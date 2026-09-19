@@ -625,7 +625,7 @@ main = do
             , chartNotes =
                 [ "Fresh: a freshly loaded rope. Edited: the same rope after " ++ commas workloadOps
                     ++ " random inserts, in the shape it has mid-session. Rows with one run are on a fresh rope."
-                , "* Not counting the libraries that do no work here. A freshly loaded text-rope or core-text is a single chunk, and core-text is the Text it was loaded from: their toText is free, and their first reads walk the whole text."
+                , "A factor marked vs a library leaves out the libraries that do no work there. A freshly loaded text-rope or core-text is a single chunk, and core-text is the Text it was loaded from: their toText is free, and their first reads walk the whole text."
                 , "No mark: the library cannot do this (yi-rope has no UTF-16, core-text neither UTF-16 nor lines). A hollow mark at the right: left out, a run takes minutes."
                 , "Live heap: what stays reachable after a major collection once the Text the document came from is dropped. A rope that shares that Text keeps it alive."
                 ]
@@ -634,7 +634,6 @@ main = do
             , chartSamples = samples
             , chartSkipped = skipped
             , chartFree = [("fromText", "core-text"), ("toText", "text-rope"), ("toText", "core-text")]
-            , chartFreeNote = "*"
             , chartTextHeap = textHeap
             , chartFootprints = fps
             }
