@@ -20,6 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.NanoRope (Position (..), Unit (..))
 import qualified Data.Text.NanoRope as Nano
+import Data.Text.NanoRope.Internal (kernels, kernelsName)
 import Data.Version (showVersion)
 import Data.Word (Word64)
 import GHC.Stats (getRTSStatsEnabled)
@@ -617,11 +618,12 @@ main = do
             { chartTitle = "nano-rope" ++ (if null others then "" else " against " ++ andList others)
             , chartSubtitle =
                 printf
-                  "A run is %s operations on %s lines of source code (%.1f MB), or one load or save of it. GHC %s."
+                  "A run is %s operations on %s lines of source code (%.1f MB), or one load or save of it. GHC %s, chunks scanned with %s."
                   (commas workloadOps)
                   (commas documentLines)
                   (fromIntegral bytes / 1e6 :: Double)
                   (showVersion fullCompilerVersion)
+                  (kernelsName (last kernels))
             , chartNotes =
                 [ "Fresh: a freshly loaded rope. Edited: the same rope after " ++ commas workloadOps
                     ++ " random inserts, in the shape it has mid-session. Rows with one run are on a fresh rope."

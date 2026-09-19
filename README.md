@@ -103,15 +103,15 @@ rope that has already had 10,000 random inserts.
 
 | workload | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
 | --- | ---: | ---: | ---: | ---: |
-| random inserts * | 5.1 ms | 19.8 ms | 108 ms | 186 ms |
-| edits at UTF-16 positions | 10.0 ms | 43.5 ms | — | — |
-| `getLine` * | 2.9 ms | 15.6 ms | 113 ms | — |
-| typing, 100 bursts of 100 | 0.5 ms | 3.8 ms | 65 ms | 4.5 s |
-| the same, reading the line after each key | 4.8 ms | 210 ms | 260 ms | — |
-| `splitAt`, both halves * | 11.5 ms | 20.8 ms | 98 ms | 81 ms |
-| `toText` (once) * | 0.26 ms | 0.43 ms | 1.8 ms | 3.1 ms |
-| `fromText` (once) | 1.9 ms | 2.8 ms | 4.3 ms | 12 ns |
-| `toText` (once), fresh rope | 0.31 ms | 49 ns | 1.2 ms | 76 ns |
+| random inserts * | 5.2 ms | 20.2 ms | 107 ms | 195 ms |
+| edits at UTF-16 positions | 8.3 ms | 42.2 ms | — | — |
+| `getLine` * | 2.5 ms | 15.5 ms | 121 ms | — |
+| typing, 100 bursts of 100 | 0.5 ms | 3.8 ms | 64 ms | 4.5 s |
+| the same, reading the line after each key | 4.4 ms | 220 ms | 277 ms | — |
+| `splitAt`, both halves * | 10.5 ms | 18.8 ms | 98 ms | 79 ms |
+| `toText` (once) * | 0.28 ms | 0.47 ms | 1.9 ms | 3.2 ms |
+| `fromText` (once) | 1.1 ms | 2.7 ms | 4.6 ms | 10 ns |
+| `toText` (once), fresh rope | 0.26 ms | 39 ns | 1.0 ms | 76 ns |
 
 yi-rope has no UTF-16, and core-text has neither UTF-16 nor lines.
 
