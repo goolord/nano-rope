@@ -1,0 +1,124 @@
+cabal-version:      3.0
+name:               nano-rope
+version:            0.1.0.0
+synopsis:
+    B-tree text rope with flat chunks, multi-unit indexing and custom measures
+
+description:
+    A persistent text rope for editors, language servers and parsers.
+
+    * Leaves are flat unpinned byte arrays of at most a kilobyte of UTF-8.
+
+    * The tree is a B-tree with up to 16 children per node, whose sizes are
+      kept as prefix sums in one flat unboxed array per node.
+
+    * Bytes, code points, UTF-16 code units and lines are tracked at every
+      node: any of them addresses the rope, and any converts to any other,
+      in logarithmic time.
+
+    * Chunks are cut by size rather than by line, so that files consisting
+      of one enormous line are nothing special.
+
+    * A monoidal measure of your own can be cached at every node and
+      searched by.
+
+license:            MIT
+license-file:       LICENSE
+author:             goolord
+maintainer:         zacharyachurchill@gmail.com
+category:           Text
+build-type:         Simple
+tested-with:        GHC ==9.14.1
+extra-doc-files:
+    CHANGELOG.md
+    README.md
+
+flag compare-text-rope
+    description: Run the benchmarks on text-rope as well, for comparison.
+    default:     False
+    manual:      True
+
+common extensions
+    default-language: GHC2021
+
+common ghc-options
+    ghc-options: -Wall -Widentities
+
+common rts-options
+    ghc-options: -rtsopts -threaded "-with-rtsopts=-N"
+
+common library-depends
+    build-depends:
+        base      >=4.17 && <4.23,
+        deepseq   >=1.4  && <1.6,
+        primitive >=0.8  && <0.10,
+        text      >=2.0  && <2.2
+
+common test-depends
+    build-depends:
+        base,
+        QuickCheck       >=2.14 && <2.19,
+        tasty            >=1.4  && <1.6,
+        tasty-quickcheck >=0.10 && <0.12,
+        text
+
+library
+    import:           extensions
+    import:           ghc-options
+    import:           library-depends
+    exposed-modules:
+        Data.Text.NanoRope
+        Data.Text.NanoRope.Internal
+        Data.Text.NanoRope.Measured
+
+    hs-source-dirs:   src
+
+    -- Measured: 5 to 15 percent across the benchmarks, more on conversions.
+    ghc-options:      -O2
+
+-- The properties against the library as it ships.
+test-suite nano-rope-test
+    import:           extensions
+    import:           ghc-options
+    import:           rts-options
+    import:           test-depends
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    build-depends:    nano-rope
+
+-- The same properties against a build with tiny chunks and nodes, where
+-- short inputs already make for deep trees.
+test-suite nano-rope-test-small
+    import:           extensions
+    import:           ghc-options
+    import:           rts-options
+    import:           library-depends
+    import:           test-depends
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test src
+    main-is:          Main.hs
+    other-modules:
+        Data.Text.NanoRope
+        Data.Text.NanoRope.Internal
+        Data.Text.NanoRope.Measured
+
+    cpp-options:      -DNANO_ROPE_SMALL
+
+benchmark nano-rope-bench
+    import:           extensions
+    import:           ghc-options
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          Main.hs
+    ghc-options:      -O2 -rtsopts "-with-rtsopts=-A32m"
+    build-depends:
+        base,
+        nano-rope,
+        deepseq,
+        tasty-bench >=0.3 && <0.6,
+        text
+
+    if flag(compare-text-rope)
+        build-depends: text-rope >=0.3 && <0.4
+        cpp-options:   -DCOMPARE_TEXT_ROPE
