@@ -4,7 +4,8 @@
 -- | Properties of the rope against a model of plain 'Text' with naive,
 -- obviously correct implementations of every unit. After every operation the
 -- structural invariants of the tree are checked as well, which includes all
--- cached metrics and annotations.
+-- cached metrics and annotations. The instances are held to the laws of
+-- their classes on top of that.
 --
 -- This file is compiled twice: against the library as it ships, and against
 -- a build with tiny chunks and nodes (see the cabal file).
@@ -12,6 +13,8 @@ module Main (main) where
 
 import qualified Data.List as L
 import Data.Maybe (fromMaybe)
+import Data.Proxy (Proxy (..))
+import Data.String (IsString (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
@@ -19,7 +22,8 @@ import qualified Data.Text.NanoRope as Plain
 import Data.Text.NanoRope.Internal (height, invariants, maxChunk)
 import Data.Text.NanoRope.Measured (Measure (..), Metrics (..), Position (..), Rope, Unit (..))
 import qualified Data.Text.NanoRope.Measured as Rope
-import Test.Tasty (defaultMain, localOption, testGroup)
+import Test.QuickCheck.Classes.Base (Laws (..), commutativeMonoidLaws, eqLaws, monoidLaws, ordLaws, semigroupLaws, semigroupMonoidLaws, showLaws)
+import Test.Tasty (TestTree, adjustOption, defaultMain, localOption, testGroup)
 import Test.Tasty.QuickCheck
 
 main :: IO ()
@@ -64,8 +68,7 @@ main =
           ]
       , testGroup
           "measures"
-          [ testProperty "the test measure is a homomorphism" prop_homomorphism
-          , testProperty "splitWhere by width" prop_splitWhereWidth
+          [ testProperty "splitWhere by width" prop_splitWhereWidth
           , testProperty "splitWhere by line breaks" prop_splitWhereBreaks
           , testProperty "splitWhere by metrics" prop_splitWhereMetrics
           ]
@@ -74,6 +77,43 @@ main =
           [ testProperty "Eq ignores the shape of the tree" prop_eq
           , testProperty "Ord agrees with Text" prop_ord
           , testProperty "Show agrees with Text" prop_show
+          ]
+      , testGroup
+          "laws"
+          [ testProperty "the ropes they are tried on" prop_lawRopes
+          , -- Enough for three ropes picked independently to be equal now and then.
+            adjustOption (\(QuickCheckTests n) -> QuickCheckTests (max 500 n)) $
+              lawsOf
+                "Rope"
+                [ eqLaws ropes
+                , ordLaws ropes
+                , eqOrdLaws ropes
+                , semigroupLaws ropes
+                , monoidLaws ropes
+                , semigroupMonoidLaws ropes
+                , homomorphismLaws
+                , showLaws ropes
+                , isStringLaws
+                ]
+          , lawsOf
+              "Metrics"
+              [ semigroupLaws metrics
+              , monoidLaws metrics
+              , commutativeMonoidLaws metrics
+              , semigroupMonoidLaws metrics
+              ]
+          , testGroup
+              "Measure"
+              [ lawsOf "()" [measureLaws (Proxy :: Proxy ())]
+              , lawsOf "pairs" [measureLaws (Proxy :: Proxy (Breaks, Width))]
+              , lawsOf "triples" [measureLaws (Proxy :: Proxy ((), Width, Breaks))]
+              ]
+          , -- The measures of this file, which the rest of it relies on.
+            testGroup
+              "test measures"
+              [ lawsOf "Breaks" [semigroupLaws breaks, monoidLaws breaks, semigroupMonoidLaws breaks, measureLaws breaks]
+              , lawsOf "Width" [semigroupLaws widths, monoidLaws widths, semigroupMonoidLaws widths, measureLaws widths]
+              ]
           ]
       , testGroup
           "plain interface"
@@ -578,10 +618,6 @@ prop_getLine (Edited r t) = forAll (choose (-1, L.length table + 1)) $ \l ->
   where
     table = lineTable t
 
-prop_homomorphism :: Snippet -> Snippet -> Property
-prop_homomorphism (Snippet a) (Snippet b) =
-  (measureChunk (a <> b) :: (Breaks, Width)) === measureChunk a <> measureChunk b
-
 -- | The longest prefix (in characters) on which a predicate fails.
 longestPrefix :: (Text -> Bool) -> Text -> Int
 longestPrefix p t = L.length (takeWhile (not . p) (drop 1 (T.inits t)))
@@ -632,6 +668,152 @@ prop_ord (Edited a ta) (Edited b tb) i =
 
 prop_show :: Edited -> Property
 prop_show (Edited r t) = show r === show t
+
+------------------------------------------------------------------------------
+-- Laws
+
+-- | The laws of some classes as a group of tests.
+lawsOf :: String -> [Laws] -> TestTree
+lawsOf name sets =
+  testGroup name [testGroup cls [testProperty law p | (law, p) <- properties] | Laws cls properties <- sets]
+
+ropes :: Proxy R
+ropes = Proxy
+
+metrics :: Proxy Metrics
+metrics = Proxy
+
+breaks :: Proxy Breaks
+breaks = Proxy
+
+widths :: Proxy Width
+widths = Proxy
+
+-- | The laws speak of ropes that are equal, or that differ late, and two
+-- documents picked at random are neither. These are a few texts over a
+-- common stem, some of them alike in every metric, of several chunks and of
+-- two heights in either build.
+lawTexts :: [(Int, Text)]
+lawTexts =
+  [ (1, "")
+  , (3, stem <> "xyz")
+  , (2, stem <> "xzy")
+  , (2, stem <> "xyz\128512")
+  , (2, T.replicate 8 stem <> "xyz")
+  , (1, T.replicate 8 stem <> "xzy")
+  ]
+  where
+    stem = T.take (2 * maxChunk) (T.replicate maxChunk "ab\nc\233 \8364\r\n\128512xyz")
+
+-- | A rope of a text by one of several routes, which leave it in different
+-- chunks: all at once, out of pieces, with its end typed and maybe still
+-- waiting, with a gap filled in, or cut out of something longer.
+ropeOf :: Measure a => Text -> Gen (Rope a)
+ropeOf t =
+  oneof
+    [ pure (Rope.fromText t)
+    , do
+        cuts <- L.sort <$> resize 6 (listOf (choose (0, n)))
+        pure (mconcat [Rope.fromText (T.take (j - i) (T.drop i t)) | (i, j) <- zip (0 : cuts) (cuts ++ [n])])
+    , do
+        k <- choose (max 0 (n - 8 * sizeFactor), n)
+        pure (L.foldl' (\r (i, c) -> Rope.insert Chars i (T.singleton c) r) (Rope.fromText (T.take k t)) (zip [k ..] (T.unpack (T.drop k t))))
+    , do
+        i <- choose (0, n)
+        j <- choose (i, n)
+        pure (Rope.insert Chars i (T.take (j - i) (T.drop i t)) (Rope.fromText (T.take i t <> T.drop j t)))
+    , do
+        Snippet before <- arbitrary
+        Snippet after <- arbitrary
+        let i = T.length before
+        pure (Rope.slice Chars i (i + n) (Rope.fromText (before <> t <> after)))
+    ]
+  where
+    n = T.length t
+
+-- | For the laws only, see 'lawTexts'. Everything else is tried on 'Edited'.
+instance Measure a => Arbitrary (Rope a) where
+  arbitrary = frequency [(w, pure t) | (w, t) <- lawTexts] >>= ropeOf
+  shrink r = Rope.fromText <$> shrinkText (Rope.toText r)
+
+-- | The laws are tried on what they are about: equal ropes in different
+-- chunks, and different ropes which no metric tells apart.
+prop_lawRopes :: R -> R -> Property
+prop_lawRopes a b =
+  checkCoverage $
+    cover 10 (a == b && Rope.toChunks a /= Rope.toChunks b) "equal, in different chunks" $
+      cover 5 (a /= b && Rope.metrics a == Rope.metrics b) "different, with the same metrics" $
+        holds a (Rope.toText a) .&&. holds b (Rope.toText b)
+
+-- | What "Test.QuickCheck.Classes.Base" leaves out. The instances define '=='
+-- and 'compare', and the rest of both classes has to agree with those.
+eqOrdLaws :: forall a. (Ord a, Arbitrary a, Show a) => Proxy a -> Laws
+eqOrdLaws _ =
+  Laws
+    "Eq and Ord"
+    [ ("Negation", property $ \(a :: a) b -> (a /= b) === not (a == b))
+    , ("compare is EQ where == holds", property $ \(a :: a) b -> (compare a b == EQ) === (a == b))
+    , ("compare, turned around", property $ \(a :: a) b -> compare a b === opposite (compare b a))
+    ,
+      ( "Operators"
+      , property $ \(a :: a) b ->
+          let o = compare a b
+           in conjoin [(a < b) === (o == LT), (a <= b) === (o /= GT), (a > b) === (o == GT), (a >= b) === (o /= LT)]
+      )
+    , ("min and max", property $ \(a :: a) b -> (min a b, max a b) === (if a <= b then (a, b) else (b, a)))
+    ]
+  where
+    opposite o = case o of
+      LT -> GT
+      EQ -> EQ
+      GT -> LT
+
+-- | Whatever is read off a rope is read off its parts.
+homomorphismLaws :: Laws
+homomorphismLaws =
+  Laws
+    "Monoid homomorphisms"
+    [ ("toText", homomorphism Rope.toText)
+    , ("metrics", homomorphism Rope.metrics)
+    , ("measure", homomorphism Rope.measure)
+    ]
+  where
+    homomorphism :: (Monoid b, Eq b, Show b) => (R -> b) -> Property
+    homomorphism f = property $ \a b -> f (a <> b) === f a <> f b .&&. f mempty === mempty
+
+-- | 'IsString' has no laws. Ropes are held to what 'Text' does, which is to
+-- replace surrogates.
+isStringLaws :: Laws
+isStringLaws =
+  Laws
+    "IsString"
+    [ ("fromString, like Text", forAll genString $ \s -> holds (fromString s) (fromString s))
+    , ("toString . fromString", forAll genString $ \s -> Rope.toString (fromString s :: R) === T.unpack (fromString s))
+    ]
+  where
+    genString = concat <$> listOf (frequency [(9, genPiece), (1, vectorOf 1 (choose ('\xD800', '\xDFFF')))])
+
+-- | The laws of 'Measure': chunks are cut anywhere, and none of it may show.
+measureLaws :: forall a. (Measure a, Eq a, Show a) => Proxy a -> Laws
+measureLaws _ =
+  Laws
+    "Measure"
+    [ ("Homomorphism", property $ \(Snippet x) (Snippet y) -> (measureChunk (x <> y) :: a) === measureChunk x <> measureChunk y)
+    , ("Identity", (measureChunk T.empty :: a) === mempty)
+    ]
+
+-- | Measurements of some text, as they come up in a rope.
+measured :: (Text -> a) -> Gen a
+measured f = (\(Snippet t) -> f t) <$> arbitrary
+
+instance Arbitrary Metrics where
+  arbitrary = measured naiveMetrics
+
+instance Arbitrary Breaks where
+  arbitrary = measured measureChunk
+
+instance Arbitrary Width where
+  arbitrary = measured measureChunk
 
 prop_plain :: Edited -> Unit -> Offset -> Snippet -> Property
 prop_plain (Edited r t) u i (Snippet s) =

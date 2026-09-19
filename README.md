@@ -139,6 +139,7 @@ whenever something happens next to it: hence the 4.5 s of typing, which are
 ## Development
 
 ```
-cabal test     # properties against a Text model, also with 16-byte chunks
+cabal test     # properties against a Text model and the laws of the
+               # instances, also with 16-byte chunks
 cabal bench
 ```
