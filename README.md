@@ -107,14 +107,17 @@ rope that has already had 10,000 random inserts.
 | the same, reading the line after each key | 4.8 ms | 210 ms | 260 ms | — |
 | `splitAt`, both halves * | 11.5 ms | 20.8 ms | 98 ms | 81 ms |
 | `toText` (once) * | 0.26 ms | 0.43 ms | 1.8 ms | 3.1 ms |
+| `fromText` (once) | 1.9 ms | 2.8 ms | 4.3 ms | 12 ns |
+| `toText` (once), fresh rope | 0.31 ms | 49 ns | 1.2 ms | 76 ns |
 
 yi-rope has no UTF-16, and core-text has neither UTF-16 nor lines.
 
-A freshly loaded text-rope or core-text is one big chunk. That makes `toText`
-free, but the first reads and splits walk the whole text (10,000 `getLine`s on
-text-rope take 1.5 s), and core-text re-measures the chunk on every edit next
-to it, hence its 4.5 s of typing. Most rows above use an edited rope to keep
-that out of the comparison.
+nano-rope is far slower at loading and saving than core-text, and at saving
+a fresh rope than text-rope. A freshly loaded text-rope or core-text is one
+big chunk, and core-text is the `Text` it was loaded from, so they hand it
+back as it is. The cost comes later: their first reads and splits walk the
+whole text (10,000 `getLine`s on a fresh text-rope take 1.5 s), and core-text
+re-measures the chunk on every edit next to it, hence its 4.5 s of typing.
 
 ![Time, allocation and live heap of nano-rope, text-rope, yi-rope and core-text](bench/results.svg)
 

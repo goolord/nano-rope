@@ -51,10 +51,6 @@ data Chart = Chart
   , chartSamples :: [Sample]
   , chartSkipped :: [(String, String)]
   -- ^ Workloads a library is left out of for being too slow.
-  , chartFree :: [(String, String)]
-  -- ^ Workloads a library does no work for, like loading a 'Data.Text.Text'
-  -- it keeps as it is. They are drawn, but not compared against, and a
-  -- factor that leaves them out names the library it is against instead.
   , chartTextHeap :: Maybe Double
   -- ^ The live heap of the document as one plain 'Data.Text.Text'.
   , chartFootprints :: [Footprint]
@@ -280,26 +276,18 @@ timeRow c times bytes (Row label runs) =
         ++ [text stateX (cy + 4) [("class", "sl"), ("text-anchor", "end")] state | shown]
         ++ dots cy [(i, logX times (timeX0, timeX1) (sampleSeconds s)) | (i, s) <- got]
         ++ [mark' "m o" i (timeX1 - 1) cy | (i, l) <- present c, (w, l) `elem` chartSkipped c, i `notElem` map fst got]
-        ++ factor cy against "faster" "slower" [(sampleSeconds s, map fst others) | (0, s) <- got, comparable]
+        ++ factor cy "faster" "slower" [(sampleSeconds s, others) | (0, s) <- got]
         ++ dots cy [(i, logX bytes (allocX0, allocX1) a) | (i, s) <- got, Just a <- [sampleAllocated s], a > 0]
         ++ ["</g>"]
       where
         cy = y + runH / 2
         cells = [(i, l, find (\s -> sampleWorkload s == w && sampleLibrary s == l) (chartSamples c)) | (i, l) <- present c]
         got = [(i, s) | (i, _, Just s) <- cells]
-        free = [i | (i, l) <- present c, (w, l) `elem` chartFree c]
-        others = [(sampleSeconds s, sampleLibrary s) | (i, s) <- got, i /= 0, i `notElem` free]
-        -- Others that ran but did no work leave nothing to compare against,
-        -- which is not the same as no other library being able to.
-        comparable = not (null others) || all ((== 0) . fst) got
-        -- Leaving a faster library out has to show on the row, not in a note.
-        against = if null free || null others then Nothing else Just (snd (minimum others))
+        others = [sampleSeconds s | (i, s) <- got, i /= 0]
         tip =
           unlines $
             (label ++ (if null state then "" else ", " ++ state))
-              : [ l ++ ": " ++ maybe (if (w, l) `elem` chartSkipped c then "too slow to run" else "cannot do this") describe s
-                  ++ (if (w, l) `elem` chartFree c then ", no work done" else "")
-                | (_, l, s) <- cells
+              : [ l ++ ": " ++ maybe (if (w, l) `elem` chartSkipped c then "too slow to run" else "cannot do this") describe s                | (_, l, s) <- cells
                 ]
         describe s = showSeconds (sampleSeconds s) ++ maybe "" (\a -> ", " ++ showBytes a ++ " allocated") (sampleAllocated s)
 
@@ -406,7 +394,7 @@ memoryPanel c
         ++ [text margin (cy + 4) [("class", "rl")] "Live heap" | k == (0 :: Int)]
         ++ [text stateX (cy + 4) [("class", "sl"), ("text-anchor", "end")] st | length states > 1]
         ++ dots cy [(i, x b) | (i, b) <- got]
-        ++ factor cy Nothing "smaller" "larger" [(b, [o | (i, o) <- got, i /= 0]) | (0, b) <- got]
+        ++ factor cy "smaller" "larger" [(b, [o | (i, o) <- got, i /= 0]) | (0, b) <- got]
         ++ ["</g>"]
       where
         cy = y + runH / 2
@@ -458,15 +446,15 @@ mark' cls0 i x y = case i `mod` 4 of
 
 -- | How the subject compares to the best of the others, as a factor: the
 -- smaller value wins.
-factor :: Double -> Maybe String -> String -> String -> [(Double, [Double])] -> [String]
-factor cy against better worse cmp = case cmp of
+factor :: Double -> String -> String -> [(Double, [Double])] -> [String]
+factor cy better worse cmp = case cmp of
   [(mine, others@(_ : _))] ->
     let f = minimum others / mine
         (cls, n, s)
           | f >= 1.05 = ("q", times f, better)
           | f <= 1 / 1.05 = ("q w", times (1 / f), worse)
           | otherwise = ("q w", "1.0×", "on par")
-     in [ tag "text" [("x", num factorX), ("y", num (cy + 5)), ("class", cls), ("text-anchor", "end")] (maybe [] (\l -> [tag "tspan" [("class", "qw")] [escape ("vs " ++ l ++ " ")]]) against ++ [escape n])
+     in [ text factorX (cy + 5) [("class", cls), ("text-anchor", "end")] n
         , text (factorX + 6) (cy + 4) [("class", "qw")] s
         ]
   [(_, [])] -> [text factorX (cy + 4) [("class", "qw"), ("text-anchor", "end")] "no other can"]
