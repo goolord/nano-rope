@@ -56,6 +56,7 @@ module Data.Text.NanoRope
   , toString
   , toChunks
   , foldrChunks
+  , foldlChunks'
   , chunkAt
 
     -- * Queries
@@ -160,6 +161,13 @@ toChunks = M.toChunks
 -- | Lazy right fold over the chunks of 'toChunks'.
 foldrChunks :: (Text -> b -> b) -> b -> Rope -> b
 foldrChunks = M.foldrChunks
+
+-- | Strict left fold over the chunks of 'toChunks'. It is a walk of the tree
+-- and allocates nothing of its own, where the list of 'toChunks' costs a
+-- hundred bytes or so a chunk: the fold for whoever consumes a whole rope,
+-- to hash it or to hand it to a parser or a socket.
+foldlChunks' :: (b -> Text -> b) -> b -> Rope -> b
+foldlChunks' = M.foldlChunks'
 
 -- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
 -- offset; empty exactly when the offset is at or beyond the end.

@@ -84,6 +84,7 @@ module Data.Text.NanoRope.Internal
   , toString
   , toChunks
   , foldrChunks
+  , foldlChunks'
   , chunkAt
 
     -- * Queries
@@ -1964,7 +1965,11 @@ toChunks = foldrChunks (:) []
 
 -- | Lazy right fold over the chunks of 'toChunks'.
 foldrChunks :: (Text -> b -> b) -> b -> Rope a -> b
-foldrChunks f z (Rope root) = foldrNode (f . chunkText) z root
+-- The rope is behind a lambda, here and in foldlChunks': a fold is inlined
+-- once it has the arguments left of the equals sign, and one written
+-- "foldrChunks f z" would otherwise stay a call of an unknown f per chunk,
+-- four times slower.
+foldrChunks f z = \(Rope root) -> foldrNode (f . chunkText) z root
 {-# INLINE foldrChunks #-}
 
 foldrNode :: (ByteArray -> b -> b) -> b -> Node a -> b
@@ -1975,6 +1980,23 @@ foldrNode f = go
       | otherwise = f arr z
     go z (Inner _ _ _ cs) = F.foldr (flip go) z cs
 {-# INLINE foldrNode #-}
+
+-- | Strict left fold over the chunks of 'toChunks'. It is a walk of the tree
+-- and allocates nothing of its own, where the list of 'toChunks' costs a
+-- hundred bytes or so a chunk: the fold for whoever consumes a whole rope,
+-- to hash it or to hand it to a parser or a socket.
+foldlChunks' :: (b -> Text -> b) -> b -> Rope a -> b
+foldlChunks' f z = \(Rope root) -> foldlNode' (\acc arr -> f acc (chunkText arr)) z root
+{-# INLINE foldlChunks' #-}
+
+foldlNode' :: (b -> ByteArray -> b) -> b -> Node a -> b
+foldlNode' f = go
+  where
+    go !acc (Leaf _ _ arr)
+      | sizeofByteArray arr == 0 = acc
+      | otherwise = f acc arr
+    go !acc (Inner _ _ _ cs) = F.foldl' go acc cs
+{-# INLINE foldlNode' #-}
 
 -- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
 -- offset; empty exactly when the offset is at or beyond the end.

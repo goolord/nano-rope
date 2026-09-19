@@ -460,6 +460,7 @@ prop_chunks (Edited r t) =
     .&&. counterexample "empty chunk" (not (any T.null chunks))
     .&&. counterexample "oversized chunk" (all ((<= maxChunk) . bytes . naiveMetrics) chunks)
     .&&. Rope.foldrChunks (\c n -> T.length c + n) 0 r === T.length t
+    .&&. reverse (Rope.foldlChunks' (flip (:)) [] r) === chunks
   where
     chunks = Rope.toChunks r
 

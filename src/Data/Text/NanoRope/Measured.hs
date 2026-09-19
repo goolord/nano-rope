@@ -50,6 +50,7 @@ module Data.Text.NanoRope.Measured
   , toString
   , toChunks
   , foldrChunks
+  , foldlChunks'
   , chunkAt
 
     -- * Queries
