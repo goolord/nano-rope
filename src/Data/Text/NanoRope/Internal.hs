@@ -2,6 +2,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE UnboxedSums #-}
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -25,13 +26,22 @@
 -- A rope is a B-tree. Leaves hold a flat, unpinned, exactly-sized
 -- 'ByteArray' of UTF-8 (at most 'maxChunk' bytes, always cut at code point
 -- boundaries). Inner nodes hold up to 'maxChildren' children. Every node
--- carries the 'Metrics' of its own subtree unpacked next to its header, so
--- seeking by any unit is a linear scan over the heads of at most
--- 'maxChildren' children per level.
+-- carries the 'Metrics' of its own subtree unpacked next to its header (a
+-- leaf packs them into one word), so seeking by any unit is a linear scan
+-- over the heads of at most 'maxChildren' children per level.
 --
 -- Nothing about a child is kept in its parent but the pointer. An edit
 -- therefore copies one small array of pointers per level: persistence is
 -- paid for in allocation, and this is what keeps the bill short.
+--
+-- The bill is meant to be exactly that: an edit allocates the new leaf, a
+-- node and an array of pointers per level, and the rope; looking something
+-- up allocates nothing but the answer. What keeps it so is strictness that
+-- the compiler can see, and none of it is visible in the types: offsets and
+-- metrics travel unboxed only through arguments that are strict on every
+-- path, results that are single-constructor records, and helpers that are
+-- either inlined or not at all (see the notes at the seeks and the scans).
+-- Check the allocation of the benchmarks after touching any of it.
 --
 -- = Scanning
 --
@@ -44,13 +54,16 @@
 module Data.Text.NanoRope.Internal
   ( -- * Types
     Rope (.., Rope)
-  , Node (..)
+  , Node (.., Leaf)
   , Measure (..)
   , Metrics (..)
   , Unit (..)
   , Position (..)
   , count
   , subMetrics
+  , PackedMetrics
+  , packMetrics
+  , unpackMetrics
 
     -- * Tuning constants
   , maxChunk
@@ -140,7 +153,7 @@ import qualified Data.Text.Array as A
 import qualified Data.Text.Internal as TI
 import qualified Data.Text.Lazy as TL
 import Data.Word (Word8)
-import GHC.Exts (Int (..), indexWord8ArrayAsWord64#)
+import GHC.Exts (Int (..), Int#, TYPE, indexWord8ArrayAsWord64#, (-#))
 import GHC.Word (Word64 (..))
 #ifdef NANO_ROPE_SIMD
 import System.IO.Unsafe (unsafeDupablePerformIO)
@@ -150,7 +163,8 @@ import Prelude hiding (drop, getLine, length, lines, null, splitAt, take)
 ------------------------------------------------------------------------------
 -- Tuning constants
 
--- | Maximum number of bytes in a leaf.
+-- | Maximum number of bytes in a leaf. No more than 65535: the metrics of a
+-- leaf are kept in 16 bits each.
 maxChunk :: Int
 
 -- | Maximum number of children of an inner node.
@@ -316,22 +330,27 @@ data Rope a
     -- one lazy thing in here, which inserts the whole run at once.
     --
     -- The others: the tree without the run, the unit and the offset at
-    -- which the run is to go in, the offset at which a keystroke would
-    -- continue it, its text (at most 'maxPending' bytes), the metrics of
-    -- everything and the room left for the run to grow.
+    -- which the run is to go in, its text (at most 'maxPending' bytes), the
+    -- metrics of that text packed like those of a leaf, and the room left
+    -- for the run to grow.
+    --
+    -- Every keystroke makes one of these, so it is kept small: where a
+    -- keystroke would continue the run and the metrics of everything are
+    -- worked out ('typingNext', 'metrics') rather than kept.
     Typing
       (Node a)
       !(Node a)
       !Unit
       {-# UNPACK #-} !Int
-      {-# UNPACK #-} !Int
       {-# UNPACK #-} !ByteArray
-      {-# UNPACK #-} !Metrics
+      {-# UNPACK #-} !PackedMetrics
       {-# UNPACK #-} !Int
 
--- | The tree of a rope, with everything typed in it.
+-- | The tree of a rope, with everything typed in it. Matching evaluates it:
+-- left lazy, it would be a thunk in every function that does not get to look
+-- at the tree on all of its paths.
 pattern Rope :: Node a -> Rope a
-pattern Rope root <- (rootOf -> root)
+pattern Rope root <- (rootOf -> !root)
   where
     Rope root = Settled root Bytes (-1) 0
 
@@ -339,7 +358,7 @@ pattern Rope root <- (rootOf -> root)
 
 rootOf :: Rope a -> Node a
 rootOf (Settled root _ _ _) = root
-rootOf (Typing root _ _ _ _ _ _ _) = root
+rootOf (Typing root _ _ _ _ _ _) = root
 {-# INLINE rootOf #-}
 
 -- | A node of the B-tree. Every field is strict, so a tree in weak head
@@ -348,10 +367,15 @@ rootOf (Typing root _ _ _ _ _ _ _) = root
 -- Both constructors start with the metrics of their subtree, which is all
 -- that seeking reads of a node it does not descend into.
 data Node a
-  = -- | Metrics, annotation and UTF-8 payload. The payload occupies the
-    -- whole array: there is no offset or length to chase.
-    Leaf
-      {-# UNPACK #-} !Metrics
+  = -- | Metrics, annotation and UTF-8 payload, which is what the pattern
+    -- v'Leaf' matches and builds. The payload occupies the whole array:
+    -- there is no offset or length to chase.
+    --
+    -- None of the metrics of a leaf exceeds 'maxChunk', so the four of them
+    -- share a word, 16 bits each (see 'PackedMetrics'). Spelled out they made
+    -- the leaves of a document three words heavier each, some 4% of it.
+    PackedLeaf
+      {-# UNPACK #-} !PackedMetrics
       !a
       {-# UNPACK #-} !ByteArray
   | -- | Metrics, height (at least 1), annotation and children.
@@ -360,6 +384,33 @@ data Node a
       {-# UNPACK #-} !Int
       !a
       {-# UNPACK #-} !(SmallArray (Node a))
+
+-- | A leaf: metrics, annotation and UTF-8 payload.
+pattern Leaf :: Metrics -> a -> ByteArray -> Node a
+pattern Leaf m a arr <- PackedLeaf (unpackMetrics -> !m) a arr
+  where
+    Leaf m a arr = PackedLeaf (packMetrics m) a arr
+
+{-# COMPLETE Leaf, Inner #-}
+
+-- | The 'Metrics' of at most 65535 bytes of text, 16 bits each: bytes lowest,
+-- then code points, UTF-16 code units and line feeds. 64 bits whatever the
+-- machine's word is.
+type PackedMetrics = Word64
+
+packMetrics :: Metrics -> PackedMetrics
+packMetrics (Metrics b c u l) =
+  fromIntegral b
+    .|. (fromIntegral c `unsafeShiftL` 16)
+    .|. (fromIntegral u `unsafeShiftL` 32)
+    .|. (fromIntegral l `unsafeShiftL` 48)
+{-# INLINE packMetrics #-}
+
+unpackMetrics :: PackedMetrics -> Metrics
+unpackMetrics w = Metrics (field 0) (field 16) (field 32) (field 48)
+  where
+    field s = fromIntegral ((w `unsafeShiftR` s) .&. 0xFFFF)
+{-# INLINE unpackMetrics #-}
 
 nodeMetrics :: Node a -> Metrics
 nodeMetrics (Leaf m _ _) = m
@@ -390,13 +441,27 @@ emptyNode = Leaf mempty mempty emptyByteArray
 ------------------------------------------------------------------------------
 -- Seeking
 
+-- The seeks are not inlined, and they return strict records rather than
+-- unboxed tuples: a record of unpacked fields comes back in registers, but
+-- an 'Int' or a 'Metrics' inside an unboxed tuple is a heap object, one for
+-- every level of every descent.
+
+-- | A child, and the metrics of the children in front of it.
+data Seek = Seek {-# UNPACK #-} !Int {-# UNPACK #-} !Metrics
+
+-- | A child, and an offset relative to it.
+data Sought = Sought {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+
+-- | A child, an offset relative to it, and the bytes in front of it.
+data SoughtBytes = SoughtBytes {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+
 -- | The child holding offset @k@ of a unit: the first one at which the
 -- running total reaches @k@, or the last one. Comes with the metrics of the
 -- children in front of it.
 --
 -- The unit is dispatched on once, in front of the loop.
-seekChild :: Unit -> Int -> SmallArray (Node a) -> (# Int, Metrics #)
-seekChild u !k !cs = case u of
+seekChild :: Unit -> Int -> SmallArray (Node a) -> Seek
+seekChild !u !k !cs = case u of
   Bytes -> scan bytes
   Chars -> scan chars
   Utf16 -> scan utf16Units
@@ -406,17 +471,17 @@ seekChild u !k !cs = case u of
     scan sel = go 0 mempty
       where
         go !i !acc
-          | i >= n - 1 || sel acc' >= k = (# i, acc #)
+          | i >= n - 1 || sel acc' >= k = Seek i acc
           | otherwise = go (i + 1) acc'
           where
             acc' = acc <> nodeMetrics (indexSmallArray cs i)
     {-# INLINE scan #-}
-{-# INLINE seekChild #-}
+{-# NOINLINE seekChild #-}
 
 -- | 'seekChild' for when nothing but the unit sought matters: the child and
 -- the offset relative to it.
-seekUnit :: Unit -> Int -> SmallArray (Node a) -> (# Int, Int #)
-seekUnit u !k !cs = case u of
+seekUnit :: Unit -> Int -> SmallArray (Node a) -> Sought
+seekUnit !u !k !cs = case u of
   Bytes -> scan bytes
   Chars -> scan chars
   Utf16 -> scan utf16Units
@@ -426,17 +491,17 @@ seekUnit u !k !cs = case u of
     scan sel = go 0 k
       where
         go !i !j
-          | i >= n - 1 || m >= j = (# i, j #)
+          | i >= n - 1 || m >= j = Sought i j
           | otherwise = go (i + 1) (j - m)
           where
             m = sel (nodeMetrics (indexSmallArray cs i))
     {-# INLINE scan #-}
-{-# INLINE seekUnit #-}
+{-# NOINLINE seekUnit #-}
 
 -- | 'seekUnit' which also counts the bytes in front of the child.
-seekUnitBytes :: Unit -> Int -> SmallArray (Node a) -> (# Int, Int, Int #)
-seekUnitBytes u !k !cs = case u of
-  Bytes -> case seekUnit Bytes k cs of (# i, j #) -> (# i, j, k - j #)
+seekUnitBytes :: Unit -> Int -> SmallArray (Node a) -> SoughtBytes
+seekUnitBytes !u !k !cs = case u of
+  Bytes -> case seekUnit Bytes k cs of Sought i j -> SoughtBytes i j (k - j)
   Chars -> scan chars
   Utf16 -> scan utf16Units
   Lines -> scan newlines
@@ -445,25 +510,25 @@ seekUnitBytes u !k !cs = case u of
     scan sel = go 0 k 0
       where
         go !i !j !b
-          | i >= n - 1 || sel m >= j = (# i, j, b #)
+          | i >= n - 1 || sel m >= j = SoughtBytes i j b
           | otherwise = go (i + 1) (j - sel m) (b + bytes m)
           where
             m = nodeMetrics (indexSmallArray cs i)
     {-# INLINE scan #-}
-{-# INLINE seekUnitBytes #-}
+{-# NOINLINE seekUnitBytes #-}
 
 -- | The child holding the byte at offset @i@: the first one whose running
 -- total exceeds @i@, or the last one. Comes with the offset relative to it.
-seekByte :: Int -> SmallArray (Node a) -> (# Int, Int #)
+seekByte :: Int -> SmallArray (Node a) -> Sought
 seekByte !i !cs = go 0 i
   where
     n = sizeofSmallArray cs
     go !c !j
-      | c >= n - 1 || j < m = (# c, j #)
+      | c >= n - 1 || j < m = Sought c j
       | otherwise = go (c + 1) (j - m)
       where
         m = nodeBytes (indexSmallArray cs c)
-{-# INLINE seekByte #-}
+{-# NOINLINE seekByte #-}
 
 ------------------------------------------------------------------------------
 -- Building inner nodes
@@ -615,11 +680,14 @@ nlCount w = byteSum ((complement t .&. highs) `unsafeShiftR` 7)
 
 -- | Metrics of @len@ bytes of valid UTF-8 starting at @off@.
 sliceMetrics :: ByteArray -> Int -> Int -> Metrics
-sliceMetrics arr off len = kernelMetrics (scans len) arr off len
+sliceMetrics !arr !off !len
+  | len >= simdMin = cMetrics simdLevel arr off len
+  | otherwise = swarMetrics arr off len
+{-# NOINLINE sliceMetrics #-}
 
 -- | 'sliceMetrics', 8 bytes at a time.
 swarMetrics :: ByteArray -> Int -> Int -> Metrics
-swarMetrics arr off len = goWord off 0 0 0
+swarMetrics !arr !off !len = goWord off 0 0 0
   where
     end = off + len
     goWord !i !conts !fours !nls
@@ -645,10 +713,12 @@ swarMetrics arr off len = goWord off 0 0 0
 -- | Largest code point boundary @<= i@. Relies on some byte at or before @i@
 -- (and inside the text) being a boundary.
 roundDownFrom :: ByteArray -> Int -> Int
-roundDownFrom arr = go
+roundDownFrom !arr (I# i) = I# (go i)
   where
-    go !j
-      | isContByte (byteAt arr j) = go (j - 1)
+    -- On unboxed offsets: a loop that returns its argument would box it on
+    -- every turn.
+    go j
+      | isContByte (byteAt arr (I# j)) = go (j -# 1#)
       | otherwise = j
 {-# INLINE roundDownFrom #-}
 
@@ -673,7 +743,7 @@ roundUp arr = go
 -- with at most @k@ units before it, or for 'Lines' the offset just after the
 -- @k@-th line feed. Clamped to the chunk.
 offsetInChunk :: Unit -> Int -> ByteArray -> Int
-offsetInChunk u k arr
+offsetInChunk !u !k !arr
   | k <= 0 = 0
   | otherwise = case u of
       Bytes -> roundDown arr k
@@ -685,12 +755,14 @@ offsetInChunk u k arr
 -- @from@ and stops in front of the first one that does not fit into @k@
 -- units, or at @to@.
 scanUnits :: Bool -> Int -> ByteArray -> Int -> Int -> Int
-scanUnits wide k arr from to = kernelScanUnits (scans (to - from)) wide k arr from to
-{-# INLINE scanUnits #-}
+scanUnits !wide !k !arr !from !to
+  | to - from >= simdMin = cScanUnits simdLevel wide k arr from to
+  | otherwise = swarScanUnits wide k arr from to
+{-# NOINLINE scanUnits #-}
 
 -- | 'scanUnits', skipping whole words as long as everything in them fits.
 swarScanUnits :: Bool -> Int -> ByteArray -> Int -> Int -> Int
-swarScanUnits wide k arr from to = goWord from 0
+swarScanUnits !wide !k !arr !from !to = goWord from 0
   where
     goWord !i !n
       | i + 8 <= to =
@@ -719,36 +791,48 @@ isAscii m = bytes m == chars m
 
 -- | 'offsetInChunk' for a leaf with known metrics.
 leafOffset :: Unit -> Int -> Metrics -> ByteArray -> Int
-leafOffset u k m arr
+leafOffset !u !k !m !arr
   | k <= 0 = 0
   | u == Lines = scanLines k arr
   | isAscii m = min k (bytes m)
   | otherwise = offsetInChunk u k arr
-{-# INLINE leafOffset #-}
+{-# NOINLINE leafOffset #-}
 
 -- | Metrics of the first @b@ bytes of a leaf with known metrics, counting
 -- whichever side of the cut is shorter.
 leafPrefixMetrics :: Metrics -> ByteArray -> Int -> Metrics
 leafPrefixMetrics m arr b
   | b <= 0 = mempty
-  | b >= size = m
+  | b >= bytes m = m
+  | otherwise = leafCutMetrics m arr b
+{-# INLINE leafPrefixMetrics #-}
+
+-- | 'leafPrefixMetrics' of a cut inside the leaf. Apart from the above
+-- because it never returns the metrics it is given, which then reach it
+-- unboxed.
+leafCutMetrics :: Metrics -> ByteArray -> Int -> Metrics
+leafCutMetrics !m !arr !b
   | 2 * b > size = m `subMetrics` leafSliceMetrics m arr b (size - b)
   | otherwise = leafSliceMetrics m arr 0 b
   where
     size = bytes m
+{-# NOINLINE leafCutMetrics #-}
 
 -- | Metrics of a slice of a leaf with known metrics. (Not local to
--- 'leafPrefixMetrics', where it would be allocated as a closure.)
+-- 'leafCutMetrics', where it would be allocated as a closure.)
 leafSliceMetrics :: Metrics -> ByteArray -> Int -> Int -> Metrics
-leafSliceMetrics m arr off len
+leafSliceMetrics !m !arr !off !len
   | isAscii m = Metrics len len len (if newlines m == 0 then 0 else countNewlines arr off len)
   | otherwise = sliceMetrics arr off len
 
 countNewlines :: ByteArray -> Int -> Int -> Int
-countNewlines arr off len = kernelNewlines (scans len) arr off len
+countNewlines !arr !off !len
+  | len >= simdMin = cNewlines simdLevel arr off len
+  | otherwise = swarNewlines arr off len
+{-# NOINLINE countNewlines #-}
 
 swarNewlines :: ByteArray -> Int -> Int -> Int
-swarNewlines arr off len = goWord off 0
+swarNewlines !arr !off !len = goWord off 0
   where
     end = off + len
     goWord !i !n
@@ -760,10 +844,13 @@ swarNewlines arr off len = goWord off 0
 
 -- | Offset of the first @\\n@ at or after @from@, or the size of the chunk.
 findNewline :: ByteArray -> Int -> Int
-findNewline arr from = kernelFindNewline (scans (sizeofByteArray arr - from)) arr from
+findNewline !arr !from
+  | sizeofByteArray arr - from >= simdMin = cFindNewline simdLevel arr from
+  | otherwise = swarFindNewline arr from
+{-# NOINLINE findNewline #-}
 
 swarFindNewline :: ByteArray -> Int -> Int
-swarFindNewline arr = goWord
+swarFindNewline !arr = goWord
   where
     len = sizeofByteArray arr
     goWord !i
@@ -775,10 +862,13 @@ swarFindNewline arr = goWord
 
 -- | Offset of the last @\\n@ before @to@, or @-1@.
 findNewlineBack :: ByteArray -> Int -> Int
-findNewlineBack arr to = kernelFindNewlineBack (scans to) arr to
+findNewlineBack !arr !to
+  | to >= simdMin = cFindNewlineBack simdLevel arr to
+  | otherwise = swarFindNewlineBack arr to
+{-# NOINLINE findNewlineBack #-}
 
 swarFindNewlineBack :: ByteArray -> Int -> Int
-swarFindNewlineBack arr = goWord
+swarFindNewlineBack !arr = goWord
   where
     goWord !i
       | i >= 8 && nlCount (indexWord64 arr (i - 8)) == 0 = goWord (i - 8)
@@ -791,7 +881,7 @@ swarFindNewlineBack arr = goWord
 -- | The number of line feeds among the first @b@ bytes of a leaf with known
 -- metrics, counting whichever side of the cut is shorter.
 leafNewlinesBefore :: Metrics -> ByteArray -> Int -> Int
-leafNewlinesBefore m arr b
+leafNewlinesBefore !m !arr !b
   | newlines m == 0 || b <= 0 = 0
   | b >= size = newlines m
   | 2 * b > size = newlines m - countNewlines arr b (size - b)
@@ -802,10 +892,13 @@ leafNewlinesBefore m arr b
 -- | The offset just after the @k@-th @\\n@ of a chunk, for @k >= 1@, or the
 -- size of the chunk.
 scanLines :: Int -> ByteArray -> Int
-scanLines k arr = kernelNthNewline (scans (sizeofByteArray arr)) k arr
+scanLines !k !arr
+  | sizeofByteArray arr >= simdMin = cNthNewline simdLevel k arr
+  | otherwise = swarScanLines k arr
+{-# NOINLINE scanLines #-}
 
 swarScanLines :: Int -> ByteArray -> Int
-swarScanLines k arr = goWord 0 0
+swarScanLines !k !arr = goWord 0 0
   where
     len = sizeofByteArray arr
     goWord !i !n
@@ -845,20 +938,18 @@ data Kernels = Kernels
 swarKernels :: Kernels
 swarKernels = Kernels "Haskell" swarMetrics swarNewlines swarFindNewline swarFindNewlineBack swarScanLines swarScanUnits
 
--- | The scans for a slice of this length: in C if it is long enough to make
--- up for a foreign call, which costs a few nanoseconds.
-scans :: Int -> Kernels
-scans len
-  | len >= simdMin = simdKernels simdLevel
-  | otherwise = swarKernels
-{-# INLINE scans #-}
-
 -- | Every implementation this machine runs: the Haskell one, then those in C
 -- by level of SIMD support. The last one is used on long slices.
 kernels :: [Kernels]
 kernels = swarKernels : map simdKernels [0 .. simdLevel]
 
--- | Slices at least this long are scanned in C.
+-- | Slices at least this long are scanned in C: long enough to make up for a
+-- foreign call, which costs a few nanoseconds.
+--
+-- The scans above choose between the C and the Haskell themselves, with calls
+-- to known functions. Picked out of a t'Kernels' they were calls to unknown
+-- ones wherever the choice did not inline away, with every argument and
+-- result in a box.
 simdMin :: Int
 
 -- | The best level of SIMD support of the machine, as the C numbers them.
@@ -866,6 +957,23 @@ simdLevel :: Int
 
 -- | The scans in C at a level of SIMD support, which must be supported.
 simdKernels :: Int -> Kernels
+simdKernels level =
+  Kernels
+    (["portable C", "SSE2", "AVX2"] !! level)
+    (cMetrics level)
+    (cNewlines level)
+    (cFindNewline level)
+    (cFindNewlineBack level)
+    (cNthNewline level)
+    (cScanUnits level)
+
+-- The scans of a t'Kernels' in C, given the level of SIMD support.
+cMetrics :: Int -> ByteArray -> Int -> Int -> Metrics
+cNewlines :: Int -> ByteArray -> Int -> Int -> Int
+cFindNewline :: Int -> ByteArray -> Int -> Int
+cFindNewlineBack :: Int -> ByteArray -> Int -> Int
+cNthNewline :: Int -> Int -> ByteArray -> Int
+cScanUnits :: Int -> Bool -> Int -> ByteArray -> Int -> Int -> Int
 
 #ifdef NANO_ROPE_SIMD
 -- The scans in C (cbits/scan.c), with SSE2 or AVX2. Unsafe calls, which may
@@ -884,26 +992,31 @@ simdMin = 32
 simdLevel = unsafeDupablePerformIO c_simdLevel
 {-# NOINLINE simdLevel #-}
 
-simdKernels level =
-  Kernels
-    (["portable C", "SSE2", "AVX2"] !! level)
-    sliceIn
-    (\(ByteArray ba) off len -> c_newlines level ba off len)
-    (\arr@(ByteArray ba) from -> c_findNewline level ba from (sizeofByteArray arr))
-    (\(ByteArray ba) to -> c_findNewlineBack level ba to)
-    (\k arr@(ByteArray ba) -> c_nthNewline level ba (sizeofByteArray arr) k)
-    (\wide k (ByteArray ba) from to -> c_scanUnits level ba from to k (fromEnum wide))
-  where
-    -- The C counts continuation bytes, 4-byte leaders and line feeds in 21
-    -- bits each; chunks are nowhere near that long.
-    sliceIn arr@(ByteArray ba) off len
-      | len >= 0x200000 = swarMetrics arr off len
-      | otherwise =
-          let w = c_metrics level ba off len
-              field s = fromIntegral ((w `unsafeShiftR` s) .&. 0x1FFFFF)
-              cs = len - field 0
-           in Metrics len cs (cs + field 21) (field 42)
-{-# INLINE simdKernels #-}
+-- The C counts continuation bytes, 4-byte leaders and line feeds in 21 bits
+-- each; chunks are nowhere near that long.
+cMetrics level arr@(ByteArray ba) off len
+  | len >= 0x200000 = swarMetrics arr off len
+  | otherwise =
+      let w = c_metrics level ba off len
+          field s = fromIntegral ((w `unsafeShiftR` s) .&. 0x1FFFFF)
+          cs = len - field 0
+       in Metrics len cs (cs + field 21) (field 42)
+{-# INLINE cMetrics #-}
+
+cNewlines level (ByteArray ba) off len = c_newlines level ba off len
+{-# INLINE cNewlines #-}
+
+cFindNewline level arr@(ByteArray ba) from = c_findNewline level ba from (sizeofByteArray arr)
+{-# INLINE cFindNewline #-}
+
+cFindNewlineBack level (ByteArray ba) to = c_findNewlineBack level ba to
+{-# INLINE cFindNewlineBack #-}
+
+cNthNewline level k arr@(ByteArray ba) = c_nthNewline level ba (sizeofByteArray arr) k
+{-# INLINE cNthNewline #-}
+
+cScanUnits level wide k (ByteArray ba) from to = c_scanUnits level ba from to k (fromEnum wide)
+{-# INLINE cScanUnits #-}
 
 foreign import ccall unsafe "nano_rope_simd_level" c_simdLevel :: IO Int
 foreign import ccall unsafe "nano_rope_metrics" c_metrics :: Int -> ByteArray# -> Int -> Int -> Word64
@@ -915,7 +1028,12 @@ foreign import ccall unsafe "nano_rope_scan_units" c_scanUnits :: Int -> ByteArr
 #else
 simdMin = maxBound
 simdLevel = -1
-simdKernels _ = swarKernels
+cMetrics _ = swarMetrics
+cNewlines _ = swarNewlines
+cFindNewline _ = swarFindNewline
+cFindNewlineBack _ = swarFindNewlineBack
+cNthNewline _ = swarScanLines
+cScanUnits _ = swarScanUnits
 #endif
 
 ------------------------------------------------------------------------------
@@ -963,6 +1081,31 @@ spliceArray arr i j src soff slen = runByteArray $ do
   copyByteArray out (i + slen) arr j (sizeofByteArray arr - j)
   pure out
 
+-- | The byte at an offset of what 'spliceArray' makes of the same arguments,
+-- without making it.
+splicedByte :: ByteArray -> Int -> Int -> ByteArray -> Int -> Int -> Int -> Word8
+splicedByte arr i j src soff slen at
+  | at < i = byteAt arr at
+  | at < i + slen = byteAt src (soff + at - i)
+  | otherwise = byteAt arr (j + at - i - slen)
+{-# INLINE splicedByte #-}
+
+-- | Bytes @from .. to-1@ of what 'spliceArray' makes of the same arguments,
+-- without making it: a leaf that overflows goes straight into its two halves.
+splicedSlice :: ByteArray -> Int -> Int -> ByteArray -> Int -> Int -> Int -> Int -> ByteArray
+splicedSlice !arr !i !j !src !soff !slen !from !to = runByteArray $ do
+  out <- newByteArray (to - from)
+  -- What is spliced is three pieces, each the bytes from some offset of an
+  -- array; of each, what falls into the slice.
+  let piece !start !end source !sourceOff =
+        let lo = max from start
+            hi = min to end
+         in when (lo < hi) $ copyByteArray out (lo - from) source (sourceOff + lo - start) (hi - lo)
+  piece 0 i arr 0
+  piece i (i + slen) src soff
+  piece (i + slen) (sizeofByteArray arr - (j - i) + slen) arr j
+  pure out
+
 -- | First @b@ bytes of a leaf.
 leafPrefix :: Measure a => Int -> Node a -> Node a
 leafPrefix b node = case node of
@@ -984,55 +1127,56 @@ leafSuffix b node = case node of
   Inner{} -> error "Data.Text.NanoRope: leafSuffix on an inner node"
 {-# INLINE leafSuffix #-}
 
--- | Cut more than 'maxChunk' bytes into evenly sized leaves. Aiming a little
--- below 'maxChunk' leaves room for moving every cut back to a code point
--- boundary.
-leavesFromSlice :: Measure a => ByteArray -> Int -> Int -> [Node a]
-leavesFromSlice arr off len = go 1 off
+-- | A tree over more than 'maxChunk' bytes, cut into evenly sized leaves.
+-- Aiming a little below 'maxChunk' leaves room for moving every cut back to a
+-- code point boundary.
+--
+-- Built from the top, every node straight into the array of its parent: with
+-- the leaves in a list and a list for every level above them, loading made
+-- two thirds of the text's size in garbage.
+treeFromSlice :: Measure a => ByteArray -> Int -> Int -> Node a
+treeFromSlice !arr !off !len = node (levelSizes leaves) 0
   where
     target = maxChunk - 4
-    k = (len + target - 1) `quot` target
-    (q, r) = len `quotRem` k
-    end = off + len
-    go !j !start
-      | j >= k = [leaf start end]
-      | otherwise =
-          let cut = roundDownFrom arr (off + j * q + (j * r) `quot` k)
-           in leaf start cut : go (j + 1) cut
-    leaf from to = mkLeaf (cloneByteArray arr from (to - from))
-{-# INLINABLE leavesFromSlice #-}
-{-# SPECIALIZE leavesFromSlice :: ByteArray -> Int -> Int -> [Node ()] #-}
+    leaves = (len + target - 1) `quot` target
+    (q, r) = len `quotRem` leaves
+    -- Where leaf @j@ starts.
+    cut j
+      | j <= 0 = off
+      | j >= leaves = off + len
+      | otherwise = roundDownFrom arr (off + j * q + (j * r) `quot` leaves)
+    -- Node @j@ of a level, given the sizes of that level and the ones below.
+    -- Strict in everything: a lazy index is a thunk for every node.
+    node sizes !j = case sizes of
+      parents : below@(children : _) ->
+        -- The children are spread evenly, so that no parent ends up below
+        -- 'minChildren'.
+        let !cq = children `quot` parents
+            !cr = children `rem` parents
+            !first = j * cq + min j cr
+            !size = if j < cr then cq + 1 else cq
+         in mkInner $ runSmallArray $ do
+              m <- newSmallArray size (error "Data.Text.NanoRope: treeFromSlice")
+              let go !i
+                    | i >= size = pure m
+                    | otherwise = do
+                        let !child = node below (first + i)
+                        writeSmallArray m i child
+                        go (i + 1)
+              go 0
+      [_] -> let !from = cut j in mkLeaf (cloneByteArray arr from (cut (j + 1) - from))
+      [] -> emptyNode
+{-# INLINABLE treeFromSlice #-}
+{-# SPECIALIZE treeFromSlice :: ByteArray -> Int -> Int -> Node () #-}
 
--- | Build a tree over nodes of equal height, bottom up.
-buildTree :: Monoid a => [Node a] -> Node a
-buildTree [] = emptyNode
-buildTree [n] = n
-buildTree ns = buildTree (groupNodes (L.length ns) ns)
-{-# INLINABLE buildTree #-}
-{-# SPECIALIZE buildTree :: [Node ()] -> Node () #-}
-
--- | One level of parents, with the children spread evenly so that no parent
--- ends up below 'minChildren'.
-groupNodes :: Monoid a => Int -> [Node a] -> [Node a]
-groupNodes total = go 0
+-- | How many nodes each level of a tree over so many leaves has, from the
+-- root down to the leaves.
+levelSizes :: Int -> [Int]
+levelSizes = go []
   where
-    groups = (total + maxChildren - 1) `quot` maxChildren
-    (q, r) = total `quotRem` groups
-    go !j ns
-      | j >= groups = []
-      | otherwise =
-          let size = if j < r then q + 1 else q
-              (now, later) = L.splitAt size ns
-           in mkInner (strictArray size now) : go (j + 1) later
-{-# INLINABLE groupNodes #-}
-{-# SPECIALIZE groupNodes :: Int -> [Node ()] -> [Node ()] #-}
-
-strictArray :: Int -> [Node a] -> SmallArray (Node a)
-strictArray n ns = runSmallArray $ do
-  m <- newSmallArray n (error "Data.Text.NanoRope: strictArray")
-  let go !_ [] = pure m
-      go !i (x : xs) = x `seq` writeSmallArray m i x >> go (i + 1) xs
-  go 0 ns
+    go above n
+      | n <= 1 = n : above
+      | otherwise = go (n : above) ((n + maxChildren - 1) `quot` maxChildren)
 
 fromTextNode :: Measure a => Text -> Node a
 fromTextNode (TI.Text (A.ByteArray ba) off len)
@@ -1040,7 +1184,7 @@ fromTextNode (TI.Text (A.ByteArray ba) off len)
   | len <= maxChunk =
       -- Share the array when the text owns all of it.
       mkLeaf (if off == 0 && len == sizeofByteArray arr then arr else cloneByteArray arr off len)
-  | otherwise = buildTree (leavesFromSlice arr off len)
+  | otherwise = treeFromSlice arr off len
   where
     arr = ByteArray ba
 {-# INLINABLE fromTextNode #-}
@@ -1052,10 +1196,26 @@ fromTextNode (TI.Text (A.ByteArray ba) off len)
 -- | Outcome of merging two trees: one or two nodes of the height of the
 -- taller tree. Also the outcome of an edit within a leaf, which is 'None' if
 -- the edit does not stay there.
-data Result a
-  = None
-  | One !(Node a)
-  | Two !(Node a) !(Node a)
+--
+-- An unboxed sum, so that handing a node up a level allocates nothing.
+type Result a = (# (# #) | Node a | (# Node a, Node a #) #)
+
+pattern None :: Result a
+pattern None = (# (# #) | | #)
+
+-- The nodes are evaluated before they go in: the components of an unboxed
+-- sum are as lazy as those of an unboxed tuple.
+pattern One :: Node a -> Result a
+pattern One n <- (# | n | #)
+  where
+    One !n = (# | n | #)
+
+pattern Two :: Node a -> Node a -> Result a
+pattern Two x y <- (# | | (# x, y #) #)
+  where
+    Two !x !y = (# | | (# x, y #) #)
+
+{-# COMPLETE None, One, Two #-}
 
 appendNode :: Measure a => Node a -> Node a -> Node a
 appendNode l r
@@ -1068,7 +1228,7 @@ appendNode l r
 {-# INLINABLE appendNode #-}
 {-# SPECIALIZE appendNode :: Node () -> Node () -> Node () #-}
 
-unreachable :: String -> a
+unreachable :: forall r (a :: TYPE r). String -> a
 unreachable fun = error ("Data.Text.NanoRope: " ++ fun)
 {-# NOINLINE unreachable #-}
 
@@ -1077,6 +1237,11 @@ unreachable fun = error ("Data.Text.NanoRope: " ++ fun)
 pair :: a -> b -> (# a, b #)
 pair !a !b = (# a, b #)
 {-# INLINE pair #-}
+
+-- | The outcome of an edit with the room it leaves, see 'editNode'.
+roomy :: Result a -> Int -> (# Result a, Int# #)
+roomy r (I# room) = (# r, room #)
+{-# INLINE roomy #-}
 
 -- | Merge two non-empty trees whose roots are allowed to be undersized.
 -- Walks down the spine of the taller tree to the height of the shorter one,
@@ -1153,7 +1318,7 @@ mergeEq _ _ = unreachable "mergeEq"
 
 -- | One node of height @h@ if the children fit, else two.
 fromChildren :: Monoid a => Int -> Metrics -> SmallArray (Node a) -> Result a
-fromChildren h m cs
+fromChildren !h !m !cs
   | n <= maxChildren = One (inner h m cs)
   | otherwise =
       let half = (n + 1) `quot` 2
@@ -1205,7 +1370,7 @@ splitRoot u k root
 -- followed by a lower tree, which may be empty or undersized: it is settled
 -- with its sibling, and the rest is lined up once.
 joinLeft :: Measure a => Int -> SmallArray (Node a) -> Int -> Metrics -> Node a -> Node a
-joinLeft h cs i before l
+joinLeft !h !cs !i !before !l
   | i == 0 = l
   | nodeIsEmpty l = if i == 1 then indexSmallArray cs 0 else inner h before (cloneSmallArray cs 0 i)
   | otherwise = case merge (indexSmallArray cs (i - 1)) l of
@@ -1225,7 +1390,7 @@ joinLeft h cs i before l
 -- | A lower tree followed by the children after child @i@ of a node of
 -- height @h@, whose metrics are @after@.
 joinRight :: Measure a => Int -> SmallArray (Node a) -> Int -> Metrics -> Node a -> Node a
-joinRight h cs i after r
+joinRight !h !cs !i !after !r
   | rest == 0 = r
   | nodeIsEmpty r = if rest == 1 then indexSmallArray cs (i + 1) else inner h after (cloneSmallArray cs (i + 1) rest)
   | otherwise = case merge r (indexSmallArray cs (i + 1)) of
@@ -1247,7 +1412,7 @@ takeNode :: Measure a => Unit -> Int -> Node a -> Node a
 takeNode u k node = case node of
   Leaf m _ arr -> leafPrefix (leafOffset u k m arr) node
   Inner _ h _ cs -> case seekChild u k cs of
-    (# i, before #) -> joinLeft h cs i before (takeNode u (k - count u before) (indexSmallArray cs i))
+    Seek i before -> joinLeft h cs i before (takeNode u (k - count u before) (indexSmallArray cs i))
 {-# INLINABLE takeNode #-}
 {-# SPECIALIZE takeNode :: Unit -> Int -> Node () -> Node () #-}
 
@@ -1255,7 +1420,7 @@ dropNode :: Measure a => Unit -> Int -> Node a -> Node a
 dropNode u k node = case node of
   Leaf m _ arr -> leafSuffix (leafOffset u k m arr) node
   Inner total h _ cs -> case seekChild u k cs of
-    (# i, before #) ->
+    Seek i before ->
       let child = indexSmallArray cs i
           after = total `subMetrics` before `subMetrics` nodeMetrics child
        in joinRight h cs i after (dropNode u (k - count u before) child)
@@ -1275,7 +1440,7 @@ splitNode u k node = case node of
       size = sizeofByteArray arr
       b = leafOffset u k m arr
   Inner total h _ cs -> case seekChild u k cs of
-    (# i, before #) ->
+    Seek i before ->
       let child = indexSmallArray cs i
           after = total `subMetrics` before `subMetrics` nodeMetrics child
        in case splitNode u (k - count u before) child of
@@ -1295,7 +1460,7 @@ metricsAtNode u k root
     go !acc !j node = case node of
       Leaf m _ arr -> acc <> leafPrefixMetrics m arr (leafOffset u j m arr)
       Inner _ _ _ cs -> case seekChild u j cs of
-        (# i, before #) -> go (acc <> before) (j - count u before) (indexSmallArray cs i)
+        Seek i before -> go (acc <> before) (j - count u before) (indexSmallArray cs i)
 
 -- | Just the byte offset of 'metricsAtNode', which is all that editing needs
 -- and spares measuring the prefix of a leaf.
@@ -1308,14 +1473,14 @@ byteOffsetAtNode u k root
     go !acc !j node = case node of
       Leaf m _ arr -> acc + leafOffset u j m arr
       Inner _ _ _ cs -> case seekUnitBytes u j cs of
-        (# i, j', b #) -> go (acc + b) j' (indexSmallArray cs i)
+        SoughtBytes i j' b -> go (acc + b) j' (indexSmallArray cs i)
 
 -- | The byte at offset @i@, for @0 <= i < size@.
 indexByteNode :: Int -> Node a -> Word8
 indexByteNode !i node = case node of
   Leaf _ _ arr -> byteAt arr i
   Inner _ _ _ cs -> case seekByte i cs of
-    (# c, i' #) -> indexByteNode i' (indexSmallArray cs c)
+    Sought c i' -> indexByteNode i' (indexSmallArray cs c)
 
 -- | Bytes @i .. j-1@ as a 'Text', given boundaries @0 <= i <= j <= size@.
 -- A range inside a single chunk is returned as a view of that chunk.
@@ -1325,7 +1490,7 @@ sliceToText !i !j node
   | otherwise = case node of
       Leaf _ _ arr -> viewSlice arr i (j - i)
       Inner _ _ _ cs -> case seekByte i cs of
-        (# c, i' #)
+        Sought c i'
           | j' <= nodeBytes child -> sliceToText i' j' child
           | otherwise ->
               let !(ByteArray ba) = runByteArray $ do
@@ -1342,7 +1507,7 @@ copyRange :: MutableByteArray s -> Int -> Int -> Int -> Node a -> ST s ()
 copyRange out !d !i !j node = case node of
   Leaf _ _ arr -> copyByteArray out d arr i (j - i)
   Inner _ _ _ cs -> case seekByte i cs of
-    (# c0, i0 #) -> go c0 (i - i0)
+    Sought c0 i0 -> go c0 (i - i0)
     where
       n = sizeofSmallArray cs
       go !c !start = when (c < n && start < j) $ do
@@ -1355,11 +1520,14 @@ copyRange out !d !i !j node = case node of
         go (c + 1) end
 
 -- | Locations of the start of line @l@ and of the end of its content, that
--- is before the terminating @\\n@ or @\\r\\n@, or at the end of the rope.
-lineSpan :: Int -> Node a -> (Metrics, Metrics)
-lineSpan l root = (start, lineEnd start (metricsAtNode Lines (max 0 l + 1) root) root)
+-- is before the terminating @\n@ or @\r\n@, or at the end of the rope.
+data Span = Span {-# UNPACK #-} !Metrics {-# UNPACK #-} !Metrics
+
+lineSpan :: Int -> Node a -> Span
+lineSpan !l root = Span start (lineEnd start (metricsAtNode Lines (max 0 l + 1) root) root)
   where
     start = metricsAtNode Lines l root
+{-# NOINLINE lineSpan #-}
 
 -- | End of the content of the line starting at @start@, given the start of
 -- the next line.
@@ -1370,34 +1538,22 @@ lineEnd start next root
   | otherwise = lf
   where
     lf = next `subMetrics` Metrics 1 1 1 1
+{-# INLINE lineEnd #-}
 
--- | A line that starts and is terminated within one leaf, as most lines are:
--- the metrics in front of that leaf, the leaf, and the offsets within it of
--- the start of the line and of the end of its content.
-data LocalLine = LocalLine !Metrics !Metrics !ByteArray !Int !Int
+-- | The end of the content of a line that starts at @from@ and is terminated
+-- by the line feed at @lf@ of the same chunk.
+contentEnd :: ByteArray -> Int -> Int -> Int
+contentEnd arr from lf
+  | lf > from && byteAt arr (lf - 1) == 0x0D = lf - 1
+  | otherwise = lf
+{-# INLINE contentEnd #-}
 
--- | Find line @l >= 0@ in a single descent, if it is local to a leaf.
-localLine :: Int -> Node a -> Maybe LocalLine
-localLine l root
-  | l > newlines (nodeMetrics root) = Nothing
-  | otherwise = go mempty l root
-  where
-    go !acc !j node = case node of
-      Leaf m _ arr ->
-        let from = if j <= 0 then 0 else scanLines j arr
-            lf = findNewline arr from
-         in if lf >= sizeofByteArray arr
-              then Nothing
-              else Just (LocalLine acc m arr from (if lf > from && byteAt arr (lf - 1) == 0x0D then lf - 1 else lf))
-      Inner _ _ _ cs
-        | j <= 0 -> go acc j (indexSmallArray cs 0)
-        | otherwise -> case seekChild Lines j cs of
-            (# i, before #) -> go (acc <> before) (j - newlines before) (indexSmallArray cs i)
-
--- | 'localLine' for when the location of the leaf does not matter.
-localLineText :: Int -> Node a -> Maybe Text
-localLineText l root
-  | l > newlines (nodeMetrics root) = Nothing
+-- | The text of line @l >= 0@. A line that starts and is terminated within
+-- one leaf, as most lines are, is found in a single descent and returned as
+-- a view of that leaf.
+lineText :: Int -> Node a -> Text
+lineText !l root
+  | l > newlines (nodeMetrics root) = T.empty
   | otherwise = go l root
   where
     go !j node = case node of
@@ -1405,24 +1561,27 @@ localLineText l root
         let from = if j <= 0 then 0 else scanLines j arr
             lf = findNewline arr from
          in if lf >= sizeofByteArray arr
-              then Nothing
-              else Just (viewSlice arr from ((if lf > from && byteAt arr (lf - 1) == 0x0D then lf - 1 else lf) - from))
+              then across
+              else viewSlice arr from (contentEnd arr from lf - from)
       Inner _ _ _ cs
         | j <= 0 -> go j (indexSmallArray cs 0)
         | otherwise -> case seekUnit Lines j cs of
-            (# i, j' #) -> go j' (indexSmallArray cs i)
+            Sought i j' -> go j' (indexSmallArray cs i)
+    -- The general case: a line across leaves.
+    across = case lineSpan l root of
+      Span start end -> sliceToText (bytes start) (bytes end) root
 
--- | The position of an offset in a single descent, if the line it is on
--- starts within the same leaf (as most lines do) or with the rope.
-localPosition :: Unit -> Unit -> Int -> Node a -> Maybe Position
-localPosition from to k root
-  | k <= 0 = Just (Position 0 0)
-  | beyondEnd from k (nodeMetrics root) = Nothing
+-- | The position of an offset. Found in a single descent if the line it is
+-- on starts within the same leaf (as most lines do) or with the rope.
+positionAtNode :: Unit -> Unit -> Int -> Node a -> Position
+positionAtNode !from !to !k root
+  | k <= 0 = Position 0 0
+  | beyondEnd from k (nodeMetrics root) = general
   | otherwise = go 0 0 k root
   where
     go !ls !bs !j node = case node of
       Leaf m _ arr ->
-        let b = leafOffset from j m arr
+        let !b = leafOffset from j m arr
             lf = if newlines m == 0 then -1 else findNewlineBack arr b
             start = lf + 1
             column
@@ -1430,31 +1589,59 @@ localPosition from to k root
               | to == Bytes || isAscii m = b - start
               | otherwise = count to (sliceMetrics arr start (b - start))
          in if lf < 0 && bs > 0
-              then Nothing
-              else Just (Position (ls + leafNewlinesBefore m arr b) column)
+              then general
+              else Position (ls + leafNewlinesBefore m arr b) column
       Inner _ _ _ cs -> case seekChild from j cs of
-        (# i, before #) -> go (ls + newlines before) (bs + bytes before) (j - count from before) (indexSmallArray cs i)
+        Seek i before -> go (ls + newlines before) (bs + bytes before) (j - count from before) (indexSmallArray cs i)
+    -- The general case: a line that starts in another leaf.
+    general = positionOfMetrics to (metricsAtNode from k root) root
+
+-- | The position, with its column in the given unit, of a location.
+positionOfMetrics :: Unit -> Metrics -> Node a -> Position
+positionOfMetrics u m root =
+  Position (newlines m) (count u m - count u (metricsAtNode Lines (newlines m) root))
+{-# INLINE positionOfMetrics #-}
 
 metricsAtPositionNode :: Unit -> Position -> Node a -> Metrics
-metricsAtPositionNode u (Position l c) root = case localLine (max 0 l) root of
-  Just (LocalLine acc m arr from to) ->
-    let b
-          | c <= 0 = from
-          | u == Lines || (u == Bytes || isAscii m) && c >= to - from = to
-          | isAscii m = from + c
-          | otherwise = case u of
-              Bytes -> roundDownFrom arr (from + c)
-              Utf16 -> scanUnits True c arr from to
-              _ -> scanUnits False c arr from to
-     in acc <> leafPrefixMetrics m arr b
-  Nothing
-    | c <= 0 -> start
-    | u == Lines || bytes there > bytes end -> end
-    | otherwise -> there
+metricsAtPositionNode !u (Position l0 c) root
+  | l > newlines (nodeMetrics root) = general
+  | otherwise = go mempty l root
   where
+    l = max 0 l0
+    -- A line that starts and is terminated within one leaf, as most lines
+    -- are, is found in a single descent.
+    go !acc !j node = case node of
+      Leaf m _ arr ->
+        let !from = if j <= 0 then 0 else scanLines j arr
+            !lf = findNewline arr from
+         in if lf >= sizeofByteArray arr
+              then general
+              else
+                let !to = contentEnd arr from lf
+                    !b = column m arr from to
+                 in acc <> leafPrefixMetrics m arr b
+      Inner _ _ _ cs
+        | j <= 0 -> go acc j (indexSmallArray cs 0)
+        | otherwise -> case seekChild Lines j cs of
+            Seek i before -> go (acc <> before) (j - newlines before) (indexSmallArray cs i)
+    -- The offset of the column within a leaf, given those of the start of
+    -- the line and of the end of its content.
+    column !m !arr !from !to
+      | c <= 0 = from
+      | u == Lines || (u == Bytes || isAscii m) && c >= to - from = to
+      | isAscii m = from + c
+      | otherwise = case u of
+          Bytes -> roundDownFrom arr (from + c)
+          Utf16 -> scanUnits True c arr from to
+          _ -> scanUnits False c arr from to
     -- The general case: a line across leaves, or no such line.
-    (start, end) = lineSpan l root
-    there = metricsAtNode u (count u start + min c (count u (nodeMetrics root))) root
+    general = case lineSpan l0 root of
+      Span start end
+        | c <= 0 -> start
+        | u == Lines || bytes there > bytes end -> end
+        | otherwise -> there
+        where
+          there = metricsAtNode u (count u start + min c (count u (nodeMetrics root))) root
 
 -- | Location of the end of the longest prefix not satisfying a monotone
 -- predicate.
@@ -1508,24 +1695,28 @@ metricsWhereNode p root
 -- The first argument is the least size the leaf may shrink to: 'minChunk', or
 -- nothing at all for a leaf that is the root. (It is not a 'Bool': with one,
 -- GHC's constructor specialisation gets ahead of specialising the measure.)
-editNode :: Measure a => Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node a -> (# Result a, Int #)
+editNode :: Measure a => Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node a -> (# Result a, Int# #)
 editNode !least u !k !d !src !soff !slen node = case node of
   Leaf m _ arr
-    | d > 0 && kj > count u m -> (# None, 0 #)
-    | slen <= 0 && bj <= bi -> (# None, 0 #)
-    | size' < least || size' > 2 * maxChunk - 8 -> (# None, 0 #)
-    | size' <= maxChunk -> pair (One (mkLeafWith m' (spliceArray arr bi bj src soff slen))) (maxChunk - size')
+    | d > 0 && kj > count u m -> (# None, 0# #)
+    | slen <= 0 && bj <= bi -> (# None, 0# #)
+    | size' < least || size' > 2 * maxChunk - 8 -> (# None, 0# #)
+    | size' <= maxChunk -> roomy (One (mkLeafWith m' (spliceArray arr bi bj src soff slen))) (maxChunk - size')
     | otherwise ->
         -- Room for moving the cut back to a code point boundary is what the
         -- 8 bytes above are for.
-        let both = spliceArray arr bi bj src soff slen
-            cut = roundDownFrom both (size' `quot` 2)
-            mx = sliceMetrics both 0 cut
-            halves =
-              Two
-                (mkLeafWith mx (cloneByteArray both 0 cut))
-                (mkLeafWith (m' `subMetrics` mx) (cloneByteArray both cut (size' - cut)))
-         in pair halves (maxChunk - max cut (size' - cut))
+        let cut = boundary (size' `quot` 2)
+            boundary !at
+              | isContByte (splicedByte arr bi bj src soff slen at) = boundary (at - 1)
+              | otherwise = at
+            left = splicedSlice arr bi bj src soff slen 0 cut
+            mx = sliceMetrics left 0 cut
+         in roomy
+              ( Two
+                  (mkLeafWith mx left)
+                  (mkLeafWith (m' `subMetrics` mx) (splicedSlice arr bi bj src soff slen cut size'))
+              )
+              (maxChunk - max cut (size' - cut))
     where
       !kj = max 0 k + d
       bi = leafOffset u k m arr
@@ -1534,24 +1725,24 @@ editNode !least u !k !d !src !soff !slen node = case node of
       kept = if bj > bi then m `subMetrics` sliceMetrics arr bi (bj - bi) else m
       m' = kept <> sliceMetrics src soff slen
   Inner m h _ cs -> case seekUnit u k cs of
-    (# c, k' #) ->
+    Sought c k' ->
       let old = indexSmallArray cs c
        in case editNode least u k' d src soff slen old of
-            (# None, _ #) -> (# None, 0 #)
+            (# None, _ #) -> (# None, 0# #)
             (# One new, room #) ->
-              pair (One (inner h (m <> (nodeMetrics new `subMetrics` nodeMetrics old)) (replaceAt cs c new))) room
+              (# One (inner h (m <> (nodeMetrics new `subMetrics` nodeMetrics old)) (replaceAt cs c new)), room #)
             (# Two x y, room #) ->
-              pair (fromChildren h (m <> ((nodeMetrics x <> nodeMetrics y) `subMetrics` nodeMetrics old)) (insert2 cs c x y)) room
+              (# fromChildren h (m <> ((nodeMetrics x <> nodeMetrics y) `subMetrics` nodeMetrics old)) (insert2 cs c x y), room #)
 {-# INLINABLE editNode #-}
-{-# SPECIALIZE editNode :: Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node () -> (# Result (), Int #) #-}
+{-# SPECIALIZE editNode :: Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node () -> (# Result (), Int# #) #-}
 
 -- | Replace the text from offset @i@ up to offset @j@. Comes with the room
 -- of 'editNode', or none if it does not know.
 editRoot :: Measure a => Unit -> Int -> Int -> Text -> Node a -> (# Node a, Int #)
 editRoot u i j t@(TI.Text (A.ByteArray ba) off len) root =
   case editNode (if nodeHeight root == 0 then 0 else minChunk) u from (max 0 (j - from)) (ByteArray ba) off len root of
-    (# One node, room #) -> (# node, room #)
-    (# Two x y, room #) -> pair (mkInner2 x y) room
+    (# One node, room #) -> (# node, I# room #)
+    (# Two x y, room #) -> pair (mkInner2 x y) (I# room)
     (# None, _ #)
       | bi < bj -> pair (takeRoot Bytes bi root `appendNode` fromTextNode t `appendNode` dropRoot Bytes bj root) 0
       | len <= 0 -> (# root, 0 #)
@@ -1594,29 +1785,35 @@ edited u i j t root = case editRoot u i j t root of
 -- leaf has. The insertion before the run went to the same leaf and reports
 -- it; should it be wrong, inserting the run is slower, not wrong.
 
--- | A rope with a run of keystrokes to be inserted at an offset.
-typing :: Measure a => Node a -> Unit -> Int -> Int -> ByteArray -> Metrics -> Int -> Rope a
-typing base u start next run total room =
-  Typing (edited u start start (chunkText run) base) base u start next run total room
+-- | A rope with a run of keystrokes, of the given metrics, to be inserted at
+-- an offset.
+typing :: Measure a => Node a -> Unit -> Int -> ByteArray -> Metrics -> Int -> Rope a
+typing base u start run typed room =
+  Typing (edited u start start (chunkText run) base) base u start run (packMetrics typed) room
 {-# INLINE typing #-}
+
+-- | The offset at which a keystroke would continue a run.
+typingNext :: Unit -> Int -> PackedMetrics -> Int
+typingNext u start typed = start + count u (unpackMetrics typed)
+{-# INLINE typingNext #-}
 
 -- | Insert text at an offset. The first insertion at some place goes into the
 -- tree and leaves a note of where it ended. One that starts there is taken
 -- for typing and begins a run, which the ones after it add to.
 insertText :: Measure a => Unit -> Int -> Text -> Rope a -> Rope a
 insertText u i t@(TI.Text (A.ByteArray ba) off len) r = case r of
-  Typing root base ru start next run total room
-    | next == i && ru == u && len <= room ->
+  Typing root base ru start run typed room
+    | typingNext ru start typed == i && ru == u && len <= room ->
         let tm = sliceMetrics src off len
-         in typing base u start (next + count u tm) (concatSlices run 0 (sizeofByteArray run) src off len) (total <> tm) (room - len)
-    | otherwise -> settled root ru next room
+         in typing base u start (concatSlices run 0 (sizeofByteArray run) src off len) (unpackMetrics typed <> tm) (room - len)
+    | otherwise -> settled root ru (typingNext ru start typed) room
   Settled root hu hint room -> settled root hu hint room
   where
     src = ByteArray ba
-    settled root hu hint room
+    settled !root !hu !hint !room
       | hint == i && i >= 0 && hu == u && len <= min room maxPending =
           let tm = sliceMetrics src off len
-           in typing root u i (i + count u tm) (cloneByteArray src off len) (nodeMetrics root <> tm) (min room maxPending - len)
+           in typing root u i (cloneByteArray src off len) tm (min room maxPending - len)
       | otherwise = case editRoot u i i t root of
           (# root', room' #) ->
             let grown = count u (nodeMetrics root') - count u (nodeMetrics root)
@@ -1629,14 +1826,14 @@ insertText u i t@(TI.Text (A.ByteArray ba) off len) r = case r of
 -- offsets say, which is known of code points that are not beyond the end.
 deleteRange :: Measure a => Unit -> Int -> Int -> Rope a -> Rope a
 deleteRange u i j r = case r of
-  Typing _ base Chars start next run total room
-    | u == Chars && j == next && i >= start && start <= chars (nodeMetrics base) ->
+  Typing _ base Chars start run typed room
+    | u == Chars && j == typingNext Chars start typed && i >= start && start <= chars (nodeMetrics base) ->
         let size = sizeofByteArray run
             keep = dropCharsEnd (j - i) run
-            total' = total `subMetrics` sliceMetrics run keep (size - keep)
+            typed' = unpackMetrics typed `subMetrics` sliceMetrics run keep (size - keep)
          in if keep <= 0
               then Settled base Chars start (room + size)
-              else typing base Chars start i (cloneByteArray run 0 keep) total' (room + size - keep)
+              else typing base Chars start (cloneByteArray run 0 keep) typed' (room + size - keep)
   _ -> Rope (edited u i j T.empty (rootOf r))
 {-# INLINABLE deleteRange #-}
 {-# SPECIALIZE deleteRange :: Unit -> Int -> Int -> Rope () -> Rope () #-}
@@ -1773,7 +1970,7 @@ chunkAt u k (Rope root)
     go !i node = case node of
       Leaf _ _ arr -> viewSlice arr i (sizeofByteArray arr - i)
       Inner _ _ _ cs -> case seekByte i cs of
-        (# c, i' #) -> go i' (indexSmallArray cs c)
+        Sought c i' -> go i' (indexSmallArray cs c)
 
 ------------------------------------------------------------------------------
 -- Queries
@@ -1797,7 +1994,7 @@ lineCount r = newlines (metrics r) + 1
 -- | /O(1)/. All built-in measurements of the rope.
 metrics :: Rope a -> Metrics
 metrics (Settled root _ _ _) = nodeMetrics root
-metrics (Typing _ _ _ _ _ _ total _) = total
+metrics (Typing _ base _ _ _ typed _) = nodeMetrics base <> unpackMetrics typed
 {-# INLINE metrics #-}
 
 -- | /O(1)/. The custom measure of the rope.
@@ -1914,11 +2111,7 @@ replace u i j t r
 getLine :: Int -> Rope a -> Text
 getLine l (Rope root)
   | l < 0 = T.empty
-  | otherwise = case localLineText l root of
-      Just line -> line
-      Nothing ->
-        let (start, end) = lineSpan l root
-         in sliceToText (bytes start) (bytes end) root
+  | otherwise = lineText l root
 
 -- | /O(n)/. The lines of the rope without their terminators, lazily. Like
 -- 'Data.Text.lines', a trailing @\\n@ does not start another line; unlike
@@ -1986,8 +2179,7 @@ metricsAtPosition u pos (Rope root) = metricsAtPositionNode u pos root
 -- | /O(log n)/. The position, with its column in the given unit, of a
 -- location obtained from 'metricsAt', 'metricsAtPosition' or 'metricsWhere'.
 metricsToPosition :: Unit -> Metrics -> Rope a -> Position
-metricsToPosition u m (Rope root) =
-  Position (newlines m) (count u m - count u (metricsAtNode Lines (newlines m) root))
+metricsToPosition u m (Rope root) = positionOfMetrics u m root
 
 -- | /O(log n)/. @offsetToPosition from to@ turns an offset in unit @from@
 -- into a position with its column in unit @to@.
@@ -1995,9 +2187,7 @@ metricsToPosition u m (Rope root) =
 -- >>> offsetToPosition Bytes Utf16 11 "a😀\nb😀c"
 -- Position {posLine = 1, posColumn = 3}
 offsetToPosition :: Unit -> Unit -> Int -> Rope a -> Position
-offsetToPosition from to k r@(Rope root) = case localPosition from to k root of
-  Just pos -> pos
-  Nothing -> metricsToPosition to (metricsAt from k r) r
+offsetToPosition from to k (Rope root) = positionAtNode from to k root
 
 -- | /O(log n)/. @positionToOffset from to@ turns a position with its column
 -- in unit @from@ into an offset in unit @to@.
@@ -2044,15 +2234,14 @@ remeasure (Rope root) = Rope (go root)
 invariants :: (Measure a, Eq a) => Rope a -> [String]
 invariants rope = case rope of
   Settled root _ _ _ -> go True root
-  Typing root base u start next run total room ->
+  Typing root base u start run typed room ->
     go True root
       ++ map ("without what was typed: " ++) (go True base)
       ++ [ "a run of " ++ show (sizeofByteArray run) ++ " bytes with room for " ++ show room | sizeofByteArray run <= 0 || room < 0 || sizeofByteArray run + room > maxPending ]
       ++ [ "a run by lines" | u == Lines ]
-      ++ [ "a run from " ++ show start ++ " to " ++ show next ++ " of " ++ show (count u typed) | start < 0 || next - start /= count u typed ]
-      ++ [ "the rope caches " ++ show total ++ " instead of " ++ show (nodeMetrics root) | total /= nodeMetrics root ]
-    where
-      typed = naive run
+      ++ [ "a run at " ++ show start | start < 0 ]
+      ++ [ "the run caches " ++ show (unpackMetrics typed) ++ " instead of " ++ show (naive run) | unpackMetrics typed /= naive run ]
+      ++ [ "the rope reports " ++ show (metrics rope) ++ " instead of " ++ show (nodeMetrics root) | metrics rope /= nodeMetrics root ]
   where
     go isRoot node = case node of
       Leaf m a arr ->

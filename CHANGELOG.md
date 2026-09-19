@@ -12,6 +12,10 @@
   tree and are inserted at once when the rope is next read, and erasing what
   was just typed takes them back. `length` and `metrics` stay `O(1)`.
 * `splitAt` finds both halves in one descent.
+* Allocation is kept to what persistence needs: an edit allocates the new
+  chunk, a node and an array of pointers per level, and nothing else; looking
+  something up allocates nothing but the answer; loading a text allocates the
+  rope and no garbage. A leaf keeps its four metrics in one word.
 * Chunks are scanned with SIMD instructions through C (SSE2, AVX2 when the
   CPU supports it, picked at run time); the `simd` flag turns this off.
 * `Data.Text.NanoRope.Measured`: the same rope carrying a custom monoidal
