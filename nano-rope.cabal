@@ -126,7 +126,12 @@ benchmark nano-rope-bench
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench
     main-is:          Main.hs
-    ghc-options:      -O2 -rtsopts "-with-rtsopts=-A32m"
+    other-modules:
+        Chart
+        Memory
+
+    -- -T: statistics, for the bytes allocated and the heap in use.
+    ghc-options:      -O2 -rtsopts "-with-rtsopts=-A32m -T"
     build-depends:
         base,
         nano-rope,

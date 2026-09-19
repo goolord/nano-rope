@@ -5,17 +5,31 @@
 -- @-f compare-text-rope@, @-f compare-yi-rope@ or @-f compare-core-text@ to
 -- run the same workloads on those packages, as far as they have the means:
 -- @yi-rope@ knows nothing of UTF-16, and @core-text@ nothing of lines either.
+--
+-- With @--chart FILE.svg@ the results are drawn into a chart as well, next to
+-- the heap each library needs to hold the document.
 module Main (main) where
 
+import Chart (Chart (..), Footprint (..), Group (..), Row (..), Sample (..), readSamples, render, showBytes)
 import Control.DeepSeq (NFData (..))
+import Control.Exception (throwIO, try)
+import Control.Monad (forM_, unless)
 import Data.Bits (shiftR)
 import qualified Data.List as L
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.NanoRope (Position (..), Unit (..))
 import qualified Data.Text.NanoRope as Nano
+import Data.Version (showVersion)
 import Data.Word (Word64)
+import GHC.Stats (getRTSStatsEnabled)
+import Memory (footprint, fresh)
+import System.Environment (getArgs, withArgs)
+import System.Exit (ExitCode (..))
+import System.IO (IOMode (..), hGetContents', hPutStr, hSetEncoding, utf8, withFile)
+import System.Info (fullCompilerVersion)
 import Test.Tasty.Bench
+import Text.Printf (printf)
 
 #ifdef COMPARE_TEXT_ROPE
 import qualified Data.Text.Rope as TR
@@ -121,7 +135,7 @@ mkEnv nLines nOps =
     , envOneLine = oneLine
     , envNano = nano
     , envNanoOneLine = Nano.fromText oneLine
-    , envNanoEdited = L.foldl' (\rope i -> Nano.insert Chars i "x" rope) nano offsets
+    , envNanoEdited = nanoEdited offsets nano
     , envChars = offsets
     , envBursts = [(i, Nano.convert Chars Lines i nano) | i <- L.take 100 offsets]
     , envPositions = [Position (r `mod` nLines) (r `mod` 40) | r <- L.take nOps (rands 3)]
@@ -130,25 +144,30 @@ mkEnv nLines nOps =
     , envTR = TR.fromText text
     , envTROneLine = TR.fromText oneLine
     , envTR16 = TR16.fromText text
-    , envTREdited = L.foldl' (\rope i -> let (a, b) = TR.splitAt (fromIntegral i) rope in a <> "x" <> b) (TR.fromText text) offsets
+    , envTREdited = trEdited offsets (TR.fromText text)
 #endif
 #ifdef COMPARE_YI_ROPE
     , envYi = Yi.fromText text
     , envYiOneLine = Yi.fromText oneLine
-    , envYiEdited = L.foldl' (flip yiInsert) (Yi.fromText text) offsets
+    , envYiEdited = yiEdited offsets (Yi.fromText text)
 #endif
 #ifdef COMPARE_CORE_TEXT
     , envCT = ctFromText text
     , envCTOneLine = ctFromText oneLine
-    , envCTEdited = L.foldl' (\rope i -> CT.insertRope i "x" rope) (ctFromText text) offsets
+    , envCTEdited = ctEdited offsets (ctFromText text)
 #endif
     }
   where
     text = sourceText nLines
     oneLine = minified text
     nano = Nano.fromText text
+    offsets = editOffsets nOps text
+
+-- | Where the random edits go.
+editOffsets :: Int -> Text -> [Int]
+editOffsets nOps text = [r `mod` (chars + 1) | r <- L.take nOps (rands 2)]
+  where
     chars = T.length text
-    offsets = [r `mod` (chars + 1) | r <- L.take nOps (rands 2)]
 
 ------------------------------------------------------------------------------
 -- Workloads
@@ -159,8 +178,11 @@ built :: Nano.Rope -> Int
 built r = if T.null (Nano.chunkAt Bytes 0 r) then 0 else Nano.length Chars r
 
 -- | Insert a character at each of the given offsets.
+nanoEdited :: [Int] -> Nano.Rope -> Nano.Rope
+nanoEdited offsets r0 = L.foldl' (\r i -> Nano.insert Chars i "x" r) r0 offsets
+
 nanoInserts :: [Int] -> Nano.Rope -> Int
-nanoInserts offsets r0 = built (L.foldl' (\r i -> Nano.insert Chars i "x" r) r0 offsets)
+nanoInserts offsets r0 = built (nanoEdited offsets r0)
 
 -- | Type a run of characters starting at each of the given offsets.
 nanoTyping :: Int -> [Int] -> Nano.Rope -> Int
@@ -204,10 +226,13 @@ nanoGetLines :: [Position] -> Nano.Rope -> Int
 nanoGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (Nano.getLine l r)) 0 positions
 
 #ifdef COMPARE_TEXT_ROPE
-trInserts :: [Int] -> TR.Rope -> Int
-trInserts offsets r0 = fromIntegral (TR.length (L.foldl' ins r0 offsets))
+trEdited :: [Int] -> TR.Rope -> TR.Rope
+trEdited offsets r0 = L.foldl' ins r0 offsets
   where
     ins r i = let (a, b) = TR.splitAt (fromIntegral i) r in a <> "x" <> b
+
+trInserts :: [Int] -> TR.Rope -> Int
+trInserts offsets r0 = fromIntegral (TR.length (trEdited offsets r0))
 
 trTyping :: Int -> [Int] -> TR.Rope -> Int
 trTyping n offsets r0 = fromIntegral (TR.length (L.foldl' burst r0 offsets))
@@ -263,8 +288,11 @@ yiFromText t = let r = Yi.fromText t in Yi.countNewLines r `seq` r
 yiInsert :: Int -> Yi.YiString -> Yi.YiString
 yiInsert i r = let (a, b) = Yi.splitAt i r in a <> "x" <> b
 
+yiEdited :: [Int] -> Yi.YiString -> Yi.YiString
+yiEdited offsets r0 = L.foldl' (flip yiInsert) r0 offsets
+
 yiInserts :: [Int] -> Yi.YiString -> Int
-yiInserts offsets r0 = Yi.length (L.foldl' (flip yiInsert) r0 offsets)
+yiInserts offsets r0 = Yi.length (yiEdited offsets r0)
 
 yiTyping :: Int -> [Int] -> Yi.YiString -> Int
 yiTyping n offsets r0 = Yi.length (L.foldl' burst r0 offsets)
@@ -305,8 +333,11 @@ ctFromText = CT.intoRope
 ctToText :: CT.Rope -> Text
 ctToText = CT.fromRope
 
+ctEdited :: [Int] -> CT.Rope -> CT.Rope
+ctEdited offsets r0 = L.foldl' (\r i -> CT.insertRope i "x" r) r0 offsets
+
 ctInserts :: [Int] -> CT.Rope -> Int
-ctInserts offsets r0 = CT.widthRope (L.foldl' (\r i -> CT.insertRope i "x" r) r0 offsets)
+ctInserts offsets r0 = CT.widthRope (ctEdited offsets r0)
 
 ctTyping :: Int -> [Int] -> CT.Rope -> Int
 ctTyping n offsets r0 = CT.widthRope (L.foldl' burst r0 offsets)
@@ -328,10 +359,14 @@ ctSplits offsets r = L.foldl' (\n i -> let (a, b) = CT.splitRope i r in n + CT.w
 
 ------------------------------------------------------------------------------
 
-main :: IO ()
-main =
-  defaultMain
-    [ env (pure (mkEnv 100000 10000)) $ \e ->
+-- | The size of the document, and the number of operations in a workload.
+documentLines, workloadOps :: Int
+documentLines = 100000
+workloadOps = 10000
+
+benchmarks :: [Benchmark]
+benchmarks =
+    [ env (pure (mkEnv documentLines workloadOps)) $ \e ->
         bgroup
           "100k lines"
           [ bgroup
@@ -547,3 +582,159 @@ main =
               ]
           ]
     ]
+
+------------------------------------------------------------------------------
+-- The chart
+
+main :: IO ()
+main = do
+  args <- getArgs
+  case chartArgs args of
+    Nothing -> defaultMain benchmarks
+    Just (svg, csv, redraw, rest) -> do
+      stats <- getRTSStatsEnabled
+      unless stats $ putStrLn "No RTS statistics (+RTS -T): leaving memory out."
+      (textHeap, fps) <- if stats then footprints else pure (Nothing, [])
+      forM_ textHeap $ \t -> do
+        putStrLn "Live heap holding the document"
+        printf "  %-10s %s\n" ("Text" :: String) (showBytes t)
+        forM_ fps $ \f ->
+          printf "  %-10s %-8s %s\n" (footprintLibrary f) (footprintState f) (showBytes (footprintBytes f))
+      unless redraw $ do
+        done <- try (withArgs rest (defaultMain benchmarks))
+        case done of
+          Left ExitSuccess -> pure ()
+          Left failure -> throwIO failure
+          Right () -> pure ()
+      samples <- readSamples <$> withFile csv ReadMode hGetContents'
+      bytes <- Nano.length Bytes . Nano.fromText <$> fresh sourceText documentLines
+      let ran = map sampleLibrary samples ++ map footprintLibrary fps
+          others = filter (`elem` ran) (drop 1 libraries)
+      withFile svg WriteMode $ \h -> do
+        hSetEncoding h utf8
+        hPutStr h . render $
+          Chart
+            { chartTitle = "nano-rope" ++ (if null others then "" else " against " ++ andList others)
+            , chartSubtitle =
+                printf
+                  "A run is %s operations on %s lines of source code (%.1f MB), or one load or save of it. GHC %s."
+                  (commas workloadOps)
+                  (commas documentLines)
+                  (fromIntegral bytes / 1e6 :: Double)
+                  (showVersion fullCompilerVersion)
+            , chartNotes =
+                [ "Fresh: a freshly loaded rope. Edited: the same rope after " ++ commas workloadOps
+                    ++ " random inserts, in the shape it has mid-session. Rows with one run are on a fresh rope."
+                , "* Not counting the libraries that do no work here. A freshly loaded text-rope or core-text is a single chunk, and core-text is the Text it was loaded from: their toText is free, and their first reads walk the whole text."
+                , "No mark: the library cannot do this (yi-rope has no UTF-16, core-text neither UTF-16 nor lines). A hollow mark at the right: left out, a run takes minutes."
+                , "Live heap: what stays reachable after a major collection once the Text the document came from is dropped. A rope that shares that Text keeps it alive."
+                ]
+            , chartLibraries = libraries
+            , chartGroups = chartRows
+            , chartSamples = samples
+            , chartSkipped = skipped
+            , chartFree = [("fromText", "core-text"), ("toText", "text-rope"), ("toText", "core-text")]
+            , chartFreeNote = "*"
+            , chartTextHeap = textHeap
+            , chartFootprints = fps
+            }
+      putStrLn ("Chart: " ++ svg)
+  where
+    libraries = ["nano-rope", "text-rope", "yi-rope", "core-text"]
+    andList [x] = x
+    andList [x, y] = x ++ " and " ++ y
+    andList (x : xs) = x ++ ", " ++ andList xs
+    andList [] = ""
+    skipped =
+#ifdef COMPARE_CORE_TEXT
+      [(w, "core-text") | w <- ["10k keystrokes in one spot", "10k random splits"]]
+#else
+      []
+#endif
+
+-- | The workloads by what they do, each on a fresh rope and, where there is
+-- a workload for it, an edited one.
+chartRows :: [Group]
+chartRows =
+  [ Group
+      "Loading and saving"
+      [ Row "fromText" [("", "fromText")]
+      , both "toText" "toText"
+      ]
+  , Group
+      "Editing"
+      [ both "Random inserts" "10k random inserts"
+      , Row "Random deletes" [("", "10k random deletes")]
+      , Row "Random inserts, one long line" [("", "one long line, 10k random inserts")]
+      , Row "Edits at UTF-16 positions" [("", "10k edits at UTF-16 positions")]
+      ]
+  , Group
+      "Typing"
+      [ both "100 bursts of 100 keystrokes" "100 bursts of 100 keystrokes"
+      , Row "The same, reading the line" [("", "100 bursts of 100 keystrokes, reading the line after each")]
+      , both "10,000 keystrokes in one spot" "10k keystrokes in one spot"
+      ]
+  , Group
+      "Reading"
+      [ both "Random splits" "10k random splits"
+      , both "getLine" "10k getLine"
+      , Row "Byte offsets to UTF-16 positions" [("", "10k byte offsets to UTF-16 positions")]
+      ]
+  ]
+  where
+    both label w = Row label [(freshState, w), (editedState, "after 10k edits, " ++ w)]
+
+freshState, editedState :: String
+freshState = "fresh"
+editedState = "edited"
+
+-- | @--chart FILE@, and the CSV file the numbers come back through: the one
+-- @--csv@ names, or FILE with @.csv@ for its extension. With @--redraw@ the
+-- benchmarks do not run again, and the chart is drawn from that file.
+chartArgs :: [String] -> Maybe (FilePath, FilePath, Bool, [String])
+chartArgs args = case break (== "--chart") (filter (/= "--redraw") args) of
+  (before, _ : svg : after) ->
+    let rest = before ++ after
+     in Just $ case lookup "--csv" (zip rest (drop 1 rest)) of
+          Just csv -> (svg, csv, redraw, rest)
+          Nothing -> let csv = dropSvg svg ++ ".csv" in (svg, csv, redraw, rest ++ ["--csv", csv])
+  _ -> Nothing
+  where
+    redraw = "--redraw" `elem` args
+    dropSvg f = maybe f reverse (L.stripPrefix "gvs." (reverse f))
+
+commas :: Int -> String
+commas = reverse . L.intercalate "," . L.unfoldr (\s -> if null s then Nothing else Just (L.splitAt 3 s)) . reverse . show
+
+------------------------------------------------------------------------------
+-- Memory
+
+-- | The live heap each library needs to hold the document, freshly loaded
+-- and after the random edits, and that of the document as one 'Text'.
+footprints :: IO (Maybe Double, [Footprint])
+footprints = do
+  offsets <- fresh (\n -> let o = editOffsets workloadOps (sourceText n) in rnf o `seq` o) documentLines
+  text <- footprint sourceText documentLines id rnf
+  fps <-
+    sequence
+      [ measure "nano-rope" Nano.fromText (nanoEdited offsets) rnf
+#ifdef COMPARE_TEXT_ROPE
+      , measure "text-rope" TR.fromText (trEdited offsets) rnf
+#endif
+#ifdef COMPARE_YI_ROPE
+      , measure "yi-rope" yiFromText (yiEdited offsets) forceYi
+#endif
+#ifdef COMPARE_CORE_TEXT
+      , measure "core-text" ctFromText (ctEdited offsets) rnf
+#endif
+      ]
+  pure (Just text, concat fps)
+  where
+    measure :: String -> (Text -> a) -> (a -> a) -> (a -> ()) -> IO [Footprint]
+    measure library load edit deep = do
+      loaded <- footprint sourceText documentLines load deep
+      edited <- footprint sourceText documentLines (edit . load) deep
+      pure
+        [ Footprint freshState library loaded
+        , Footprint editedState library edited
+        ]
