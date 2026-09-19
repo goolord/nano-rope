@@ -3,6 +3,7 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE UnliftedFFITypes #-}
 {-# LANGUAGE ViewPatterns #-}
 -- Constructor specialisation clones the recursive workers before they can be
 -- specialised to a measure, and the clones then take the measure as a
@@ -31,6 +32,15 @@
 -- Nothing about a child is kept in its parent but the pointer. An edit
 -- therefore copies one small array of pointers per level: persistence is
 -- paid for in allocation, and this is what keeps the bill short.
+--
+-- = Scanning
+--
+-- Whatever reads through a chunk (measuring it, finding a line feed,
+-- counting code points or UTF-16 code units up to some offset) is one of a
+-- few scans. Slices of 32 bytes or more are scanned by C with SIMD
+-- instructions, AVX2 or SSE2 as the CPU allows (see 'kernels'); shorter ones,
+-- and all of them if the package is built with @-f -simd@, by Haskell
+-- reading 8 bytes at a time.
 module Data.Text.NanoRope.Internal
   ( -- * Types
     Rope (.., Rope)
@@ -111,6 +121,8 @@ module Data.Text.NanoRope.Internal
   , sliceMetrics
   , offsetInChunk
   , chunkText
+  , Kernels (..)
+  , kernels
   ) where
 
 import Control.DeepSeq (NFData (..))
@@ -130,6 +142,9 @@ import qualified Data.Text.Lazy as TL
 import Data.Word (Word8)
 import GHC.Exts (Int (..), indexWord8ArrayAsWord64#)
 import GHC.Word (Word64 (..))
+#ifdef NANO_ROPE_SIMD
+import System.IO.Unsafe (unsafeDupablePerformIO)
+#endif
 import Prelude hiding (drop, getLine, length, lines, null, splitAt, take)
 
 ------------------------------------------------------------------------------
@@ -598,10 +613,13 @@ nlCount w = byteSum ((complement t .&. highs) `unsafeShiftR` 7)
     t = ((x .&. 0x7F7F7F7F7F7F7F7F) + 0x7F7F7F7F7F7F7F7F) .|. x
 {-# INLINE nlCount #-}
 
--- | Metrics of @len@ bytes of valid UTF-8 starting at @off@, 8 bytes at a
--- time.
+-- | Metrics of @len@ bytes of valid UTF-8 starting at @off@.
 sliceMetrics :: ByteArray -> Int -> Int -> Metrics
-sliceMetrics arr off len = goWord off 0 0 0
+sliceMetrics arr off len = kernelMetrics (scans len) arr off len
+
+-- | 'sliceMetrics', 8 bytes at a time.
+swarMetrics :: ByteArray -> Int -> Int -> Metrics
+swarMetrics arr off len = goWord off 0 0 0
   where
     end = off + len
     goWord !i !conts !fours !nls
@@ -665,10 +683,14 @@ offsetInChunk u k arr
 
 -- | @scanUnits wide k arr from to@ walks over code points from the boundary
 -- @from@ and stops in front of the first one that does not fit into @k@
--- units, or at @to@. Whole words are skipped as long as everything in them
--- fits.
+-- units, or at @to@.
 scanUnits :: Bool -> Int -> ByteArray -> Int -> Int -> Int
-scanUnits wide k arr from to = goWord from 0
+scanUnits wide k arr from to = kernelScanUnits (scans (to - from)) wide k arr from to
+{-# INLINE scanUnits #-}
+
+-- | 'scanUnits', skipping whole words as long as everything in them fits.
+swarScanUnits :: Bool -> Int -> ByteArray -> Int -> Int -> Int
+swarScanUnits wide k arr from to = goWord from 0
   where
     goWord !i !n
       | i + 8 <= to =
@@ -687,7 +709,7 @@ scanUnits wide k arr from to = goWord from 0
       where
         b = byteAt arr i
         u = if wide && b >= 0xF0 then 2 else 1
-{-# INLINE scanUnits #-}
+{-# INLINE swarScanUnits #-}
 
 -- | Is this all ASCII? Then bytes, code points and UTF-16 code units are the
 -- same thing and nothing needs to be scanned to convert between them.
@@ -710,16 +732,23 @@ leafPrefixMetrics :: Metrics -> ByteArray -> Int -> Metrics
 leafPrefixMetrics m arr b
   | b <= 0 = mempty
   | b >= size = m
-  | 2 * b > size = m `subMetrics` range b (size - b)
-  | otherwise = range 0 b
+  | 2 * b > size = m `subMetrics` leafSliceMetrics m arr b (size - b)
+  | otherwise = leafSliceMetrics m arr 0 b
   where
     size = bytes m
-    range off len
-      | isAscii m = Metrics len len len (if newlines m == 0 then 0 else countNewlines arr off len)
-      | otherwise = sliceMetrics arr off len
+
+-- | Metrics of a slice of a leaf with known metrics. (Not local to
+-- 'leafPrefixMetrics', where it would be allocated as a closure.)
+leafSliceMetrics :: Metrics -> ByteArray -> Int -> Int -> Metrics
+leafSliceMetrics m arr off len
+  | isAscii m = Metrics len len len (if newlines m == 0 then 0 else countNewlines arr off len)
+  | otherwise = sliceMetrics arr off len
 
 countNewlines :: ByteArray -> Int -> Int -> Int
-countNewlines arr off len = goWord off 0
+countNewlines arr off len = kernelNewlines (scans len) arr off len
+
+swarNewlines :: ByteArray -> Int -> Int -> Int
+swarNewlines arr off len = goWord off 0
   where
     end = off + len
     goWord !i !n
@@ -731,7 +760,10 @@ countNewlines arr off len = goWord off 0
 
 -- | Offset of the first @\\n@ at or after @from@, or the size of the chunk.
 findNewline :: ByteArray -> Int -> Int
-findNewline arr = goWord
+findNewline arr from = kernelFindNewline (scans (sizeofByteArray arr - from)) arr from
+
+swarFindNewline :: ByteArray -> Int -> Int
+swarFindNewline arr = goWord
   where
     len = sizeofByteArray arr
     goWord !i
@@ -743,7 +775,10 @@ findNewline arr = goWord
 
 -- | Offset of the last @\\n@ before @to@, or @-1@.
 findNewlineBack :: ByteArray -> Int -> Int
-findNewlineBack arr = goWord
+findNewlineBack arr to = kernelFindNewlineBack (scans to) arr to
+
+swarFindNewlineBack :: ByteArray -> Int -> Int
+swarFindNewlineBack arr = goWord
   where
     goWord !i
       | i >= 8 && nlCount (indexWord64 arr (i - 8)) == 0 = goWord (i - 8)
@@ -764,8 +799,13 @@ leafNewlinesBefore m arr b
   where
     size = bytes m
 
+-- | The offset just after the @k@-th @\\n@ of a chunk, for @k >= 1@, or the
+-- size of the chunk.
 scanLines :: Int -> ByteArray -> Int
-scanLines k arr = goWord 0 0
+scanLines k arr = kernelNthNewline (scans (sizeofByteArray arr)) k arr
+
+swarScanLines :: Int -> ByteArray -> Int
+swarScanLines k arr = goWord 0 0
   where
     len = sizeofByteArray arr
     goWord !i !n
@@ -777,6 +817,106 @@ scanLines k arr = goWord 0 0
       | i >= len = len
       | byteAt arr i == 0x0A = if n + 1 == k then i + 1 else goByte (i + 1) (n + 1)
       | otherwise = goByte (i + 1) n
+
+------------------------------------------------------------------------------
+-- Scanning chunks with SIMD
+
+-- | One implementation of the scans over chunks, as the functions above use
+-- them. Exposed so that the test suite can hold them all to the same results.
+data Kernels = Kernels
+  { kernelsName :: String
+  , kernelMetrics :: ByteArray -> Int -> Int -> Metrics
+  -- ^ Like 'sliceMetrics'.
+  , kernelNewlines :: ByteArray -> Int -> Int -> Int
+  -- ^ Line feeds in a slice.
+  , kernelFindNewline :: ByteArray -> Int -> Int
+  -- ^ The first line feed at or after an offset, or the size.
+  , kernelFindNewlineBack :: ByteArray -> Int -> Int
+  -- ^ The last line feed before an offset, or -1.
+  , kernelNthNewline :: Int -> ByteArray -> Int
+  -- ^ Just after the @k@-th line feed, for @k >= 1@, or the size.
+  , kernelScanUnits :: Bool -> Int -> ByteArray -> Int -> Int -> Int
+  -- ^ @kernelScanUnits wide k arr from to@: from a code point boundary, the
+  -- offset in front of the first code point that does not fit into @k@ code
+  -- points (UTF-16 code units if @wide@), or @to@.
+  }
+
+-- | The scans in Haskell, 8 bytes at a time.
+swarKernels :: Kernels
+swarKernels = Kernels "Haskell" swarMetrics swarNewlines swarFindNewline swarFindNewlineBack swarScanLines swarScanUnits
+
+-- | The scans for a slice of this length: in C if it is long enough to make
+-- up for a foreign call, which costs a few nanoseconds.
+scans :: Int -> Kernels
+scans len
+  | len >= simdMin = simdKernels simdLevel
+  | otherwise = swarKernels
+{-# INLINE scans #-}
+
+-- | Every implementation this machine runs: the Haskell one, then those in C
+-- by level of SIMD support. The last one is used on long slices.
+kernels :: [Kernels]
+kernels = swarKernels : map simdKernels [0 .. simdLevel]
+
+-- | Slices at least this long are scanned in C.
+simdMin :: Int
+
+-- | The best level of SIMD support of the machine, as the C numbers them.
+simdLevel :: Int
+
+-- | The scans in C at a level of SIMD support, which must be supported.
+simdKernels :: Int -> Kernels
+
+#ifdef NANO_ROPE_SIMD
+-- The scans in C (cbits/scan.c), with SSE2 or AVX2. Unsafe calls, which may
+-- be handed the payload of an unpinned array: the garbage collector cannot
+-- run during one.
+
+#ifdef NANO_ROPE_SMALL
+-- Everything, so that the tiny chunks of the test suite go through the C.
+simdMin = 0
+#else
+simdMin = 32
+#endif
+
+-- Asked once: a pure foreign call would be inlined into every scan and ask
+-- again each time.
+simdLevel = unsafeDupablePerformIO c_simdLevel
+{-# NOINLINE simdLevel #-}
+
+simdKernels level =
+  Kernels
+    (["portable C", "SSE2", "AVX2"] !! level)
+    sliceIn
+    (\(ByteArray ba) off len -> c_newlines level ba off len)
+    (\arr@(ByteArray ba) from -> c_findNewline level ba from (sizeofByteArray arr))
+    (\(ByteArray ba) to -> c_findNewlineBack level ba to)
+    (\k arr@(ByteArray ba) -> c_nthNewline level ba (sizeofByteArray arr) k)
+    (\wide k (ByteArray ba) from to -> c_scanUnits level ba from to k (fromEnum wide))
+  where
+    -- The C counts continuation bytes, 4-byte leaders and line feeds in 21
+    -- bits each; chunks are nowhere near that long.
+    sliceIn arr@(ByteArray ba) off len
+      | len >= 0x200000 = swarMetrics arr off len
+      | otherwise =
+          let w = c_metrics level ba off len
+              field s = fromIntegral ((w `unsafeShiftR` s) .&. 0x1FFFFF)
+              cs = len - field 0
+           in Metrics len cs (cs + field 21) (field 42)
+{-# INLINE simdKernels #-}
+
+foreign import ccall unsafe "nano_rope_simd_level" c_simdLevel :: IO Int
+foreign import ccall unsafe "nano_rope_metrics" c_metrics :: Int -> ByteArray# -> Int -> Int -> Word64
+foreign import ccall unsafe "nano_rope_newlines" c_newlines :: Int -> ByteArray# -> Int -> Int -> Int
+foreign import ccall unsafe "nano_rope_find_newline" c_findNewline :: Int -> ByteArray# -> Int -> Int -> Int
+foreign import ccall unsafe "nano_rope_find_newline_back" c_findNewlineBack :: Int -> ByteArray# -> Int -> Int
+foreign import ccall unsafe "nano_rope_nth_newline" c_nthNewline :: Int -> ByteArray# -> Int -> Int -> Int
+foreign import ccall unsafe "nano_rope_scan_units" c_scanUnits :: Int -> ByteArray# -> Int -> Int -> Int -> Int -> Int
+#else
+simdMin = maxBound
+simdLevel = -1
+simdKernels _ = swarKernels
+#endif
 
 ------------------------------------------------------------------------------
 -- Leaves
@@ -1785,18 +1925,20 @@ getLine l (Rope root)
 -- it, @\\r\\n@ is stripped too. Lines within a single chunk are zero-copy
 -- views.
 lines :: Rope a -> [Text]
-lines = go [] . toChunks
+lines (Rope root) = go [] (foldrNode (:) [] root)
   where
     -- The pieces of an unfinished line, last one first. Never just empty
-    -- pieces: a piece is only carried over if it is a whole chunk.
+    -- pieces: a piece is only carried over if it is the non-empty rest of a
+    -- chunk.
     go carry [] = [T.concat (reverse carry) | not (L.null carry)]
-    go carry (chunk : chunks) = case T.breakOn (T.singleton '\n') chunk of
-      (piece, rest)
-        | T.null rest -> go (piece : carry) chunks
-        | otherwise ->
-            let after = T.drop 1 rest
-             in stripCR (T.concat (reverse (piece : carry)))
-                  : go [] (if T.null after then chunks else after : chunks)
+    go carry (arr : arrs) = from carry arr 0 arrs
+    from carry arr i arrs
+      | i >= size = go carry arrs
+      | lf >= size = go (viewSlice arr i (size - i) : carry) arrs
+      | otherwise = stripCR (T.concat (reverse (viewSlice arr i (lf - i) : carry))) : from [] arr (lf + 1) arrs
+      where
+        size = sizeofByteArray arr
+        lf = findNewline arr i
     stripCR t
       | not (T.null t) && T.last t == '\r' = T.init t
       | otherwise = t

@@ -19,6 +19,9 @@ Rope.getLine 1 rope                               -- "let y = x"
 
 * Bytes, code points, UTF-16 code units and lines are tracked at every node,
   so you can index by any of them and convert between them in `O(log n)`.
+* Measuring chunks and searching them for line feeds, code points or UTF-16
+  offsets is done with SIMD (SSE2, or AVX2 where the CPU has it) through a
+  little C. Build with `-f -simd` for pure Haskell.
 * A B-tree of flat UTF-8 chunks (up to 512 bytes, up to 16 children per node).
   Chunks are split by size, not by line, so one huge line is fine.
 * An edit copies one chunk and the path to it. Consecutive keystrokes are
@@ -137,5 +140,6 @@ redraw from those without re-running.
 ```
 cabal test     # properties against a Text model and the instance laws,
                # also with 16-byte chunks
+cabal test -f -simd   # the same without the C
 cabal bench
 ```

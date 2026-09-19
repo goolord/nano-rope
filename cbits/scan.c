@@ -1,0 +1,548 @@
+/*
+ * Scanning the chunks of a rope with SIMD instructions.
+ *
+ * Every function here reads bytes of UTF-8 (or any bytes, for the counts) and
+ * nothing else: no allocation, no state but the choice of instruction set.
+ * They are called from Data.Text.NanoRope.Internal through unsafe foreign
+ * calls, which hand over the payload of an unpinned byte array directly.
+ * Slices shorter than 32 bytes are left to the Haskell, 8 bytes at a time.
+ *
+ * Three levels, all computing exactly the same results:
+ *
+ *   0  portable C, which compilers are free to vectorise;
+ *   1  SSE2, 16 bytes at a time (every x86-64 has it);
+ *   2  AVX2, 32 bytes at a time, if the CPU and the OS support it.
+ *
+ * Every exported function takes the level to run at, no higher than
+ * nano_rope_simd_level(): the Haskell asks for that once, and the test suite
+ * holds every level to the same results.
+ *
+ * A vector loop leaves a tail shorter than a vector. As long as the whole
+ * range is at least a vector long, the tail is read as the last vector of
+ * the range, overlapping bytes already seen, which are masked off. Nothing is
+ * ever read outside the range asked about, except before it for the
+ * functions that are handed the size of the whole array.
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "HsFFI.h"
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define NR_X86 1
+#include <immintrin.h>
+#else
+#define NR_X86 0
+#endif
+
+typedef const uint8_t *bytes;
+
+/* The three counts of a metrics scan in one word, 21 bits each. The caller
+ * never asks about 2^21 bytes or more at once. */
+#define PACK(conts, fours, nls) \
+  ((HsWord64)(conts) | (HsWord64)(fours) << 21 | (HsWord64)(nls) << 42)
+
+/* ------------------------------------------------------------------------
+ * Level 0: portable C. They also handle what is shorter than a vector, and
+ * scan_units_c finishes off the vector a unit count falls in.
+ */
+
+static HsWord64 metrics_c(bytes s, size_t n)
+{
+  size_t conts = 0, fours = 0, nls = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t b = s[i];
+    conts += (b & 0xC0) == 0x80;
+    fours += b >= 0xF0;
+    nls += b == '\n';
+  }
+  return PACK(conts, fours, nls);
+}
+
+static HsInt newlines_c(bytes s, size_t n)
+{
+  size_t nls = 0;
+  for (size_t i = 0; i < n; i++)
+    nls += s[i] == '\n';
+  return (HsInt)nls;
+}
+
+/* The first '\n' at or after i, or n. */
+static HsInt find_newline_c(bytes s, size_t i, size_t n)
+{
+  const uint8_t *p = i < n ? memchr(s + i, '\n', n - i) : NULL;
+  return p ? (HsInt)(p - s) : (HsInt)n;
+}
+
+/* The last '\n' before i, or -1. */
+static HsInt find_newline_back_c(bytes s, size_t i)
+{
+  while (i > 0)
+    if (s[--i] == '\n')
+      return (HsInt)i;
+  return -1;
+}
+
+/* Just after the k-th '\n' (k >= 1) from i on, or n. */
+static HsInt nth_newline_c(bytes s, size_t i, size_t n, HsInt k)
+{
+  for (; i < n; i++)
+    if (s[i] == '\n' && --k == 0)
+      return (HsInt)(i + 1);
+  return (HsInt)n;
+}
+
+/* From the code point boundary i, the offset in front of the first code
+ * point that does not fit into k units, with u units counted already, or
+ * `to`. A unit is a code point, or a UTF-16 code unit if wide. */
+static HsInt scan_units_c(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
+{
+  for (; i < to; i++) {
+    uint8_t b = s[i];
+    if ((b & 0xC0) == 0x80)
+      continue;
+    HsInt w = wide && b >= 0xF0 ? 2 : 1;
+    if (u + w > k)
+      return (HsInt)i;
+    u += w;
+  }
+  return (HsInt)to;
+}
+
+#if NR_X86
+
+/* A byte counter goes up by one per vector, so it has to be emptied into
+ * the wide sums at least every 255 vectors. */
+#define FLUSH 255
+
+static inline uint32_t popcount32(uint32_t m)
+{
+  return (uint32_t)__builtin_popcount(m);
+}
+
+/* Position of the k-th (1-based) set bit, for k <= popcount m. */
+static inline uint32_t nth_bit(uint32_t m, HsInt k)
+{
+  while (--k > 0)
+    m &= m - 1;
+  return (uint32_t)__builtin_ctz(m);
+}
+
+/* The counts of a metrics scan in the last t lanes of a vector of the given
+ * width, out of its movemask bits. */
+static inline HsWord64 pack_tail(uint32_t conts, uint32_t fours, uint32_t nls, int width, size_t t)
+{
+  int shift = width - (int)t;
+  return PACK(popcount32(conts >> shift), popcount32(fours >> shift), popcount32(nls >> shift));
+}
+
+/* Units in the lanes set in `lanes`, out of the continuation and 4-byte
+ * leader bits of a vector. */
+static inline HsInt units(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)
+{
+  return (HsInt)popcount32(lanes & ~conts) + (wide ? (HsInt)popcount32(lanes & fours) : 0);
+}
+
+/* ------------------------------------------------------------------------
+ * Level 1: SSE2.
+ *
+ * Continuation bytes 0x80 .. 0xBF are exactly the signed bytes below -64;
+ * leaders of 4-byte sequences are the bytes whose unsigned maximum with 0xF0
+ * is themselves.
+ */
+
+static inline __m128i conts128(__m128i x)
+{
+  return _mm_cmpgt_epi8(_mm_set1_epi8((char)0xC0), x);
+}
+
+static inline __m128i fours128(__m128i x)
+{
+  return _mm_cmpeq_epi8(_mm_max_epu8(x, _mm_set1_epi8((char)0xF0)), x);
+}
+
+static inline __m128i newlines128(__m128i x)
+{
+  return _mm_cmpeq_epi8(x, _mm_set1_epi8('\n'));
+}
+
+static inline uint32_t bits128(__m128i m)
+{
+  return (uint32_t)_mm_movemask_epi8(m);
+}
+
+static inline HsWord64 sum128(__m128i v)
+{
+  return (HsWord64)_mm_cvtsi128_si64(v) + (HsWord64)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v));
+}
+
+static HsWord64 metrics_sse2(bytes s, size_t n)
+{
+  if (n < 16)
+    return metrics_c(s, n);
+  const __m128i zero = _mm_setzero_si128();
+  __m128i sum = zero; /* packed as by PACK, in each 64-bit lane */
+  size_t i = 0;
+  while (n - i >= 16) {
+    size_t v = (n - i) / 16;
+    if (v > FLUSH)
+      v = FLUSH;
+    __m128i ac = zero, af = zero, an = zero;
+    for (; v > 0; v--, i += 16) {
+      __m128i x = _mm_loadu_si128((const __m128i *)(s + i));
+      ac = _mm_sub_epi8(ac, conts128(x));
+      af = _mm_sub_epi8(af, fours128(x));
+      an = _mm_sub_epi8(an, newlines128(x));
+    }
+    sum = _mm_add_epi64(sum, _mm_sad_epu8(ac, zero));
+    sum = _mm_add_epi64(sum, _mm_slli_epi64(_mm_sad_epu8(af, zero), 21));
+    sum = _mm_add_epi64(sum, _mm_slli_epi64(_mm_sad_epu8(an, zero), 42));
+  }
+  HsWord64 packed = sum128(sum);
+  if (i < n) {
+    __m128i x = _mm_loadu_si128((const __m128i *)(s + n - 16));
+    packed += pack_tail(bits128(conts128(x)), bits128(fours128(x)), bits128(newlines128(x)), 16, n - i);
+  }
+  return packed;
+}
+
+static HsInt newlines_sse2(bytes s, size_t n)
+{
+  if (n < 16)
+    return newlines_c(s, n);
+  const __m128i zero = _mm_setzero_si128();
+  __m128i sn = zero;
+  size_t i = 0;
+  while (n - i >= 16) {
+    size_t v = (n - i) / 16;
+    if (v > FLUSH)
+      v = FLUSH;
+    __m128i an = zero;
+    for (; v > 0; v--, i += 16)
+      an = _mm_sub_epi8(an, newlines128(_mm_loadu_si128((const __m128i *)(s + i))));
+    sn = _mm_add_epi64(sn, _mm_sad_epu8(an, zero));
+  }
+  HsInt nls = (HsInt)sum128(sn);
+  if (i < n) {
+    __m128i x = _mm_loadu_si128((const __m128i *)(s + n - 16));
+    nls += popcount32(bits128(newlines128(x)) >> (16 - (n - i)));
+  }
+  return nls;
+}
+
+static uint32_t newline_mask128(bytes p)
+{
+  return bits128(newlines128(_mm_loadu_si128((const __m128i *)p)));
+}
+
+static HsInt find_newline_sse2(bytes s, size_t i, size_t n)
+{
+  if (n < 16)
+    return find_newline_c(s, i, n);
+  for (; n - i >= 16; i += 16) {
+    uint32_t m = newline_mask128(s + i);
+    if (m)
+      return (HsInt)(i + __builtin_ctz(m));
+  }
+  if (i < n) {
+    uint32_t m = newline_mask128(s + n - 16) >> (16 - (n - i));
+    if (m)
+      return (HsInt)(i + __builtin_ctz(m));
+  }
+  return (HsInt)n;
+}
+
+static HsInt find_newline_back_sse2(bytes s, size_t i)
+{
+  if (i < 16)
+    return find_newline_back_c(s, i);
+  for (; i >= 16; i -= 16) {
+    uint32_t m = newline_mask128(s + i - 16);
+    if (m)
+      return (HsInt)(i - 16 + 31 - __builtin_clz(m));
+  }
+  if (i > 0) {
+    uint32_t m = newline_mask128(s) & ((1u << i) - 1);
+    if (m)
+      return (HsInt)(31 - __builtin_clz(m));
+  }
+  return -1;
+}
+
+static HsInt nth_newline_sse2(bytes s, size_t i, size_t n, HsInt k)
+{
+  if (n < 16)
+    return nth_newline_c(s, i, n, k);
+  for (; n - i >= 16; i += 16) {
+    uint32_t m = newline_mask128(s + i);
+    HsInt c = popcount32(m);
+    if (c >= k)
+      return (HsInt)(i + nth_bit(m, k) + 1);
+    k -= c;
+  }
+  if (i < n) {
+    uint32_t m = newline_mask128(s + n - 16) >> (16 - (n - i));
+    if (popcount32(m) >= k)
+      return (HsInt)(i + nth_bit(m, k) + 1);
+  }
+  return (HsInt)n;
+}
+
+static HsInt scan_units_sse2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
+{
+  if (to < 16)
+    return scan_units_c(s, i, to, k, u, wide);
+  for (; to - i >= 16; i += 16) {
+    __m128i x = _mm_loadu_si128((const __m128i *)(s + i));
+    HsInt c = units(0xFFFF, bits128(conts128(x)), bits128(fours128(x)), wide);
+    if (u + c > k)
+      return scan_units_c(s, i, to, k, u, wide);
+    u += c;
+  }
+  if (i < to) {
+    __m128i x = _mm_loadu_si128((const __m128i *)(s + to - 16));
+    uint32_t lanes = 0xFFFFu & ~((1u << (16 - (to - i))) - 1);
+    if (u + units(lanes, bits128(conts128(x)), bits128(fours128(x)), wide) > k)
+      return scan_units_c(s, i, to, k, u, wide);
+  }
+  return (HsInt)to;
+}
+
+/* ------------------------------------------------------------------------
+ * Level 2: AVX2. The same as SSE2, twice as wide; whatever is shorter than
+ * a vector goes to SSE2.
+ */
+
+#define AVX2 __attribute__((target("avx2,popcnt")))
+
+AVX2 static inline __m256i conts256(__m256i x)
+{
+  return _mm256_cmpgt_epi8(_mm256_set1_epi8((char)0xC0), x);
+}
+
+AVX2 static inline __m256i fours256(__m256i x)
+{
+  return _mm256_cmpeq_epi8(_mm256_max_epu8(x, _mm256_set1_epi8((char)0xF0)), x);
+}
+
+AVX2 static inline __m256i newlines256(__m256i x)
+{
+  return _mm256_cmpeq_epi8(x, _mm256_set1_epi8('\n'));
+}
+
+AVX2 static inline uint32_t bits256(__m256i m)
+{
+  return (uint32_t)_mm256_movemask_epi8(m);
+}
+
+AVX2 static inline HsWord64 sum256(__m256i v)
+{
+  __m128i w = _mm_add_epi64(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+  return (HsWord64)_mm_cvtsi128_si64(w) + (HsWord64)_mm_extract_epi64(w, 1);
+}
+
+AVX2 static HsWord64 metrics_avx2(bytes s, size_t n)
+{
+  if (n < 32)
+    return metrics_sse2(s, n);
+  const __m256i zero = _mm256_setzero_si256();
+  __m256i sum = zero; /* packed as by PACK, in each 64-bit lane */
+  size_t i = 0;
+  while (n - i >= 32) {
+    size_t v = (n - i) / 32;
+    if (v > FLUSH)
+      v = FLUSH;
+    __m256i ac = zero, af = zero, an = zero;
+    for (; v > 0; v--, i += 32) {
+      __m256i x = _mm256_loadu_si256((const __m256i *)(s + i));
+      ac = _mm256_sub_epi8(ac, conts256(x));
+      af = _mm256_sub_epi8(af, fours256(x));
+      an = _mm256_sub_epi8(an, newlines256(x));
+    }
+    sum = _mm256_add_epi64(sum, _mm256_sad_epu8(ac, zero));
+    sum = _mm256_add_epi64(sum, _mm256_slli_epi64(_mm256_sad_epu8(af, zero), 21));
+    sum = _mm256_add_epi64(sum, _mm256_slli_epi64(_mm256_sad_epu8(an, zero), 42));
+  }
+  HsWord64 packed = sum256(sum);
+  if (i < n) {
+    __m256i x = _mm256_loadu_si256((const __m256i *)(s + n - 32));
+    packed += pack_tail(bits256(conts256(x)), bits256(fours256(x)), bits256(newlines256(x)), 32, n - i);
+  }
+  return packed;
+}
+
+AVX2 static HsInt newlines_avx2(bytes s, size_t n)
+{
+  if (n < 32)
+    return newlines_sse2(s, n);
+  const __m256i zero = _mm256_setzero_si256();
+  __m256i sn = zero;
+  size_t i = 0;
+  while (n - i >= 32) {
+    size_t v = (n - i) / 32;
+    if (v > FLUSH)
+      v = FLUSH;
+    __m256i an = zero;
+    for (; v > 0; v--, i += 32)
+      an = _mm256_sub_epi8(an, newlines256(_mm256_loadu_si256((const __m256i *)(s + i))));
+    sn = _mm256_add_epi64(sn, _mm256_sad_epu8(an, zero));
+  }
+  HsInt nls = (HsInt)sum256(sn);
+  if (i < n) {
+    __m256i x = _mm256_loadu_si256((const __m256i *)(s + n - 32));
+    nls += popcount32(bits256(newlines256(x)) >> (32 - (n - i)));
+  }
+  return nls;
+}
+
+AVX2 static inline uint32_t newline_mask256(bytes p)
+{
+  return bits256(newlines256(_mm256_loadu_si256((const __m256i *)p)));
+}
+
+AVX2 static HsInt find_newline_avx2(bytes s, size_t i, size_t n)
+{
+  if (n < 32)
+    return find_newline_sse2(s, i, n);
+  for (; n - i >= 32; i += 32) {
+    uint32_t m = newline_mask256(s + i);
+    if (m)
+      return (HsInt)(i + __builtin_ctz(m));
+  }
+  if (i < n) {
+    uint32_t m = newline_mask256(s + n - 32) >> (32 - (n - i));
+    if (m)
+      return (HsInt)(i + __builtin_ctz(m));
+  }
+  return (HsInt)n;
+}
+
+AVX2 static HsInt find_newline_back_avx2(bytes s, size_t i)
+{
+  if (i < 32)
+    return find_newline_back_sse2(s, i);
+  for (; i >= 32; i -= 32) {
+    uint32_t m = newline_mask256(s + i - 32);
+    if (m)
+      return (HsInt)(i - 32 + 31 - __builtin_clz(m));
+  }
+  if (i > 0) {
+    uint32_t m = newline_mask256(s) & ((1u << i) - 1);
+    if (m)
+      return (HsInt)(31 - __builtin_clz(m));
+  }
+  return -1;
+}
+
+AVX2 static HsInt nth_newline_avx2(bytes s, size_t i, size_t n, HsInt k)
+{
+  if (n < 32)
+    return nth_newline_sse2(s, i, n, k);
+  for (; n - i >= 32; i += 32) {
+    uint32_t m = newline_mask256(s + i);
+    HsInt c = popcount32(m);
+    if (c >= k)
+      return (HsInt)(i + nth_bit(m, k) + 1);
+    k -= c;
+  }
+  if (i < n) {
+    uint32_t m = newline_mask256(s + n - 32) >> (32 - (n - i));
+    if (popcount32(m) >= k)
+      return (HsInt)(i + nth_bit(m, k) + 1);
+  }
+  return (HsInt)n;
+}
+
+AVX2 static HsInt scan_units_avx2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
+{
+  if (to < 32)
+    return scan_units_sse2(s, i, to, k, u, wide);
+  for (; to - i >= 32; i += 32) {
+    __m256i x = _mm256_loadu_si256((const __m256i *)(s + i));
+    HsInt c = units(0xFFFFFFFFu, bits256(conts256(x)), bits256(fours256(x)), wide);
+    if (u + c > k)
+      return scan_units_c(s, i, to, k, u, wide);
+    u += c;
+  }
+  if (i < to) {
+    __m256i x = _mm256_loadu_si256((const __m256i *)(s + to - 32));
+    uint32_t lanes = ~((1u << (32 - (to - i))) - 1);
+    if (u + units(lanes, bits256(conts256(x)), bits256(fours256(x)), wide) > k)
+      return scan_units_c(s, i, to, k, u, wide);
+  }
+  return (HsInt)to;
+}
+
+#endif /* NR_X86 */
+
+/* ------------------------------------------------------------------------
+ * The exported functions, one per scan, at a given level no higher than
+ * nano_rope_simd_level(): Haskell asks for that once and passes it along.
+ */
+
+HsInt nano_rope_simd_level(void)
+{
+#if NR_X86
+  __builtin_cpu_init();
+  /* Checks that the OS saves the AVX registers, too. */
+  return __builtin_cpu_supports("avx2") ? 2 : 1;
+#else
+  return 0;
+#endif
+}
+
+#if NR_X86
+#define DISPATCH(level, name, ...)           \
+  switch (level) {                            \
+  case 2: return name##_avx2(__VA_ARGS__);    \
+  case 1: return name##_sse2(__VA_ARGS__);    \
+  default: return name##_c(__VA_ARGS__);      \
+  }
+#else
+#define DISPATCH(level, name, ...) \
+  (void)(level);                   \
+  return name##_c(__VA_ARGS__);
+#endif
+
+/* Continuation bytes, 4-byte leaders and '\n' in s[off .. off+len), packed
+ * by PACK. len < 2^21. */
+HsWord64 nano_rope_metrics(HsInt level, bytes s, HsInt off, HsInt len)
+{
+  DISPATCH(level, metrics, s + off, (size_t)len)
+}
+
+/* Number of '\n' in s[off .. off+len). */
+HsInt nano_rope_newlines(HsInt level, bytes s, HsInt off, HsInt len)
+{
+  DISPATCH(level, newlines, s + off, (size_t)len)
+}
+
+/* The first '\n' in s[from .. n), or n; from <= n. */
+HsInt nano_rope_find_newline(HsInt level, bytes s, HsInt from, HsInt n)
+{
+  DISPATCH(level, find_newline, s, (size_t)from, (size_t)n)
+}
+
+/* The last '\n' in s[0 .. to), or -1. */
+HsInt nano_rope_find_newline_back(HsInt level, bytes s, HsInt to)
+{
+  DISPATCH(level, find_newline_back, s, (size_t)to)
+}
+
+/* The offset just after the k-th '\n' in s[0 .. n) for k >= 1, or n. */
+HsInt nano_rope_nth_newline(HsInt level, bytes s, HsInt n, HsInt k)
+{
+  if (k <= 0)
+    return n;
+  DISPATCH(level, nth_newline, s, 0, (size_t)n, k)
+}
+
+/* Walking over the code points of s[from .. to) from the boundary `from`,
+ * the offset in front of the first one that does not fit into k units, or
+ * `to`. Units are code points, or UTF-16 code units if wide. */
+HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, HsInt wide)
+{
+  DISPATCH(level, scan_units, s, (size_t)from, (size_t)to, k, 0, (int)wide)
+}

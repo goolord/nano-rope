@@ -12,6 +12,8 @@
   tree and are inserted at once when the rope is next read, and erasing what
   was just typed takes them back. `length` and `metrics` stay `O(1)`.
 * `splitAt` finds both halves in one descent.
+* Chunks are scanned with SIMD instructions through C (SSE2, AVX2 when the
+  CPU supports it, picked at run time); the `simd` flag turns this off.
 * `Data.Text.NanoRope.Measured`: the same rope carrying a custom monoidal
   `Measure`, searchable with `splitWhere`.
 * `Data.Text.NanoRope.Internal`: the representation and an invariant checker,

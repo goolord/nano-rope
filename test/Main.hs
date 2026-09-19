@@ -13,15 +13,20 @@ module Main (main) where
 
 import qualified Data.List as L
 import Data.Maybe (fromMaybe)
+import Data.Primitive.ByteArray (ByteArray (..), cloneByteArray, indexByteArray, sizeofByteArray)
 import Data.Proxy (Proxy (..))
 import Data.String (IsString (..))
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Array as A
+import qualified Data.Text.Internal as TI
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.NanoRope as Plain
-import Data.Text.NanoRope.Internal (height, invariants, maxChunk)
+import Data.Text.NanoRope.Internal (Kernels (..), height, invariants, kernels, maxChunk)
 import Data.Text.NanoRope.Measured (Measure (..), Metrics (..), Position (..), Rope, Unit (..))
 import qualified Data.Text.NanoRope.Measured as Rope
+import Data.Text.Unsafe (dropWord8, takeWord8)
+import Data.Word (Word8)
 import Test.QuickCheck.Classes.Base (Laws (..), commutativeMonoidLaws, eqLaws, monoidLaws, ordLaws, semigroupLaws, semigroupMonoidLaws, showLaws)
 import Test.Tasty (TestTree, adjustOption, defaultMain, localOption, testGroup)
 import Test.Tasty.QuickCheck
@@ -122,6 +127,15 @@ main =
       , testGroup
           "big"
           [ localOption (QuickCheckTests 5) (testProperty "a tall tree" prop_big)
+          ]
+      , testGroup
+          ("chunk scans: " ++ L.intercalate ", " (map kernelsName kernels))
+          [ testProperty "metrics" prop_scanMetrics
+          , testProperty "line feeds" prop_scanNewlines
+          , testProperty "the next line feed" prop_scanNext
+          , testProperty "the previous line feed" prop_scanPrevious
+          , testProperty "the k-th line feed" prop_scanNth
+          , testProperty "code points and UTF-16 code units" prop_scanUnits
           ]
       ]
 
@@ -837,3 +851,105 @@ prop_big = forAll (genText (6000 * sizeFactor)) $ \t0 ->
     let r0 = Rope.fromText t0 :: R
      in counterexample ("height " ++ show (height r0)) $
           height r0 >= 2 .&&. prop_ops (Doc t0) ops
+
+------------------------------------------------------------------------------
+-- Chunk scans
+
+-- | UTF-8 in an array of its own, for the scans to be held against a model:
+-- every implementation of them (see 'kernels') gives the same results. Also
+-- long lines, as line feeds found in the first vector looked at leave the
+-- rest of a scan untried; and now and then a long run of one piece, which
+-- fills the byte counters of the vector loops (255 vectors of 32 bytes, all
+-- of them matching).
+newtype Scanned = Scanned Text
+  deriving (Show)
+
+instance Arbitrary Scanned where
+  arbitrary =
+    Scanned
+      <$> frequency
+        [ (6, choose (0, 1100) >>= \n -> T.pack . concat <$> vectorOf n genPiece)
+        , (3, choose (0, 1100) >>= \n -> T.pack . concat <$> vectorOf n (frequency [(1, pure "\n"), (60, filter (/= '\n') <$> genPiece)]))
+        , (1, genPiece >>= \p -> choose (8000, 9000) >>= \n -> pure (T.pack (concat (replicate n p))))
+        ]
+  shrink (Scanned t) = Scanned <$> shrinkText t
+
+bytesOfText :: Text -> ByteArray
+bytesOfText (TI.Text (A.ByteArray ba) off len) = cloneByteArray (ByteArray ba) off len
+
+byteList :: ByteArray -> [Word8]
+byteList arr = [indexByteArray arr i | i <- [0 .. sizeofByteArray arr - 1]]
+
+isContByte :: Word8 -> Bool
+isContByte b = b >= 0x80 && b < 0xC0
+
+-- | Every implementation gives what the model says.
+allKernels :: (Eq b, Show b) => (Kernels -> b) -> b -> Property
+allKernels run expected = conjoin [counterexample (kernelsName k) (run k === expected) | k <- kernels]
+
+-- | A slice of an array of this size: often short, often long.
+genSlice :: Int -> Gen (Int, Int)
+genSlice size = do
+  off <- frequency [(1, pure 0), (4, choose (0, size))]
+  len <- frequency [(1, pure (size - off)), (2, choose (0, min 40 (size - off))), (2, choose (0, size - off))]
+  pure (off, len)
+
+prop_scanMetrics :: Scanned -> Property
+prop_scanMetrics (Scanned t) = forAll (genSlice (sizeofByteArray arr)) $ \(off, len) ->
+  let bs = L.take len (L.drop off (byteList arr))
+      cs = len - L.length (filter isContByte bs)
+   in allKernels
+        (\k -> kernelMetrics k arr off len)
+        (Metrics len cs (cs + L.length (filter (>= 0xF0) bs)) (L.length (filter (== 0x0A) bs)))
+  where
+    arr = bytesOfText t
+
+prop_scanNewlines :: Scanned -> Property
+prop_scanNewlines (Scanned t) = forAll (genSlice (sizeofByteArray arr)) $ \(off, len) ->
+  allKernels (\k -> kernelNewlines k arr off len) (L.length (filter (== 0x0A) (L.take len (L.drop off (byteList arr)))))
+  where
+    arr = bytesOfText t
+
+-- | Offsets of the line feeds.
+lineFeeds :: ByteArray -> [Int]
+lineFeeds arr = [i | (i, b) <- zip [0 ..] (byteList arr), b == 0x0A]
+
+prop_scanNext :: Scanned -> Property
+prop_scanNext (Scanned t) = forAll (choose (0, size)) $ \from ->
+  allKernels (\k -> kernelFindNewline k arr from) (fromMaybe size (L.find (>= from) (lineFeeds arr)))
+  where
+    arr = bytesOfText t
+    size = sizeofByteArray arr
+
+prop_scanPrevious :: Scanned -> Property
+prop_scanPrevious (Scanned t) = forAll (choose (0, sizeofByteArray arr)) $ \to ->
+  allKernels (\k -> kernelFindNewlineBack k arr to) (last (-1 : [i | i <- lineFeeds arr, i < to]))
+  where
+    arr = bytesOfText t
+
+prop_scanNth :: Scanned -> Property
+prop_scanNth (Scanned t) = forAll (choose (1, L.length lfs + 2)) $ \n ->
+  allKernels (\k -> kernelNthNewline k n arr) (case L.drop (n - 1) lfs of i : _ -> i + 1; [] -> sizeofByteArray arr)
+  where
+    arr = bytesOfText t
+    lfs = lineFeeds arr
+
+-- | Between two code point boundaries: the end of the longest run of whole
+-- code points that fits into @k@ units, decoded rather than scanned.
+prop_scanUnits :: Scanned -> Bool -> Property
+prop_scanUnits (Scanned t) wide = forAll (genSlice (L.length bounds - 1)) $ \(i, n) ->
+  let from = bounds !! i
+      to = bounds !! (i + n)
+      piece = T.unpack (takeWord8 (to - from) (dropWord8 from t))
+      units c = if wide then utf16Len c else 1
+      model k = go from 0 piece
+        where
+          go b _ [] = b
+          go b u (c : cs)
+            | u + units c > k = b
+            | otherwise = go (b + utf8Len c) (u + units c) cs
+   in forAll (choose (-1, sum (map units piece) + 2)) $ \k ->
+        allKernels (\kn -> kernelScanUnits kn wide k arr from to) (model k)
+  where
+    arr = bytesOfText t
+    bounds = scanl (+) 0 (map utf8Len (T.unpack t))

@@ -20,6 +20,9 @@ description:
       node: any of them addresses the rope, and any converts to any other,
       in logarithmic time.
 
+    * Chunks are scanned with SIMD instructions (SSE2, or AVX2 where the
+      CPU has it) through a little C, or by plain Haskell with @-f -simd@.
+
     * Chunks are cut by size rather than by line, so that files consisting
       of one enormous line are nothing special.
 
@@ -36,6 +39,14 @@ tested-with:        GHC ==9.14.1
 extra-doc-files:
     CHANGELOG.md
     README.md
+
+flag simd
+    description:
+        Scan chunks with SIMD instructions (SSE2, and AVX2 where the CPU has
+        it, on x86-64), through a little C. Without it, the scans are plain
+        Haskell reading 8 bytes at a time.
+    default:     True
+    manual:      True
 
 flag compare-text-rope
     description: Run the benchmarks on text-rope as well, for comparison.
@@ -68,9 +79,17 @@ common library-depends
         primitive >=0.8  && <0.10,
         text      >=2.0  && <2.2
 
+-- The chunk scans in C, and the switch telling the Haskell to use them.
+common simd
+    if flag(simd)
+        c-sources:   cbits/scan.c
+        cc-options:  -O2
+        cpp-options: -DNANO_ROPE_SIMD
+
 common test-depends
     build-depends:
         base,
+        primitive,
         QuickCheck              >=2.14  && <2.19,
         quickcheck-classes-base >=0.6.2 && <0.7,
         tasty                   >=1.4   && <1.6,
@@ -81,6 +100,7 @@ library
     import:           extensions
     import:           ghc-options
     import:           library-depends
+    import:           simd
     exposed-modules:
         Data.Text.NanoRope
         Data.Text.NanoRope.Internal
@@ -110,6 +130,7 @@ test-suite nano-rope-test-small
     import:           rts-options
     import:           library-depends
     import:           test-depends
+    import:           simd
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test src
     main-is:          Main.hs
