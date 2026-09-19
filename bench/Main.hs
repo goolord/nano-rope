@@ -62,6 +62,8 @@ data Env = Env
   -- ^ After 10k random inserts: the shape a rope has in the middle of a session.
   , envChars :: ![Int]
   -- ^ Random character offsets.
+  , envBursts :: ![(Int, Int)]
+  -- ^ A hundred of them, each with the line it is on.
   , envPositions :: ![Position]
   -- ^ Random positions with their column in UTF-16 code units.
   , envByteOffsets :: ![Int]
@@ -75,7 +77,7 @@ data Env = Env
 
 -- | The ropes are strict all the way down, and the lists are forced here.
 instance NFData Env where
-  rnf e = rnf (envChars e) `seq` rnf (envPositions e) `seq` rnf (envByteOffsets e)
+  rnf e = rnf (envChars e) `seq` rnf (envBursts e) `seq` rnf (envPositions e) `seq` rnf (envByteOffsets e)
 
 mkEnv :: Int -> Int -> Env
 mkEnv nLines nOps =
@@ -86,6 +88,7 @@ mkEnv nLines nOps =
     , envNanoOneLine = Nano.fromText oneLine
     , envNanoEdited = L.foldl' (\rope i -> Nano.insert Chars i "x" rope) nano offsets
     , envChars = offsets
+    , envBursts = [(i, Nano.convert Chars Lines i nano) | i <- L.take 100 offsets]
     , envPositions = [Position (r `mod` nLines) (r `mod` 40) | r <- L.take nOps (rands 3)]
     , envByteOffsets = [r `mod` (Nano.length Bytes nano + 1) | r <- L.take nOps (rands 4)]
 #ifdef COMPARE_TEXT_ROPE
@@ -105,19 +108,35 @@ mkEnv nLines nOps =
 ------------------------------------------------------------------------------
 -- Workloads
 
+-- | The length of a rope that has been read, so that the keystrokes typed
+-- last are in the tree like everything else and not left waiting.
+built :: Nano.Rope -> Int
+built r = if T.null (Nano.chunkAt Bytes 0 r) then 0 else Nano.length Chars r
+
 -- | Insert a character at each of the given offsets.
 nanoInserts :: [Int] -> Nano.Rope -> Int
-nanoInserts offsets r0 = Nano.length Chars (L.foldl' (\r i -> Nano.insert Chars i "x" r) r0 offsets)
+nanoInserts offsets r0 = built (L.foldl' (\r i -> Nano.insert Chars i "x" r) r0 offsets)
 
 -- | Type a run of characters starting at each of the given offsets.
-nanoTyping :: [Int] -> Nano.Rope -> Int
-nanoTyping offsets r0 = Nano.length Chars (L.foldl' burst r0 (L.take 100 offsets))
+nanoTyping :: Int -> [Int] -> Nano.Rope -> Int
+nanoTyping n offsets r0 = built (L.foldl' burst r0 offsets)
   where
-    burst r i = L.foldl' (\acc k -> Nano.insert Chars (i + k) "x" acc) r [0 .. 99]
+    burst r i = L.foldl' (\acc k -> Nano.insert Chars (i + k) "x" acc) r [0 .. n - 1]
+
+-- | The same, looking at the line after every keystroke like an editor that
+-- redraws it.
+nanoTypingRead :: [(Int, Int)] -> Nano.Rope -> Int
+nanoTypingRead bursts r0 = snd (L.foldl' burst (r0, 0) bursts)
+  where
+    burst acc (i, l) = L.foldl' (key i l) acc [0 .. 99]
+    key i l (r, n) k =
+      let r' = Nano.insert Chars (i + k) "x" r
+          !n' = n + T.length (Nano.getLine l r')
+       in (r', n')
 
 -- | Delete a character at each of the given offsets.
 nanoDeletes :: [Int] -> Nano.Rope -> Int
-nanoDeletes offsets r0 = Nano.length Chars (L.foldl' (\r i -> Nano.delete Chars i (i + 1) r) r0 offsets)
+nanoDeletes offsets r0 = built (L.foldl' (\r i -> Nano.delete Chars i (i + 1) r) r0 offsets)
 
 nanoSplits :: [Int] -> Nano.Rope -> Int
 nanoSplits offsets r = L.foldl' (\n i -> let (a, b) = Nano.splitAt Chars i r in n + Nano.length Lines a + Nano.length Lines b) 0 offsets
@@ -125,7 +144,7 @@ nanoSplits offsets r = L.foldl' (\n i -> let (a, b) = Nano.splitAt Chars i r in 
 -- | What a language server does with an incoming change: find a UTF-16
 -- position and edit there.
 nanoLspEdits :: [Position] -> Nano.Rope -> Int
-nanoLspEdits positions r0 = Nano.length Chars (L.foldl' edit r0 positions)
+nanoLspEdits positions r0 = built (L.foldl' edit r0 positions)
   where
     edit r pos =
       let i = Nano.positionToOffset Utf16 Bytes pos r
@@ -145,10 +164,20 @@ trInserts offsets r0 = fromIntegral (TR.length (L.foldl' ins r0 offsets))
   where
     ins r i = let (a, b) = TR.splitAt (fromIntegral i) r in a <> "x" <> b
 
-trTyping :: [Int] -> TR.Rope -> Int
-trTyping offsets r0 = fromIntegral (TR.length (L.foldl' burst r0 (L.take 100 offsets)))
+trTyping :: Int -> [Int] -> TR.Rope -> Int
+trTyping n offsets r0 = fromIntegral (TR.length (L.foldl' burst r0 offsets))
   where
-    burst r i = L.foldl' (\acc k -> let (a, b) = TR.splitAt (fromIntegral (i + k)) acc in a <> "x" <> b) r [0 .. 99 :: Int]
+    burst r i = L.foldl' (\acc k -> let (a, b) = TR.splitAt (fromIntegral (i + k)) acc in a <> "x" <> b) r [0 .. n - 1]
+
+trTypingRead :: [(Int, Int)] -> TR.Rope -> Int
+trTypingRead bursts r0 = snd (L.foldl' burst (r0, 0) bursts)
+  where
+    burst acc (i, l) = L.foldl' (key i l) acc [0 .. 99 :: Int]
+    key i l (r, n) k =
+      let (a, b) = TR.splitAt (fromIntegral (i + k)) r
+          r' = a <> "x" <> b
+          !n' = n + T.length (TR.toText (TR.getLine (fromIntegral l) r'))
+       in (r', n')
 
 trDeletes :: [Int] -> TR.Rope -> Int
 trDeletes offsets r0 = fromIntegral (TR.length (L.foldl' del r0 offsets))
@@ -206,9 +235,23 @@ main =
               ]
           , bgroup
               "100 bursts of 100 keystrokes"
-              [ bench "nano-rope" $ whnf (nanoTyping (envChars e)) (envNano e)
+              [ bench "nano-rope" $ whnf (nanoTyping 100 (L.take 100 (envChars e))) (envNano e)
 #ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trTyping (envChars e)) (envTR e)
+              , bench "text-rope" $ whnf (trTyping 100 (L.take 100 (envChars e))) (envTR e)
+#endif
+              ]
+          , bgroup
+              "100 bursts of 100 keystrokes, reading the line after each"
+              [ bench "nano-rope" $ whnf (nanoTypingRead (envBursts e)) (envNano e)
+#ifdef COMPARE_TEXT_ROPE
+              , bench "text-rope" $ whnf (trTypingRead (envBursts e)) (envTR e)
+#endif
+              ]
+          , bgroup
+              "10k keystrokes in one spot"
+              [ bench "nano-rope" $ whnf (nanoTyping 10000 (L.take 1 (envChars e))) (envNano e)
+#ifdef COMPARE_TEXT_ROPE
+              , bench "text-rope" $ whnf (trTyping 10000 (L.take 1 (envChars e))) (envTR e)
 #endif
               ]
           , bgroup
@@ -272,6 +315,27 @@ main =
               [ bench "nano-rope" $ whnf (nanoInserts (envChars e)) (envNanoEdited e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trInserts (envChars e)) (envTREdited e)
+#endif
+              ]
+          , bgroup
+              "after 10k edits, 100 bursts of 100 keystrokes"
+              [ bench "nano-rope" $ whnf (nanoTyping 100 (L.take 100 (envChars e))) (envNanoEdited e)
+#ifdef COMPARE_TEXT_ROPE
+              , bench "text-rope" $ whnf (trTyping 100 (L.take 100 (envChars e))) (envTREdited e)
+#endif
+              ]
+          , bgroup
+              "after 10k edits, 10k keystrokes in one spot"
+              [ bench "nano-rope" $ whnf (nanoTyping 10000 (L.take 1 (envChars e))) (envNanoEdited e)
+#ifdef COMPARE_TEXT_ROPE
+              , bench "text-rope" $ whnf (trTyping 10000 (L.take 1 (envChars e))) (envTREdited e)
+#endif
+              ]
+          , bgroup
+              "after 10k edits, toText"
+              [ bench "nano-rope" $ whnf Nano.toText (envNanoEdited e)
+#ifdef COMPARE_TEXT_ROPE
+              , bench "text-rope" $ whnf TR.toText (envTREdited e)
 #endif
               ]
           ]

@@ -7,10 +7,14 @@ synopsis:
 description:
     A persistent text rope for editors, language servers and parsers.
 
-    * Leaves are flat unpinned byte arrays of at most a kilobyte of UTF-8.
+    * Leaves are flat unpinned byte arrays of at most 512 bytes of UTF-8.
 
-    * The tree is a B-tree with up to 16 children per node, whose sizes are
-      kept as prefix sums in one flat unboxed array per node.
+    * The tree is a B-tree with up to 16 children per node. Every node
+      carries the sizes of its subtree, so an edit copies a chunk and one
+      small array of pointers per level.
+
+    * Keystrokes that continue each other are buffered next to the tree and
+      inserted at once when the rope is read.
 
     * Bytes, code points, UTF-16 code units and lines are tracked at every
       node: any of them addresses the rope, and any converts to any other,

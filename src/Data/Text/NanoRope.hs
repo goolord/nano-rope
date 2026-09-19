@@ -5,11 +5,14 @@
 --
 -- A text rope for editors, language servers and parsers.
 --
--- * __Flat chunks.__ Leaves are unpinned byte arrays of at most a kilobyte of
+-- * __Flat chunks.__ Leaves are unpinned byte arrays of at most 512 bytes of
 --   UTF-8, referenced straight from the tree.
--- * __A B-tree.__ Up to 16 children per node, whose sizes are kept as prefix
---   sums in one flat unboxed array, so that seeking touches a few adjacent
---   machine words per level.
+-- * __A B-tree.__ Up to 16 children per node. Every node carries the sizes of
+--   its subtree, so that seeking reads the heads of a node's children and an
+--   edit copies one small array of pointers per level.
+-- * __Cheap keystrokes.__ An edit within a chunk is one descent and one copy
+--   of that chunk, and typing on from where the last insertion ended does
+--   not even touch the tree, see 'insert'.
 -- * __Every unit at once.__ Bytes, code points, UTF-16 code units and lines
 --   are tracked at every node. Any of them addresses the rope in /O(log n)/,
 --   and any converts to any other in /O(log n)/, see 'Unit' and 'convert'.
@@ -150,7 +153,7 @@ toString :: Rope -> String
 toString = M.toString
 
 -- | The chunks of the rope as zero-copy views, in order. They are non-empty,
--- at most a kilobyte long and produced lazily.
+-- at most 512 bytes long and produced lazily.
 toChunks :: Rope -> [Text]
 toChunks = M.toChunks
 
@@ -193,8 +196,8 @@ append :: Rope -> Rope -> Rope
 append = M.append
 
 -- | /O(log n)/. Split at an offset, clamped to the rope and rounded down to
--- a code point boundary (see 'Unit'). The halves are computed independently
--- and only on demand.
+-- a code point boundary (see 'Unit'). Both halves come out of one descent;
+-- 'take' and 'drop' are cheaper if you are after just one of them.
 --
 -- >>> splitAt Lines 1 "fst\nsnd\n"
 -- ("fst\n","snd\n")
@@ -220,11 +223,23 @@ sliceText :: Unit -> Int -> Int -> Rope -> Text
 sliceText = M.sliceText
 
 -- | /O(log n + length of the text)/. Insert text at an offset.
+--
+-- An insertion confined to one chunk, as nearly all are, copies that chunk
+-- and the path to it and nothing else; a chunk that overflows splits in two.
+--
+-- Typing is cheaper still. An insertion that starts where the one before it
+-- ended (in the same unit, which is not 'Lines') is held back: up to 128
+-- bytes of such keystrokes wait next to the tree and go into it at once, when
+-- the rope is read or edited elsewhere. A keystroke then costs a copy of what
+-- is waiting, /O(1)/, and 'length' and 'metrics' answer without looking at
+-- the tree. This is the one lazy spot of a rope: evaluating it to weak head
+-- normal form leaves up to one such insertion undone.
 insert :: Unit -> Int -> Text -> Rope -> Rope
 insert = M.insert
 
 -- | /O(log n)/. @delete u i j@ removes the text from offset @i@ up to
--- offset @j@.
+-- offset @j@. Erasing the end of what was just typed (see 'insert') by code
+-- points is /O(1)/ as well.
 delete :: Unit -> Int -> Int -> Rope -> Rope
 delete = M.delete
 

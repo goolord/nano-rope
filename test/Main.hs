@@ -46,6 +46,8 @@ main =
           "editing"
           [ testProperty "sequences of operations" prop_ops
           , testProperty "typing and erasing at a cursor" prop_typing
+          , testProperty "keystrokes that continue each other" prop_run
+          , testProperty "typing on from the same rope twice" prop_branching
           ]
       , testGroup
           "units"
@@ -284,6 +286,7 @@ data Op
   | Drop Unit Offset
   | Slice Unit Offset Offset
   | Rejoin Unit Offset
+  | Typed Unit Offset [Snippet] Int
   deriving (Show)
 
 instance Arbitrary Op where
@@ -298,6 +301,7 @@ instance Arbitrary Op where
       , (1, Drop <$> arbitrary <*> arbitrary)
       , (1, Slice <$> arbitrary <*> arbitrary <*> arbitrary)
       , (3, Rejoin <$> arbitrary <*> arbitrary)
+      , (4, Typed <$> arbitrary <*> arbitrary <*> resize 6 (listOf arbitrary) <*> choose (0, 4))
       ]
     where
       -- Ends of ranges, as lengths: mostly short, so that the text survives.
@@ -307,6 +311,7 @@ instance Arbitrary Op where
     Replace u i j s -> Delete u i j : (Replace u i j <$> shrink s)
     Append s -> Append <$> shrink s
     Prepend s -> Prepend <$> shrink s
+    Typed u i ss erased -> [Typed u i ss' erased | ss' <- shrink ss] ++ [Typed u i ss 0 | erased > 0]
     _ -> []
 
 -- | Ranges are generated as a start and a length.
@@ -344,6 +349,18 @@ apply op (r, t) = case op of
   Rejoin u i ->
     let (a, b) = Rope.splitAt u (resolve u i t) r
      in (a <> b, t)
+  Typed u i snippets erased ->
+    let (r', t', cursor) = L.foldl' (keystroke u) (r, t, resolve u i t) snippets
+        (na, nb) = charRange u (cursor - erased) cursor t'
+     in (Rope.delete u (cursor - erased) cursor r', T.take na t' <> T.drop nb t')
+
+-- | Insert at a cursor and move it to where the next keystroke goes: by what
+-- the text measures, from the offset asked for or the start of the rope.
+keystroke :: Unit -> (R, Text, Int) -> Snippet -> (R, Text, Int)
+keystroke u (r, t, cursor) (Snippet s) =
+  (Rope.insert u cursor s r, T.take n t <> s <> T.drop n t, max 0 cursor + Rope.count u (naiveMetrics s))
+  where
+    n = charsAt u cursor t
 
 -- | A rope with some history, and the text it should hold.
 data Edited = Edited R Text
@@ -473,6 +490,34 @@ prop_typing (Doc t0) start = forAll (resize 10 (listOf arbitrary)) $ \bursts ->
     eraseOne st@(r, t, c)
       | c <= 0 = st
       | otherwise = (Rope.delete Chars (c - 1) c r, T.take (c - 1) t <> T.drop c t, c - 1)
+
+-- | Keystrokes that continue each other, in any unit and from any offset,
+-- also one that is clamped or falls inside a code point. Every rope on the
+-- way is right, whether or not it has been looked at before typing on.
+prop_run :: Edited -> Unit -> Offset -> Property
+prop_run (Edited r0 t0) u i = forAll (resize 12 (listOf arbitrary)) $ \snippets ->
+  let steps = L.scanl (keystroke u) (r0, t0, resolve u i t0) snippets
+      (unread, final, _) = L.foldl' (keystroke u) (r0, t0, resolve u i t0) snippets
+   in counterexample (show (u, resolve u i t0)) $
+        holds unread final .&&. conjoin [holds r t | (r, t, _) <- steps]
+
+-- | A rope in the middle of typing is a value like any other: typing on from
+-- it twice gives two ropes and leaves the first alone.
+prop_branching :: Edited -> Offset -> Snippet -> Snippet -> Snippet -> Property
+prop_branching (Edited r0 t0) i s1 s2 s3 =
+  conjoin
+    [ counterexample "one way" (holds ra ta)
+    , counterexample "the other way" (holds rb tb)
+    , counterexample "erased" (holds rc tc)
+    , counterexample "the rope they came from" (holds r t)
+    ]
+  where
+    start = max 0 (min (T.length t0) (resolve Chars i t0))
+    (r, t, cursor) = L.foldl' (keystroke Chars) (r0, t0, start) [Snippet "ab", s1]
+    (ra, ta, _) = keystroke Chars (r, t, cursor) s2
+    (rb, tb, _) = keystroke Chars (r, t, cursor) s3
+    rc = Rope.delete Chars (cursor - 1) cursor r
+    tc = T.take (cursor - 1) t <> T.drop cursor t
 
 prop_metricsAt :: Edited -> Unit -> Offset -> Property
 prop_metricsAt (Edited r t) u i =
