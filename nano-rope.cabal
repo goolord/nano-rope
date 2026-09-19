@@ -42,6 +42,16 @@ flag compare-text-rope
     default:     False
     manual:      True
 
+flag compare-yi-rope
+    description: Run the benchmarks on yi-rope as well, for comparison.
+    default:     False
+    manual:      True
+
+flag compare-core-text
+    description: Run the benchmarks on core-text as well, for comparison.
+    default:     False
+    manual:      True
+
 common extensions
     default-language: GHC2021
 
@@ -126,3 +136,11 @@ benchmark nano-rope-bench
     if flag(compare-text-rope)
         build-depends: text-rope >=0.3 && <0.4
         cpp-options:   -DCOMPARE_TEXT_ROPE
+
+    if flag(compare-yi-rope)
+        build-depends: yi-rope >=0.11 && <0.12
+        cpp-options:   -DCOMPARE_YI_ROPE
+
+    if flag(compare-core-text)
+        build-depends: core-text >=0.3.8 && <0.4
+        cpp-options:   -DCOMPARE_CORE_TEXT

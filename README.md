@@ -107,18 +107,22 @@ convert to and from the plain rope without copying text.
 ## Benchmarks
 
 10,000 operations each on 3.4 MB of source text (GHC 9.14.1,
-`cabal bench -f compare-text-rope`). Rows marked * run on a rope that has
-already been through 10,000 edits, the others on a freshly loaded one.
+`cabal bench -f compare-text-rope -f compare-yi-rope -f compare-core-text`).
+Rows marked * run on a rope that has already been through 10,000 edits, the
+others on a freshly loaded one.
 
-| workload | nano-rope | text-rope 0.3 |
-| --- | ---: | ---: |
-| random inserts * | 5.2 ms | 20.6 ms |
-| edits at UTF-16 positions | 9.1 ms | 42.0 ms |
-| `getLine` * | 3.0 ms | 15.6 ms |
-| keystrokes in one spot | 0.5 ms | 3.7 ms |
-| the same, reading the line after each | 4.7 ms | 210 ms |
-| `splitAt`, both halves * | 10.3 ms | 19.0 ms |
-| `toText` (once) * | 0.27 ms | 0.49 ms |
+| workload | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
+| --- | ---: | ---: | ---: | ---: |
+| random inserts * | 5.0 ms | 20.2 ms | 107 ms | 188 ms |
+| edits at UTF-16 positions | 9.5 ms | 43.0 ms | — | — |
+| `getLine` * | 3.0 ms | 15.5 ms | 129 ms | — |
+| keystrokes in one spot | 0.5 ms | 3.8 ms | 86 ms | 4.5 s |
+| the same, reading the line after each | 4.6 ms | 213 ms | 302 ms | — |
+| `splitAt`, both halves * | 10.1 ms | 19.2 ms | 113 ms | 81 ms |
+| `toText` (once) * | 0.26 ms | 0.43 ms | 1.8 ms | 3.1 ms |
+
+`yi-rope` counts code points and lines, `core-text` code points alone: they
+sit out the rows that ask for more.
 
 Keystrokes in one spot are 100 bursts of 100. Left alone they wait next to the
 tree; an editor that redraws the line after every one has them inserted every
@@ -126,8 +130,11 @@ time, which is the row below.
 
 A freshly loaded `text-rope` is a single chunk. Its `toText` is free, which
 no tree of chunks can match, and its first `getLine`s and splits walk the
-whole text: 10,000 of either take 1.5 s, against 3 ms and 10 ms here. The
-rows above stay clear of both.
+whole text: 10,000 of either take 1.5 s, against 3 ms and 10 ms here. A
+freshly loaded `core-text` is a single piece as well, which it measures again
+whenever something happens next to it: hence the 4.5 s of typing, which are
+150 ms once 10,000 edits have cut the piece up, and 10,000 splits of one take
+45 s. The rows above stay clear of all this but for that one.
 
 ## Development
 

@@ -2,7 +2,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Benchmarks of the workloads the rope is meant for. Build with
--- @-f compare-text-rope@ to run the same workloads on @text-rope@.
+-- @-f compare-text-rope@, @-f compare-yi-rope@ or @-f compare-core-text@ to
+-- run the same workloads on those packages, as far as they have the means:
+-- @yi-rope@ knows nothing of UTF-16, and @core-text@ nothing of lines either.
 module Main (main) where
 
 import Control.DeepSeq (NFData (..))
@@ -18,6 +20,14 @@ import Test.Tasty.Bench
 #ifdef COMPARE_TEXT_ROPE
 import qualified Data.Text.Rope as TR
 import qualified Data.Text.Utf16.Rope as TR16
+#endif
+
+#ifdef COMPARE_YI_ROPE
+import qualified Yi.Rope as Yi
+#endif
+
+#ifdef COMPARE_CORE_TEXT
+import qualified Core.Text.Rope as CT
 #endif
 
 ------------------------------------------------------------------------------
@@ -73,11 +83,36 @@ data Env = Env
   , envTR16 :: !TR16.Rope
   , envTREdited :: !TR.Rope
 #endif
+#ifdef COMPARE_YI_ROPE
+  , envYi :: !Yi.YiString
+  , envYiOneLine :: !Yi.YiString
+  , envYiEdited :: !Yi.YiString
+#endif
+#ifdef COMPARE_CORE_TEXT
+  , envCT :: !CT.Rope
+  , envCTOneLine :: !CT.Rope
+  , envCTEdited :: !CT.Rope
+#endif
   }
 
--- | The ropes are strict all the way down, and the lists are forced here.
+-- | The ropes of @nano-rope@ and @text-rope@ are strict all the way down.
+-- The finger trees of the other two and the lists are forced here.
 instance NFData Env where
-  rnf e = rnf (envChars e) `seq` rnf (envBursts e) `seq` rnf (envPositions e) `seq` rnf (envByteOffsets e)
+  rnf e =
+    rnf (envChars e)
+      `seq` rnf (envBursts e)
+      `seq` rnf (envPositions e)
+      `seq` rnf (envByteOffsets e)
+#ifdef COMPARE_YI_ROPE
+      `seq` forceYi (envYi e)
+      `seq` forceYi (envYiOneLine e)
+      `seq` forceYi (envYiEdited e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+      `seq` rnf (envCT e)
+      `seq` rnf (envCTOneLine e)
+      `seq` rnf (envCTEdited e)
+#endif
 
 mkEnv :: Int -> Int -> Env
 mkEnv nLines nOps =
@@ -96,6 +131,16 @@ mkEnv nLines nOps =
     , envTROneLine = TR.fromText oneLine
     , envTR16 = TR16.fromText text
     , envTREdited = L.foldl' (\rope i -> let (a, b) = TR.splitAt (fromIntegral i) rope in a <> "x" <> b) (TR.fromText text) offsets
+#endif
+#ifdef COMPARE_YI_ROPE
+    , envYi = Yi.fromText text
+    , envYiOneLine = Yi.fromText oneLine
+    , envYiEdited = L.foldl' (flip yiInsert) (Yi.fromText text) offsets
+#endif
+#ifdef COMPARE_CORE_TEXT
+    , envCT = ctFromText text
+    , envCTOneLine = ctFromText oneLine
+    , envCTEdited = L.foldl' (\rope i -> CT.insertRope i "x" rope) (ctFromText text) offsets
 #endif
     }
   where
@@ -204,6 +249,83 @@ trGetLines :: [Position] -> TR.Rope -> Int
 trGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (TR.toText (TR.getLine (fromIntegral l) r))) 0 positions
 #endif
 
+#ifdef COMPARE_YI_ROPE
+-- | A finger tree is lazy in its spine, and @yi-rope@ in its counts of lines
+-- as well: a rope that has been used has both.
+forceYi :: Yi.YiString -> ()
+forceYi r = Yi.countNewLines r `seq` rnf r
+
+-- | Loaded and ready for a question about lines, like the others.
+yiFromText :: Text -> Yi.YiString
+yiFromText t = let r = Yi.fromText t in Yi.countNewLines r `seq` r
+
+-- | There is no insertion as such: split and append, which is what Yi does.
+yiInsert :: Int -> Yi.YiString -> Yi.YiString
+yiInsert i r = let (a, b) = Yi.splitAt i r in a <> "x" <> b
+
+yiInserts :: [Int] -> Yi.YiString -> Int
+yiInserts offsets r0 = Yi.length (L.foldl' (flip yiInsert) r0 offsets)
+
+yiTyping :: Int -> [Int] -> Yi.YiString -> Int
+yiTyping n offsets r0 = Yi.length (L.foldl' burst r0 offsets)
+  where
+    burst r i = L.foldl' (\acc k -> yiInsert (i + k) acc) r [0 .. n - 1]
+
+-- | A line without its line feed, like 'Nano.getLine'.
+yiGetLine :: Int -> Yi.YiString -> Text
+yiGetLine l = Yi.toText . Yi.takeWhile (/= '\n') . snd . Yi.splitAtLine l
+
+yiTypingRead :: [(Int, Int)] -> Yi.YiString -> Int
+yiTypingRead bursts r0 = snd (L.foldl' burst (r0, 0) bursts)
+  where
+    burst acc (i, l) = L.foldl' (key i l) acc [0 .. 99 :: Int]
+    key i l (r, n) k =
+      let r' = yiInsert (i + k) r
+          !n' = n + T.length (yiGetLine l r')
+       in (r', n')
+
+yiDeletes :: [Int] -> Yi.YiString -> Int
+yiDeletes offsets r0 = Yi.length (L.foldl' del r0 offsets)
+  where
+    del r i = let (a, b) = Yi.splitAt i r in a <> Yi.drop 1 b
+
+yiSplits :: [Int] -> Yi.YiString -> Int
+yiSplits offsets r = L.foldl' (\n i -> let (a, b) = Yi.splitAt i r in n + Yi.countNewLines a + Yi.countNewLines b) 0 offsets
+
+yiGetLines :: [Position] -> Yi.YiString -> Int
+yiGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (yiGetLine l r)) 0 positions
+#endif
+
+#ifdef COMPARE_CORE_TEXT
+-- | One piece which shares the text, in a tree that is lazy: benchmark it to
+-- normal form.
+ctFromText :: Text -> CT.Rope
+ctFromText = CT.intoRope
+
+ctToText :: CT.Rope -> Text
+ctToText = CT.fromRope
+
+ctInserts :: [Int] -> CT.Rope -> Int
+ctInserts offsets r0 = CT.widthRope (L.foldl' (\r i -> CT.insertRope i "x" r) r0 offsets)
+
+ctTyping :: Int -> [Int] -> CT.Rope -> Int
+ctTyping n offsets r0 = CT.widthRope (L.foldl' burst r0 offsets)
+  where
+    burst r i = L.foldl' (\acc k -> CT.insertRope (i + k) "x" acc) r [0 .. n - 1]
+
+ctDeletes :: [Int] -> CT.Rope -> Int
+ctDeletes offsets r0 = CT.widthRope (L.foldl' del r0 offsets)
+  where
+    del r i =
+      let (a, b) = CT.splitRope i r
+          (_, c) = CT.splitRope 1 b
+       in a <> c
+
+-- | There are no lines to count: the halves are forced by their width.
+ctSplits :: [Int] -> CT.Rope -> Int
+ctSplits offsets r = L.foldl' (\n i -> let (a, b) = CT.splitRope i r in n + CT.widthRope a + CT.widthRope b) 0 offsets
+#endif
+
 ------------------------------------------------------------------------------
 
 main :: IO ()
@@ -218,12 +340,24 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf TR.fromText (envText e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf yiFromText (envText e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ nf ctFromText (envText e)
+#endif
               ]
           , bgroup
               "toText"
               [ bench "nano-rope" $ whnf Nano.toText (envNano e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf TR.toText (envTR e)
+#endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf Yi.toText (envYi e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf ctToText (envCT e)
 #endif
               ]
           , bgroup
@@ -232,12 +366,24 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trInserts (envChars e)) (envTR e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiInserts (envChars e)) (envYi e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctInserts (envChars e)) (envCT e)
+#endif
               ]
           , bgroup
               "100 bursts of 100 keystrokes"
               [ bench "nano-rope" $ whnf (nanoTyping 100 (L.take 100 (envChars e))) (envNano e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trTyping 100 (L.take 100 (envChars e))) (envTR e)
+#endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiTyping 100 (L.take 100 (envChars e))) (envYi e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctTyping 100 (L.take 100 (envChars e))) (envCT e)
 #endif
               ]
           , bgroup
@@ -246,6 +392,9 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trTypingRead (envBursts e)) (envTR e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiTypingRead (envBursts e)) (envYi e)
+#endif
               ]
           , bgroup
               "10k keystrokes in one spot"
@@ -253,6 +402,12 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trTyping 10000 (L.take 1 (envChars e))) (envTR e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiTyping 10000 (L.take 1 (envChars e))) (envYi e)
+#endif
+              -- Not core-text: a freshly loaded rope is one piece, which it
+              -- measures again at every keystroke next to it and every split
+              -- of it. This and the splits below take 45 s a run.
               ]
           , bgroup
               "10k random deletes"
@@ -260,12 +415,21 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trDeletes (envChars e)) (envTR e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiDeletes (envChars e)) (envYi e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctDeletes (envChars e)) (envCT e)
+#endif
               ]
           , bgroup
               "10k random splits"
               [ bench "nano-rope" $ whnf (nanoSplits (envChars e)) (envNano e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trSplits (envChars e)) (envTR e)
+#endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiSplits (envChars e)) (envYi e)
 #endif
               ]
           , bgroup
@@ -285,6 +449,9 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trGetLines (envPositions e)) (envTR e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiGetLines (envPositions e)) (envYi e)
+#endif
               ]
           , bgroup
               "one long line, 10k random inserts"
@@ -292,15 +459,28 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trInserts (envChars e)) (envTROneLine e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiInserts (envChars e)) (envYiOneLine e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctInserts (envChars e)) (envCTOneLine e)
+#endif
               ]
-            -- A freshly loaded text-rope is a single chunk, which the read-only
-            -- workloads above keep hitting. These run on ropes that have been
-            -- through 10k edits and are in the shape they have mid-session.
+            -- A freshly loaded text-rope is a single chunk and a freshly loaded
+            -- core-text a single piece, which the read-only workloads above
+            -- keep hitting. These run on ropes that have been through 10k edits
+            -- and are in the shape they have mid-session.
           , bgroup
               "after 10k edits, 10k random splits"
               [ bench "nano-rope" $ whnf (nanoSplits (envChars e)) (envNanoEdited e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trSplits (envChars e)) (envTREdited e)
+#endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiSplits (envChars e)) (envYiEdited e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctSplits (envChars e)) (envCTEdited e)
 #endif
               ]
           , bgroup
@@ -309,12 +489,21 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trGetLines (envPositions e)) (envTREdited e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiGetLines (envPositions e)) (envYiEdited e)
+#endif
               ]
           , bgroup
               "after 10k edits, 10k random inserts"
               [ bench "nano-rope" $ whnf (nanoInserts (envChars e)) (envNanoEdited e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trInserts (envChars e)) (envTREdited e)
+#endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiInserts (envChars e)) (envYiEdited e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctInserts (envChars e)) (envCTEdited e)
 #endif
               ]
           , bgroup
@@ -323,6 +512,12 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trTyping 100 (L.take 100 (envChars e))) (envTREdited e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiTyping 100 (L.take 100 (envChars e))) (envYiEdited e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctTyping 100 (L.take 100 (envChars e))) (envCTEdited e)
+#endif
               ]
           , bgroup
               "after 10k edits, 10k keystrokes in one spot"
@@ -330,12 +525,24 @@ main =
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf (trTyping 10000 (L.take 1 (envChars e))) (envTREdited e)
 #endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf (yiTyping 10000 (L.take 1 (envChars e))) (envYiEdited e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf (ctTyping 10000 (L.take 1 (envChars e))) (envCTEdited e)
+#endif
               ]
           , bgroup
               "after 10k edits, toText"
               [ bench "nano-rope" $ whnf Nano.toText (envNanoEdited e)
 #ifdef COMPARE_TEXT_ROPE
               , bench "text-rope" $ whnf TR.toText (envTREdited e)
+#endif
+#ifdef COMPARE_YI_ROPE
+              , bench "yi-rope" $ whnf Yi.toText (envYiEdited e)
+#endif
+#ifdef COMPARE_CORE_TEXT
+              , bench "core-text" $ whnf ctToText (envCTEdited e)
 #endif
               ]
           ]
