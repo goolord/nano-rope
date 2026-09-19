@@ -57,6 +57,7 @@ main =
           , testProperty "typing and erasing at a cursor" prop_typing
           , testProperty "keystrokes that continue each other" prop_run
           , testProperty "typing on from the same rope twice" prop_branching
+          , testProperty "an insertion anywhere near a run" prop_nearRun
           ]
       , testGroup
           "units"
@@ -554,6 +555,23 @@ prop_run (Edited r0 t0) u i = forAll (resize 12 (listOf arbitrary)) $ \snippets 
       (unread, final, _) = L.foldl' (keystroke u) (r0, t0, resolve u i t0) snippets
    in counterexample (show (u, resolve u i t0)) $
         holds unread final .&&. conjoin [holds r t | (r, t, _) <- steps]
+
+-- | An insertion joins a run where the run ends and nowhere else: not where
+-- it would end if it were counted in another unit, neither inside it.
+prop_nearRun :: Edited -> Unit -> Offset -> Property
+prop_nearRun (Edited r0 t0) u i = forAll ((,) <$> key <*> key) $ \(s1, s2) ->
+  let (r, t, _) = L.foldl' (keystroke u) (r0, t0, start) [Snippet "a", Snippet s1, Snippet s2]
+      -- In bytes, the longest way to count what was typed.
+      typed = Rope.count Bytes (naiveMetrics t) - Rope.count Bytes (naiveMetrics t0)
+   in conjoin
+        [ counterexample (show (u, start, k)) (holds (Rope.insert u k "-" r) (T.take n t <> "-" <> T.drop n t))
+        | k <- [start - 1 .. start + typed + 1]
+        , let n = charsAt u k t
+        ]
+  where
+    start = resolve u i t0
+    -- What a key or two make, short enough to wait in a run.
+    key = choose (1, 2) >>= genText
 
 -- | A rope in the middle of typing is a value like any other: typing on from
 -- it twice gives two ropes and leaves the first alone.
