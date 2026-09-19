@@ -59,6 +59,10 @@ module Data.Text.NanoRope
   , foldlChunks'
   , chunkAt
 
+    -- * Output
+  , hPutUtf8
+  , writeFileUtf8
+
     -- * Queries
   , null
   , length
@@ -108,6 +112,7 @@ import Data.Text (Text)
 import qualified Data.Text.Lazy as TL
 import Data.Text.NanoRope.Internal (Measure, Metrics (..), Position (..), Unit (..), count)
 import qualified Data.Text.NanoRope.Internal as M
+import System.IO (Handle)
 import Prelude hiding (drop, getLine, length, lines, null, splitAt, take)
 
 -- | A rope of text. This is "Data.Text.NanoRope.Measured"'s rope without a
@@ -177,6 +182,25 @@ foldlChunks' = M.foldlChunks'
 -- the following offset.
 chunkAt :: Unit -> Int -> Rope -> Text
 chunkAt = M.chunkAt
+
+-- | Write the text to a handle as UTF-8, which is what the chunks hold
+-- already: they are poured through one small buffer, and no 'Text' of the
+-- whole document is made on the way as it would be by way of 'toText'.
+--
+-- Like 'System.IO.hPutBuf' this writes bytes. The encoding and the newline
+-- mode of the handle have no say, so a @\\r\\n@ in the rope is a @\\r\\n@
+-- in the file on every platform. That is what a file, a pipe or a socket
+-- wants; a console may not, and text for one is better off as 'toLazyText'.
+hPutUtf8 :: Handle -> Rope -> IO ()
+hPutUtf8 = M.hPutUtf8
+
+-- | Write the text to a file as UTF-8 with 'hPutUtf8', replacing what was
+-- there.
+--
+-- The rope is evaluated first, keystrokes that were waiting included: should
+-- that fail, the file is as it was.
+writeFileUtf8 :: FilePath -> Rope -> IO ()
+writeFileUtf8 = M.writeFileUtf8
 
 -- | /O(1)/.
 null :: Rope -> Bool

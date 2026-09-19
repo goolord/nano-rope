@@ -71,6 +71,7 @@ module Data.Text.NanoRope.Internal
   , maxChildren
   , minChildren
   , maxPending
+  , outputBuffer
 
     -- * Construction
   , empty
@@ -86,6 +87,10 @@ module Data.Text.NanoRope.Internal
   , foldrChunks
   , foldlChunks'
   , chunkAt
+
+    -- * Output
+  , hPutUtf8
+  , writeFileUtf8
 
     -- * Queries
   , null
@@ -141,7 +146,7 @@ module Data.Text.NanoRope.Internal
 
 import Control.DeepSeq (NFData (..))
 import Control.Monad (when)
-import Control.Monad.ST (ST)
+import Control.Monad.ST (RealWorld, ST)
 import Data.Bits (complement, unsafeShiftL, unsafeShiftR, xor, (.&.), (.|.))
 import qualified Data.Foldable as F
 import qualified Data.List as L
@@ -154,8 +159,10 @@ import qualified Data.Text.Array as A
 import qualified Data.Text.Internal as TI
 import qualified Data.Text.Lazy as TL
 import Data.Word (Word8)
+import Foreign.Ptr (Ptr)
 import GHC.Exts (Int (..), Int#, TYPE, indexWord8ArrayAsWord64#, (-#))
 import GHC.Word (Word64 (..))
+import System.IO (Handle, IOMode (WriteMode), hPutBuf, withBinaryFile)
 #ifdef NANO_ROPE_SIMD
 import System.IO.Unsafe (unsafeDupablePerformIO)
 #endif
@@ -198,6 +205,18 @@ minChildren = maxChildren `quot` 2
 -- below a chunk.
 maxPending :: Int
 maxPending = maxChunk `quot` 4
+
+-- | Size of the buffer that 'hPutUtf8' pours the chunks through, in bytes: 32
+-- kB. So many chunks, because a chunk has to fit whatever 'maxChunk' is, and
+-- no less than the buffer of a handle, which is then bypassed rather than
+-- copied into.
+outputBuffer :: Int
+#ifdef NANO_ROPE_SMALL
+-- A few chunks, so that the test suite fills it over and over.
+outputBuffer = 4 * maxChunk
+#else
+outputBuffer = 64 * maxChunk
+#endif
 
 ------------------------------------------------------------------------------
 -- Metrics
@@ -1997,6 +2016,65 @@ foldlNode' f = go
       | otherwise = f acc arr
     go !acc (Inner _ _ _ cs) = F.foldl' go acc cs
 {-# INLINE foldlNode' #-}
+
+------------------------------------------------------------------------------
+-- Output
+
+-- | Write the text to a handle as UTF-8, which is what the chunks hold
+-- already: they are poured through one small buffer, and no 'Text' of the
+-- whole document is made on the way as it would be by way of 'toText'.
+--
+-- Like 'hPutBuf' this writes bytes. The encoding and the newline mode of the
+-- handle have no say, so a @\\r\\n@ in the rope is a @\\r\\n@ in the file on
+-- every platform. That is what a file, a pipe or a socket wants; a console
+-- may not, and text for one is better off as 'toLazyText'.
+hPutUtf8 :: Handle -> Rope a -> IO ()
+hPutUtf8 h (Rope root) = do
+  buf <- newPinnedByteArray outputBuffer
+  withMutableByteArrayContents buf $ \ptr -> do
+    I# used <- pourNode h buf ptr 0 root
+    flushBuffer h ptr used
+
+-- | Copy a node into a buffer of 'outputBuffer' bytes, @used@ of which are
+-- taken, writing the buffer out whenever the next chunk would not fit.
+-- Returns how much of it is taken then.
+--
+-- At the top level for the sake of that number: as a loop local to
+-- 'hPutUtf8' it was a box for every chunk.
+pourNode :: Handle -> MutableByteArray RealWorld -> Ptr Word8 -> Int -> Node a -> IO Int
+pourNode h !buf !ptr used@(I# used#) node = case node of
+  Leaf _ _ arr
+    | used + size <= outputBuffer -> used + size <$ copyByteArray buf used arr 0 size
+    | otherwise -> do
+        flushBuffer h ptr used#
+        size <$ copyByteArray buf 0 arr 0 size
+    where
+      size = sizeofByteArray arr
+  Inner _ _ _ cs -> go 0 used
+    where
+      n = sizeofSmallArray cs
+      go !c !used'
+        | c >= n = pure used'
+        | otherwise = pourNode h buf ptr used' (indexSmallArray cs c) >>= go (c + 1)
+
+-- | Write out what is in the buffer.
+--
+-- 'hPutBuf' wants the number in a box. It is made here, out of sight: a
+-- function that hands on a box it was given is given one by its callers in
+-- turn, and for 'pourNode' that was a box for every chunk.
+flushBuffer :: Handle -> Ptr Word8 -> Int# -> IO ()
+flushBuffer h ptr used# = when (used > 0) $ hPutBuf h ptr used
+  where
+    used = I# used#
+{-# NOINLINE flushBuffer #-}
+
+-- | Write the text to a file as UTF-8 with 'hPutUtf8', replacing what was
+-- there.
+--
+-- The rope is evaluated first, keystrokes that were waiting and their
+-- measure included: should that fail, the file is as it was.
+writeFileUtf8 :: FilePath -> Rope a -> IO ()
+writeFileUtf8 path rope@(Rope _) = withBinaryFile path WriteMode (`hPutUtf8` rope)
 
 -- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
 -- offset; empty exactly when the offset is at or beyond the end.

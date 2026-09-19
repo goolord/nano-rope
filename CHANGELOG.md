@@ -16,6 +16,11 @@
   chunk, a node and an array of pointers per level, and nothing else; looking
   something up allocates nothing but the answer; loading a text allocates the
   rope and no garbage. A leaf keeps its four metrics in one word.
+* Getting the text out without copying it: `hPutUtf8` and `writeFileUtf8`
+  stream the chunks to a handle through one small buffer, `foldlChunks'` is a
+  strict fold over them that allocates nothing, next to the lazy
+  `foldrChunks`, `toChunks` and `toLazyText`. `toText` costs a `memcpy` of the
+  document.
 * Chunks are scanned with SIMD instructions through C (SSE2, AVX2 when the
   CPU supports it, picked at run time); the `simd` flag turns this off.
 * `Data.Text.NanoRope.Measured`: the same rope carrying a custom monoidal

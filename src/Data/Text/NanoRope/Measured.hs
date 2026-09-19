@@ -53,6 +53,10 @@ module Data.Text.NanoRope.Measured
   , foldlChunks'
   , chunkAt
 
+    -- * Output
+  , hPutUtf8
+  , writeFileUtf8
+
     -- * Queries
   , null
   , length

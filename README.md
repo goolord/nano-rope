@@ -62,6 +62,22 @@ A column past the end of a line clamps to before its `\n` or `\r\n`, as LSP
 expects. `Rope.chunkAt Bytes i rope` is a zero-copy view of the text at an
 offset, for parsers that read through a callback.
 
+## Getting the text out
+
+```haskell
+Rope.writeFileUtf8 path rope                       -- or hPutUtf8 to a handle
+Rope.foldlChunks' (\h chunk -> hash h chunk) h0 rope
+Rope.toText rope
+```
+
+The chunks are UTF-8 already, so saving streams them through a 32 kB buffer:
+the 4 MB document of the benchmarks allocates 98 kB on its way to a file,
+and 8 MB by way of `toText`. It writes bytes, whatever the encoding and
+newline mode of the handle. `foldlChunks'` walks the chunks as zero-copy
+`Text`s and allocates nothing of its own (22 μs for that document, where
+the lazy list of `toChunks` takes 83 μs and a megabyte). `toText` is for
+when one `Text` is what you need: it costs a `memcpy` of the document.
+
 ## Custom measures
 
 ```haskell
@@ -95,6 +111,7 @@ convert to and from the plain rope without copying text.
 | `metricsAt`, `convert`, positions, `splitWhere`, `chunkAt` | `O(log n)` |
 | `getLine`, `sliceText` | `O(log n + result)`, zero-copy within a chunk |
 | `fromText`, `toText` | `O(n)` |
+| `foldlChunks'`, `toChunks`, `toLazyText`, `hPutUtf8` | `O(n)`, zero-copy but for the write buffer |
 
 ## Benchmarks
 

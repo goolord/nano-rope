@@ -11,6 +11,8 @@
 -- a build with tiny chunks and nodes (see the cabal file).
 module Main (main) where
 
+import Control.Exception (ErrorCall, bracket, try)
+import qualified Data.ByteString as B
 import qualified Data.List as L
 import Data.Maybe (fromMaybe)
 import Data.Primitive.ByteArray (ByteArray (..), cloneByteArray, indexByteArray, sizeofByteArray)
@@ -19,6 +21,7 @@ import Data.String (IsString (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Array as A
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Internal as TI
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.NanoRope as Plain
@@ -27,6 +30,8 @@ import Data.Text.NanoRope.Measured (Measure (..), Metrics (..), Position (..), R
 import qualified Data.Text.NanoRope.Measured as Rope
 import Data.Text.Unsafe (dropWord8, takeWord8)
 import Data.Word (Word8)
+import System.Directory (getTemporaryDirectory, removeFile)
+import System.IO (Handle, hClose, openBinaryTempFile)
 import Test.QuickCheck.Classes.Base (Laws (..), commutativeMonoidLaws, eqLaws, monoidLaws, ordLaws, semigroupLaws, semigroupMonoidLaws, showLaws)
 import Test.Tasty (TestTree, adjustOption, defaultMain, localOption, testGroup)
 import Test.Tasty.QuickCheck
@@ -42,6 +47,9 @@ main =
           , testProperty "lazy text" prop_lazy
           , testProperty "toChunks" prop_chunks
           , testProperty "chunkAt" prop_chunkAt
+          , testProperty "hPutUtf8 / writeFileUtf8" prop_output
+          , testProperty "output of more than the buffer" (once prop_outputLarge)
+          , testProperty "output of a rope that fails" (once prop_outputFails)
           , testProperty "remeasure" prop_remeasure
           ]
       , testGroup
@@ -463,6 +471,69 @@ prop_chunks (Edited r t) =
     .&&. reverse (Rope.foldlChunks' (flip (:)) [] r) === chunks
   where
     chunks = Rope.toChunks r
+
+-- | What is written is the UTF-8 of the text, to the byte: to a handle that
+-- has something in it already, and to a file, which is replaced.
+prop_output :: Edited -> Property
+prop_output (Edited r t) = ioProperty $ do
+  (written, replaced) <- withTempFile $ \path h -> do
+    B.hPut h "before "
+    Rope.hPutUtf8 h r
+    hClose h
+    written <- B.readFile path
+    Rope.writeFileUtf8 path r
+    replaced <- B.readFile path
+    pure (written, replaced)
+  pure (written === "before " <> TE.encodeUtf8 t .&&. replaced === TE.encodeUtf8 t)
+
+-- | The documents of the other properties fit the buffer of the library as
+-- it ships. This one fills it several times over, and not to the brim.
+prop_outputLarge :: Property
+prop_outputLarge = ioProperty $ do
+  written <- withTempFile $ \path h -> do
+    Rope.hPutUtf8 h (Rope.fromText t :: R)
+    hClose h
+    B.readFile path
+  pure (written == TE.encodeUtf8 t)
+  where
+    t = T.replicate 9000 "na\239ve \20013\25991 \128512\r\n"
+
+-- | A measure that has no answer for an exclamation mark.
+data Calm = Calm
+  deriving (Eq, Show)
+
+instance Semigroup Calm where
+  Calm <> Calm = Calm
+
+instance Monoid Calm where
+  mempty = Calm
+
+instance Measure Calm where
+  measureChunk t
+    | T.any (== '!') t = error "not calm"
+    | otherwise = Calm
+
+-- | A rope that cannot be evaluated leaves the file as it was: here the
+-- keystrokes still waiting to go into the tree are the ones without a measure.
+prop_outputFails :: Property
+prop_outputFails = ioProperty $ do
+  (outcome, kept) <- withTempFile $ \path h -> do
+    B.hPut h "kept"
+    hClose h
+    outcome <- try (Rope.writeFileUtf8 path typed) :: IO (Either ErrorCall ())
+    kept <- B.readFile path
+    pure (outcome, kept)
+  pure (counterexample "it was written" (either (const True) (const False) outcome) .&&. kept === "kept")
+  where
+    typed = L.foldl' (\r (i, key) -> Rope.insert Chars i key r) (Rope.fromText "calm" :: Rope Calm) [(4, "a"), (5, "b"), (6, "!")]
+
+withTempFile :: (FilePath -> Handle -> IO a) -> IO a
+withTempFile act = do
+  dir <- getTemporaryDirectory
+  bracket
+    (openBinaryTempFile dir "nano-rope.txt")
+    (\(path, h) -> hClose h >> removeFile path)
+    (uncurry act)
 
 prop_chunkAt :: Edited -> Unit -> Offset -> Property
 prop_chunkAt (Edited r t) u i =
