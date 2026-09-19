@@ -17,23 +17,15 @@ Rope.offsetToPosition Bytes Utf16 17 rope         -- Position 1 2
 Rope.getLine 1 rope                               -- "let y = x"
 ```
 
-* **Every unit at once.** Bytes, code points, UTF-16 code units and lines are
-  tracked at every node. Any of them addresses the rope, and any converts to
-  any other, in `O(log n)`.
-* **Flat chunks in a B-tree.** Leaves are unpinned byte arrays of at most
-  512 bytes of UTF-8. Inner nodes have up to 16 children. Every node carries
-  the sizes of its subtree next to its header, so seeking reads the heads of
-  a node's children, and an edit copies one small array of pointers per level.
-* **Long lines are nothing special.** Chunks are cut by size, never by line.
-* **Cheap keystrokes.** An edit within one chunk copies that chunk and the
-  path to it, in one descent; a chunk that overflows splits in two. Typing is
-  cheaper still: keystrokes that continue each other wait next to the tree,
-  up to 128 bytes of them, and go into it at once when the rope is read.
-* **Custom measures.** Cache a monoid of your own at every node and search by
-  it.
-* **Persistent and strict.** Old versions stay valid and share structure with
-  new ones: undo is a list of ropes. The keystrokes that wait are the one
-  lazy spot.
+* Bytes, code points, UTF-16 code units and lines are tracked at every node,
+  so you can index by any of them and convert between them in `O(log n)`.
+* A B-tree of flat UTF-8 chunks (up to 512 bytes, up to 16 children per node).
+  Chunks are split by size, not by line, so one huge line is fine.
+* An edit copies one chunk and the path to it. Consecutive keystrokes are
+  buffered (up to 128 bytes) and flushed into the tree when you next read.
+* Cache your own monoid at every node and search by it.
+* Persistent: old versions stay valid and share structure, so undo is just a
+  list of ropes. Strict, apart from the keystroke buffer.
 
 ## Units
 
@@ -41,11 +33,10 @@ Rope.getLine 1 rope                               -- "let y = x"
 data Unit = Bytes | Chars | Utf16 | Lines
 ```
 
-Everything that takes an offset takes a `Unit`. The text is stored as UTF-8,
-so `Bytes` is what tree-sitter, PCRE and FFI buffers speak. `Utf16` is what the
-Language Server Protocol counts columns in by default; for a negotiated
+Anything that takes an offset takes a `Unit`. `Bytes` is what tree-sitter,
+PCRE and FFI want; `Utf16` is LSP's default. If the client negotiates a
 `positionEncoding`, `"utf-8"` is `Bytes` and `"utf-32"` is `Chars`. Offsets are
-clamped to the rope and rounded down to a code point boundary.
+clamped to the rope and rounded down to a code point.
 
 ```haskell
 Rope.splitAt Bytes 120 rope
@@ -54,8 +45,8 @@ Rope.slice   Utf16 5 9 rope
 Rope.convert Bytes Utf16 120 rope
 ```
 
-`metricsAt` describes a location in every unit with one descent, which is all
-tree-sitter wants to know about an edit that arrived as an LSP position:
+`metricsAt` gives you a location in every unit at once, e.g. to turn an LSP
+position into what tree-sitter needs:
 
 ```haskell
 let m      = Rope.metricsAtPosition Utf16 lspPosition rope
@@ -64,10 +55,9 @@ let m      = Rope.metricsAtPosition Utf16 lspPosition rope
     column = posColumn (Rope.metricsToPosition Bytes m rope)
 ```
 
-Positions clamp the way LSP asks: a column past the end of a line is the end
-of its content, before the `\n` or `\r\n`. For parsers that pull their input
-through a callback, `Rope.chunkAt Bytes i rope` is a zero-copy view of the text
-at an offset.
+A column past the end of a line clamps to before its `\n` or `\r\n`, as LSP
+expects. `Rope.chunkAt Bytes i rope` is a zero-copy view of the text at an
+offset, for parsers that read through a callback.
 
 ## Custom measures
 
@@ -87,9 +77,8 @@ Rope.measure rope :: Width                           -- O(1)
 fst (Rope.splitWhere (\_ w -> w > Width 80) rope)    -- O(log n): what fits in 80 columns
 ```
 
-Chunk boundaries are up to the rope, so a measure has to be a monoid
-homomorphism: `measureChunk (x <> y) == measureChunk x <> measureChunk y`.
-Pairs and triples of measures are measures, and `measured` / `unmeasured`
+The rope picks the chunk boundaries, so `measureChunk` has to be a monoid
+homomorphism. Tuples of measures are measures. `measured` and `unmeasured`
 convert to and from the plain rope without copying text.
 
 ## Complexity
@@ -106,40 +95,44 @@ convert to and from the plain rope without copying text.
 
 ## Benchmarks
 
-10,000 operations each on 3.4 MB of source text (GHC 9.14.1,
-`cabal bench -f compare-text-rope -f compare-yi-rope -f compare-core-text`).
-Rows marked * run on a rope that has already been through 10,000 edits, the
-others on a freshly loaded one.
+10,000 operations on 4 MB of source code, GHC 9.14.1. Rows marked * run on a
+rope that has already had 10,000 random inserts.
 
 | workload | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
 | --- | ---: | ---: | ---: | ---: |
-| random inserts * | 5.0 ms | 20.2 ms | 107 ms | 188 ms |
-| edits at UTF-16 positions | 9.5 ms | 43.0 ms | — | — |
-| `getLine` * | 3.0 ms | 15.5 ms | 129 ms | — |
-| keystrokes in one spot | 0.5 ms | 3.8 ms | 86 ms | 4.5 s |
-| the same, reading the line after each | 4.6 ms | 213 ms | 302 ms | — |
-| `splitAt`, both halves * | 10.1 ms | 19.2 ms | 113 ms | 81 ms |
+| random inserts * | 5.1 ms | 19.8 ms | 108 ms | 186 ms |
+| edits at UTF-16 positions | 10.0 ms | 43.5 ms | — | — |
+| `getLine` * | 2.9 ms | 15.6 ms | 113 ms | — |
+| typing, 100 bursts of 100 | 0.5 ms | 3.8 ms | 65 ms | 4.5 s |
+| the same, reading the line after each key | 4.8 ms | 210 ms | 260 ms | — |
+| `splitAt`, both halves * | 11.5 ms | 20.8 ms | 98 ms | 81 ms |
 | `toText` (once) * | 0.26 ms | 0.43 ms | 1.8 ms | 3.1 ms |
 
-`yi-rope` counts code points and lines, `core-text` code points alone: they
-sit out the rows that ask for more.
+yi-rope has no UTF-16, and core-text has neither UTF-16 nor lines.
 
-Keystrokes in one spot are 100 bursts of 100. Left alone they wait next to the
-tree; an editor that redraws the line after every one has them inserted every
-time, which is the row below.
+A freshly loaded text-rope or core-text is one big chunk. That makes `toText`
+free, but the first reads and splits walk the whole text (10,000 `getLine`s on
+text-rope take 1.5 s), and core-text re-measures the chunk on every edit next
+to it, hence its 4.5 s of typing. Most rows above use an edited rope to keep
+that out of the comparison.
 
-A freshly loaded `text-rope` is a single chunk. Its `toText` is free, which
-no tree of chunks can match, and its first `getLine`s and splits walk the
-whole text: 10,000 of either take 1.5 s, against 3 ms and 10 ms here. A
-freshly loaded `core-text` is a single piece as well, which it measures again
-whenever something happens next to it: hence the 4.5 s of typing, which are
-150 ms once 10,000 edits have cut the piece up, and 10,000 splits of one take
-45 s. The rows above stay clear of all this but for that one.
+![Time, allocation and live heap of nano-rope, text-rope, yi-rope and core-text](bench/results.svg)
+
+The chart has everything, including allocation and memory use. To regenerate
+it:
+
+```
+cabal bench -f compare-text-rope -f compare-yi-rope -f compare-core-text \
+  --benchmark-options="--chart bench/results.svg"
+```
+
+The numbers are saved next to it in `bench/results.csv`; add `--redraw` to
+redraw from those without re-running.
 
 ## Development
 
 ```
-cabal test     # properties against a Text model and the laws of the
-               # instances, also with 16-byte chunks
+cabal test     # properties against a Text model and the instance laws,
+               # also with 16-byte chunks
 cabal bench
 ```
