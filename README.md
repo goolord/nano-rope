@@ -103,15 +103,15 @@ rope that has already had 10,000 random inserts.
 
 | workload | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
 | --- | ---: | ---: | ---: | ---: |
-| random inserts * | 5.2 ms | 20.2 ms | 107 ms | 195 ms |
-| edits at UTF-16 positions | 8.3 ms | 42.2 ms | — | — |
-| `getLine` * | 2.5 ms | 15.5 ms | 121 ms | — |
-| typing, 100 bursts of 100 | 0.5 ms | 3.8 ms | 64 ms | 4.5 s |
-| the same, reading the line after each key | 4.4 ms | 220 ms | 277 ms | — |
-| `splitAt`, both halves * | 10.5 ms | 18.8 ms | 98 ms | 79 ms |
-| `toText` (once) * | 0.28 ms | 0.47 ms | 1.9 ms | 3.2 ms |
-| `fromText` (once) | 1.1 ms | 2.7 ms | 4.6 ms | 10 ns |
-| `toText` (once), fresh rope | 0.26 ms | 39 ns | 1.0 ms | 76 ns |
+| random inserts * | 4.5 ms | 23.5 ms | 107 ms | 183 ms |
+| edits at UTF-16 positions | 6.5 ms | 42.4 ms | — | — |
+| `getLine` * | 1.9 ms | 15.4 ms | 120 ms | — |
+| typing, 100 bursts of 100 | 0.4 ms | 3.8 ms | 63 ms | 4.5 s |
+| the same, reading the line after each key | 3.4 ms | 224 ms | 272 ms | — |
+| `splitAt`, both halves * | 7.8 ms | 19.4 ms | 101 ms | 80 ms |
+| `toText` (once) * | 0.24 ms | 0.45 ms | 1.9 ms | 3.0 ms |
+| `fromText` (once) | 0.61 ms | 2.7 ms | 4.4 ms | 10 ns |
+| `toText` (once), fresh rope | 0.25 ms | 39 ns | 1.1 ms | 75 ns |
 
 yi-rope has no UTF-16, and core-text has neither UTF-16 nor lines.
 
@@ -119,8 +119,36 @@ nano-rope is far slower at loading and saving than core-text, and at saving
 a fresh rope than text-rope. A freshly loaded text-rope or core-text is one
 big chunk, and core-text is the `Text` it was loaded from, so they hand it
 back as it is. The cost comes later: their first reads and splits walk the
-whole text (10,000 `getLine`s on a fresh text-rope take 1.5 s), and core-text
+whole text (10,000 `getLine`s on a fresh text-rope take 1.6 s), and core-text
 re-measures the chunk on every edit next to it, hence its 4.5 s of typing.
+
+### Memory
+
+The same runs, by what they allocate, and the heap that stays live holding the
+4.03 MB document once the `Text` it came from is dropped.
+
+| | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
+| --- | ---: | ---: | ---: | ---: |
+| allocated by random inserts * | 12.6 MB | 87.2 MB | 335 MB | 304 MB |
+| allocated by edits at UTF-16 positions | 12.9 MB | 148 MB | — | — |
+| allocated by `getLine` * | 0.38 MB | 78.9 MB | 260 MB | — |
+| allocated by `splitAt`, both halves * | 26.6 MB | 107 MB | 185 MB | 160 MB |
+| allocated by `fromText` (once) | 4.55 MB | 11.7 MB | 2.71 MB | 55 B |
+| live heap, fresh rope | 4.55 MB | 5.08 MB | 4.56 MB | 4.03 MB |
+| live heap after 10,000 random inserts | 4.60 MB | 11.6 MB | 7.90 MB | 4.62 MB |
+
+An edit allocates the new chunk, a node and an array of pointers for each level
+of the tree, and nothing else: about 1.3 kB per insert here. That is also what
+an old version keeps alive, so it is the price of a step of undo. Looking
+something up allocates nothing but the answer, and `fromText` allocates the
+rope it builds and no garbage.
+
+A fresh core-text is smaller because it is the `Text` it was loaded from, and
+yi-rope allocates less to load than the text is long, so it does not copy all
+of it either. nano-rope copies the text into chunks of its own. Of the 0.52
+MB nano-rope adds to the text, each of the 7,900 chunks accounts for some 66
+bytes: the array's header, a leaf of four words (its metrics share one of
+them) and its share of the inner nodes.
 
 ![Time, allocation and live heap of nano-rope, text-rope, yi-rope and core-text](bench/results.svg)
 
