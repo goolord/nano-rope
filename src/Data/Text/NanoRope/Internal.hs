@@ -4,6 +4,7 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE UnboxedSums #-}
 {-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE UnliftedDatatypes #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 {-# LANGUAGE ViewPatterns #-}
 -- Constructor specialisation clones the recursive workers before they can be
@@ -34,6 +35,13 @@
 -- therefore copies one small array of pointers per level: persistence is
 -- paid for in allocation, and this is what keeps the bill short.
 --
+-- Nodes are unlifted: a node is never a thunk, and the compiler knows. What
+-- seeking reads of a child is then a load and a look at the tag of the
+-- pointer. Were they lifted, every child read out of an array would have to
+-- be evaluated first, for all that it always is already, and an evaluation
+-- inside a loop saves the state of the loop to the stack and fetches it
+-- back: that was most of what a descent cost.
+--
 -- The bill is meant to be exactly that: an edit allocates the new leaf, a
 -- node and an array of pointers per level, and the rope; looking something
 -- up allocates nothing but the answer. What keeps it so is strictness that
@@ -55,6 +63,10 @@ module Data.Text.NanoRope.Internal
   ( -- * Types
     Rope (.., Rope)
   , Node (.., Leaf)
+  , Lazy (..)
+  , Children
+  , sizeofChildren
+  , indexChildren
   , Measure (..)
   , Metrics (..)
   , Unit (..)
@@ -146,12 +158,11 @@ module Data.Text.NanoRope.Internal
 
 import Control.DeepSeq (NFData (..))
 import Control.Monad (when)
-import Control.Monad.ST (RealWorld, ST)
+import Control.Monad.ST (RealWorld)
 import Data.Bits (complement, unsafeShiftL, unsafeShiftR, xor, (.&.), (.|.))
-import qualified Data.Foldable as F
+import Data.Kind (Type)
 import qualified Data.List as L
 import Data.Primitive.ByteArray
-import Data.Primitive.SmallArray
 import Data.String (IsString (..))
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -160,7 +171,26 @@ import qualified Data.Text.Internal as TI
 import qualified Data.Text.Lazy as TL
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
-import GHC.Exts (Int (..), Int#, TYPE, indexWord8ArrayAsWord64#, (-#))
+import GHC.Exts
+  ( Int (..)
+  , Int#
+  , SmallArray#
+  , SmallMutableArray#
+  , TYPE
+  , UnliftedType
+  , cloneSmallArray#
+  , copySmallArray#
+  , indexSmallArray#
+  , indexWord8ArrayAsWord64#
+  , newSmallArray#
+  , runRW#
+  , sizeofSmallArray#
+  , thawSmallArray#
+  , unsafeFreezeSmallArray#
+  , writeSmallArray#
+  , (-#)
+  )
+import GHC.ST (ST (..))
 import GHC.Word (Word64 (..))
 import System.IO (Handle, IOMode (WriteMode), hPutBuf, withBinaryFile)
 #ifdef NANO_ROPE_SIMD
@@ -340,7 +370,7 @@ data Rope a
     -- offset is negative if there is no such place. Last, the room left in
     -- the leaf that insertion went to, as far as known.
     Settled
-      !(Node a)
+      (Node a)
       !Unit
       {-# UNPACK #-} !Int
       {-# UNPACK #-} !Int
@@ -358,19 +388,22 @@ data Rope a
     -- keystroke would continue the run and the metrics of everything are
     -- worked out ('typingNext', 'metrics') rather than kept.
     Typing
+      (Lazy a)
       (Node a)
-      !(Node a)
       !Unit
       {-# UNPACK #-} !Int
       {-# UNPACK #-} !ByteArray
       {-# UNPACK #-} !PackedMetrics
       {-# UNPACK #-} !Int
 
--- | The tree of a rope, with everything typed in it. Matching evaluates it:
--- left lazy, it would be a thunk in every function that does not get to look
--- at the tree on all of its paths.
+-- | A node in a box. A node is never a thunk, but the box can be one: this
+-- is how the tree of a 'Typing' rope is put off.
+data Lazy a = Lazy (Node a)
+
+-- | The tree of a rope, with everything typed in it. Matching evaluates it,
+-- as a node is unlifted: the keystrokes that were waiting go in.
 pattern Rope :: Node a -> Rope a
-pattern Rope root <- (rootOf -> !root)
+pattern Rope root <- (rootOf -> root)
   where
     Rope root = Settled root Bytes (-1) 0
 
@@ -378,14 +411,15 @@ pattern Rope root <- (rootOf -> !root)
 
 rootOf :: Rope a -> Node a
 rootOf (Settled root _ _ _) = root
-rootOf (Typing root _ _ _ _ _ _) = root
+rootOf (Typing (Lazy root) _ _ _ _ _ _) = root
 {-# INLINE rootOf #-}
 
--- | A node of the B-tree. Every field is strict, so a tree in weak head
--- normal form is fully built.
+-- | A node of the B-tree. It is unlifted and every field is strict, so there
+-- is no such thing as a tree that is not fully built.
 --
 -- Both constructors start with the metrics of their subtree, which is all
 -- that seeking reads of a node it does not descend into.
+type Node :: Type -> UnliftedType
 data Node a
   = -- | Metrics, annotation and UTF-8 payload, which is what the pattern
     -- v'Leaf' matches and builds. The payload occupies the whole array:
@@ -403,7 +437,7 @@ data Node a
       {-# UNPACK #-} !Metrics
       {-# UNPACK #-} !Int
       !a
-      {-# UNPACK #-} !(SmallArray (Node a))
+      {-# UNPACK #-} !(Children a)
 
 -- | A leaf: metrics, annotation and UTF-8 payload.
 pattern Leaf :: Metrics -> a -> ByteArray -> Node a
@@ -448,15 +482,71 @@ nodeHeight (Inner _ h _ _) = h
 {-# INLINE nodeHeight #-}
 
 nodeBytes :: Node a -> Int
-nodeBytes = bytes . nodeMetrics
+nodeBytes node = bytes (nodeMetrics node)
 {-# INLINE nodeBytes #-}
 
 nodeIsEmpty :: Node a -> Bool
 nodeIsEmpty node = nodeBytes node == 0
 {-# INLINE nodeIsEmpty #-}
 
+-- | Not a constant: there are none of an unlifted type. It is four words to
+-- whoever ends up with no text.
 emptyNode :: Monoid a => Node a
-emptyNode = Leaf mempty mempty emptyByteArray
+emptyNode = PackedLeaf 0 mempty emptyByteArray
+{-# INLINE emptyNode #-}
+
+------------------------------------------------------------------------------
+-- Arrays of nodes
+
+-- | The children of an inner node: a small array whose elements are
+-- unlifted, which those of a 'Data.Primitive.SmallArray.SmallArray' cannot
+-- be. What follows is as much of its interface as the tree needs.
+data Children a = Children (SmallArray# (Node a))
+
+data MutableChildren s a = MutableChildren (SmallMutableArray# s (Node a))
+
+-- | How many children there are.
+sizeofChildren :: Children a -> Int
+sizeofChildren (Children cs) = I# (sizeofSmallArray# cs)
+{-# INLINE sizeofChildren #-}
+
+-- | The child at an index, which is not checked. A load, and no more: what
+-- comes out of the array is a node, not something to evaluate to one.
+indexChildren :: Children a -> Int -> Node a
+indexChildren (Children cs) (I# i) = case indexSmallArray# cs i of (# node #) -> node
+{-# INLINE indexChildren #-}
+
+-- | An array of so many children, all of them the given node.
+newChildren :: Int -> Node a -> ST s (MutableChildren s a)
+newChildren (I# n) node = ST $ \s -> case newSmallArray# n node s of
+  (# s', m #) -> (# s', MutableChildren m #)
+{-# INLINE newChildren #-}
+
+writeChildren :: MutableChildren s a -> Int -> Node a -> ST s ()
+writeChildren (MutableChildren m) (I# i) node = ST $ \s -> (# writeSmallArray# m i node s, () #)
+{-# INLINE writeChildren #-}
+
+-- | @copyChildren dst d src off cnt@ copies @cnt@ children of @src@ from
+-- @off@ on to @dst@ from @d@ on.
+copyChildren :: MutableChildren s a -> Int -> Children a -> Int -> Int -> ST s ()
+copyChildren (MutableChildren dst) (I# d) (Children src) (I# off) (I# cnt) =
+  ST $ \s -> (# copySmallArray# src off dst d cnt s, () #)
+{-# INLINE copyChildren #-}
+
+thawChildren :: Children a -> Int -> Int -> ST s (MutableChildren s a)
+thawChildren (Children cs) (I# off) (I# cnt) = ST $ \s -> case thawSmallArray# cs off cnt s of
+  (# s', m #) -> (# s', MutableChildren m #)
+{-# INLINE thawChildren #-}
+
+cloneChildren :: Children a -> Int -> Int -> Children a
+cloneChildren (Children cs) (I# off) (I# cnt) = Children (cloneSmallArray# cs off cnt)
+{-# INLINE cloneChildren #-}
+
+runChildren :: (forall s. ST s (MutableChildren s a)) -> Children a
+runChildren (ST build) =
+  case runRW# (\s -> case build s of (# s', MutableChildren m #) -> unsafeFreezeSmallArray# m s') of
+    (# _, cs #) -> Children cs
+{-# INLINE runChildren #-}
 
 ------------------------------------------------------------------------------
 -- Seeking
@@ -480,74 +570,74 @@ data SoughtBytes = SoughtBytes {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPAC
 -- children in front of it.
 --
 -- The unit is dispatched on once, in front of the loop.
-seekChild :: Unit -> Int -> SmallArray (Node a) -> Seek
+seekChild :: Unit -> Int -> Children a -> Seek
 seekChild !u !k !cs = case u of
   Bytes -> scan bytes
   Chars -> scan chars
   Utf16 -> scan utf16Units
   Lines -> scan newlines
   where
-    n = sizeofSmallArray cs
+    n = sizeofChildren cs
     scan sel = go 0 mempty
       where
         go !i !acc
           | i >= n - 1 || sel acc' >= k = Seek i acc
           | otherwise = go (i + 1) acc'
           where
-            acc' = acc <> nodeMetrics (indexSmallArray cs i)
+            acc' = acc <> nodeMetrics (indexChildren cs i)
     {-# INLINE scan #-}
 {-# NOINLINE seekChild #-}
 
 -- | 'seekChild' for when nothing but the unit sought matters: the child and
 -- the offset relative to it.
-seekUnit :: Unit -> Int -> SmallArray (Node a) -> Sought
+seekUnit :: Unit -> Int -> Children a -> Sought
 seekUnit !u !k !cs = case u of
   Bytes -> scan bytes
   Chars -> scan chars
   Utf16 -> scan utf16Units
   Lines -> scan newlines
   where
-    n = sizeofSmallArray cs
+    n = sizeofChildren cs
     scan sel = go 0 k
       where
         go !i !j
           | i >= n - 1 || m >= j = Sought i j
           | otherwise = go (i + 1) (j - m)
           where
-            m = sel (nodeMetrics (indexSmallArray cs i))
+            m = sel (nodeMetrics (indexChildren cs i))
     {-# INLINE scan #-}
 {-# NOINLINE seekUnit #-}
 
 -- | 'seekUnit' which also counts the bytes in front of the child.
-seekUnitBytes :: Unit -> Int -> SmallArray (Node a) -> SoughtBytes
+seekUnitBytes :: Unit -> Int -> Children a -> SoughtBytes
 seekUnitBytes !u !k !cs = case u of
   Bytes -> case seekUnit Bytes k cs of Sought i j -> SoughtBytes i j (k - j)
   Chars -> scan chars
   Utf16 -> scan utf16Units
   Lines -> scan newlines
   where
-    n = sizeofSmallArray cs
+    n = sizeofChildren cs
     scan sel = go 0 k 0
       where
         go !i !j !b
           | i >= n - 1 || sel m >= j = SoughtBytes i j b
           | otherwise = go (i + 1) (j - sel m) (b + bytes m)
           where
-            m = nodeMetrics (indexSmallArray cs i)
+            m = nodeMetrics (indexChildren cs i)
     {-# INLINE scan #-}
 {-# NOINLINE seekUnitBytes #-}
 
 -- | The child holding the byte at offset @i@: the first one whose running
 -- total exceeds @i@, or the last one. Comes with the offset relative to it.
-seekByte :: Int -> SmallArray (Node a) -> Sought
+seekByte :: Int -> Children a -> Sought
 seekByte !i !cs = go 0 i
   where
-    n = sizeofSmallArray cs
+    n = sizeofChildren cs
     go !c !j
       | c >= n - 1 || j < m = Sought c j
       | otherwise = go (c + 1) (j - m)
       where
-        m = nodeBytes (indexSmallArray cs c)
+        m = nodeBytes (indexChildren cs c)
 {-# NOINLINE seekByte #-}
 
 ------------------------------------------------------------------------------
@@ -555,97 +645,98 @@ seekByte !i !cs = go 0 i
 
 -- | The annotation of a node with these children. A right fold, which for
 -- the measure @()@ never gets going, because its '<>' does not look.
-foldAnn :: Monoid a => SmallArray (Node a) -> a
+foldAnn :: Monoid a => Children a -> a
 foldAnn cs = go 0
   where
-    n = sizeofSmallArray cs
+    n = sizeofChildren cs
     go !i
-      | i >= n - 1 = nodeAnn (indexSmallArray cs i)
-      | otherwise = nodeAnn (indexSmallArray cs i) <> go (i + 1)
+      | i >= n - 1 = nodeAnn (indexChildren cs i)
+      | otherwise = nodeAnn (indexChildren cs i) <> go (i + 1)
 {-# INLINE foldAnn #-}
 
 -- | Metrics of children @off .. off + cnt - 1@.
-sumMetrics :: SmallArray (Node a) -> Int -> Int -> Metrics
+sumMetrics :: Children a -> Int -> Int -> Metrics
 sumMetrics cs off cnt = go off mempty
   where
     end = off + cnt
     go !i !acc
       | i >= end = acc
-      | otherwise = go (i + 1) (acc <> nodeMetrics (indexSmallArray cs i))
+      | otherwise = go (i + 1) (acc <> nodeMetrics (indexChildren cs i))
 
 -- | An inner node of known height and metrics, out of at least one child.
 -- Most nodes are built from pieces of others, whose metrics add up without
 -- another look at the children.
-inner :: Monoid a => Int -> Metrics -> SmallArray (Node a) -> Node a
+inner :: Monoid a => Int -> Metrics -> Children a -> Node a
 inner h m cs = Inner m h (foldAnn cs) cs
 {-# INLINE inner #-}
 
 -- | Build an inner node out of at least one child.
-mkInner :: Monoid a => SmallArray (Node a) -> Node a
-mkInner cs = inner (nodeHeight (indexSmallArray cs 0) + 1) (sumMetrics cs 0 (sizeofSmallArray cs)) cs
+mkInner :: Monoid a => Children a -> Node a
+mkInner cs = inner (nodeHeight (indexChildren cs 0) + 1) (sumMetrics cs 0 (sizeofChildren cs)) cs
 {-# INLINABLE mkInner #-}
-{-# SPECIALIZE mkInner :: SmallArray (Node ()) -> Node () #-}
+{-# SPECIALIZE mkInner :: Children () -> Node () #-}
 
 mkInner2 :: Monoid a => Node a -> Node a -> Node a
-mkInner2 x y = inner (nodeHeight x + 1) (nodeMetrics x <> nodeMetrics y) $ runSmallArray $ do
-  m <- newSmallArray 2 x
-  writeSmallArray m 1 y
+mkInner2 x y = inner (nodeHeight x + 1) (nodeMetrics x <> nodeMetrics y) $ runChildren $ do
+  m <- newChildren 2 x
+  writeChildren m 1 y
   pure m
 {-# INLINABLE mkInner2 #-}
 {-# SPECIALIZE mkInner2 :: Node () -> Node () -> Node () #-}
 
-replaceAt :: SmallArray a -> Int -> a -> SmallArray a
-replaceAt arr i x = runSmallArray $ do
-  m <- thawSmallArray arr 0 (sizeofSmallArray arr)
-  writeSmallArray m i x
+replaceAt :: Children a -> Int -> Node a -> Children a
+replaceAt arr i x = runChildren $ do
+  m <- thawChildren arr 0 (sizeofChildren arr)
+  writeChildren m i x
   pure m
 
 -- | The first @cnt@ elements followed by two more. One allocation if the
 -- array has two elements to spare, which are copied along and overwritten.
-snoc2 :: SmallArray a -> Int -> a -> a -> SmallArray a
-snoc2 arr cnt x y = runSmallArray $ do
+snoc2 :: Children a -> Int -> Node a -> Node a -> Children a
+snoc2 arr cnt x y = runChildren $ do
   m <-
-    if cnt + 2 <= sizeofSmallArray arr
-      then thawSmallArray arr 0 (cnt + 2)
+    if cnt + 2 <= sizeofChildren arr
+      then thawChildren arr 0 (cnt + 2)
       else do
-        out <- newSmallArray (cnt + 2) y
-        copySmallArray out 0 arr 0 cnt
+        out <- newChildren (cnt + 2) y
+        copyChildren out 0 arr 0 cnt
         pure out
-  writeSmallArray m cnt x
-  writeSmallArray m (cnt + 1) y
+  writeChildren m cnt x
+  writeChildren m (cnt + 1) y
   pure m
 
 -- | Two elements followed by all but the first @off@ of an array.
-cons2 :: a -> a -> SmallArray a -> Int -> SmallArray a
-cons2 x y arr off = runSmallArray $ do
-  let cnt = sizeofSmallArray arr - off
+cons2 :: Node a -> Node a -> Children a -> Int -> Children a
+cons2 x y arr off = runChildren $ do
+  let cnt = sizeofChildren arr - off
   m <-
     if off >= 2
-      then thawSmallArray arr (off - 2) (cnt + 2)
+      then thawChildren arr (off - 2) (cnt + 2)
       else do
-        out <- newSmallArray (cnt + 2) x
-        copySmallArray out 2 arr off cnt
+        out <- newChildren (cnt + 2) x
+        copyChildren out 2 arr off cnt
         pure out
-  writeSmallArray m 0 x
-  writeSmallArray m 1 y
+  writeChildren m 0 x
+  writeChildren m 1 y
   pure m
 
 -- | Replace element @c@ by two.
-insert2 :: SmallArray a -> Int -> a -> a -> SmallArray a
-insert2 arr c x y = runSmallArray $ do
-  let n = sizeofSmallArray arr
-  m <- newSmallArray (n + 1) x
-  copySmallArray m 0 arr 0 c
-  writeSmallArray m (c + 1) y
-  copySmallArray m (c + 2) arr (c + 1) (n - c - 1)
+insert2 :: Children a -> Int -> Node a -> Node a -> Children a
+insert2 arr c x y = runChildren $ do
+  let n = sizeofChildren arr
+  m <- newChildren (n + 1) x
+  copyChildren m 0 arr 0 c
+  writeChildren m (c + 1) y
+  copyChildren m (c + 2) arr (c + 1) (n - c - 1)
   pure m
 
--- | A slice of one array followed by a slice of another.
-append2 :: SmallArray a -> Int -> Int -> SmallArray a -> Int -> Int -> SmallArray a
-append2 a offa cnta b offb cntb = runSmallArray $ do
-  m <- newSmallArray (cnta + cntb) (error "Data.Text.NanoRope: append2")
-  copySmallArray m 0 a offa cnta
-  copySmallArray m cnta b offb cntb
+-- | A slice of one array followed by a slice of another, at least one of
+-- them not empty.
+append2 :: Children a -> Int -> Int -> Children a -> Int -> Int -> Children a
+append2 a offa cnta b offb cntb = runChildren $ do
+  m <- newChildren (cnta + cntb) (if cnta > 0 then indexChildren a offa else indexChildren b offb)
+  copyChildren m 0 a offa cnta
+  copyChildren m cnta b offb cntb
   pure m
 
 ------------------------------------------------------------------------------
@@ -1175,15 +1266,15 @@ treeFromSlice !arr !off !len = node (levelSizes leaves) 0
             !cr = children `rem` parents
             !first = j * cq + min j cr
             !size = if j < cr then cq + 1 else cq
-         in mkInner $ runSmallArray $ do
-              m <- newSmallArray size (error "Data.Text.NanoRope: treeFromSlice")
+         in mkInner $ runChildren $ do
+              -- At least one child, and the array starts out full of it.
+              m <- newChildren size (node below first)
               let go !i
                     | i >= size = pure m
                     | otherwise = do
-                        let !child = node below (first + i)
-                        writeSmallArray m i child
+                        writeChildren m i (node below (first + i))
                         go (i + 1)
-              go 0
+              go 1
       [_] -> let !from = cut j in mkLeaf (cloneByteArray arr from (cut (j + 1) - from))
       [] -> emptyNode
 {-# INLINABLE treeFromSlice #-}
@@ -1223,17 +1314,11 @@ type Result a = (# (# #) | Node a | (# Node a, Node a #) #)
 pattern None :: Result a
 pattern None = (# (# #) | | #)
 
--- The nodes are evaluated before they go in: the components of an unboxed
--- sum are as lazy as those of an unboxed tuple.
 pattern One :: Node a -> Result a
-pattern One n <- (# | n | #)
-  where
-    One !n = (# | n | #)
+pattern One n = (# | n | #)
 
 pattern Two :: Node a -> Node a -> Result a
-pattern Two x y <- (# | | (# x, y #) #)
-  where
-    Two !x !y = (# | | (# x, y #) #)
+pattern Two x y = (# | | (# x, y #) #)
 
 {-# COMPLETE None, One, Two #-}
 
@@ -1252,12 +1337,6 @@ unreachable :: forall r (a :: TYPE r). String -> a
 unreachable fun = error ("Data.Text.NanoRope: " ++ fun)
 {-# NOINLINE unreachable #-}
 
--- | An unboxed pair is lazy in its components, which would make a thunk of
--- every node on the way back up. This one is not.
-pair :: a -> b -> (# a, b #)
-pair !a !b = (# a, b #)
-{-# INLINE pair #-}
-
 -- | The outcome of an edit with the room it leaves, see 'editNode'.
 roomy :: Result a -> Int -> (# Result a, Int# #)
 roomy r (I# room) = (# r, room #)
@@ -1271,9 +1350,9 @@ merge l r = case compare (nodeHeight l) (nodeHeight r) of
   EQ -> mergeEq l r
   GT -> case l of
     Inner ml h _ cs ->
-      let k = sizeofSmallArray cs - 1
+      let k = sizeofChildren cs - 1
           m = ml <> nodeMetrics r
-       in case merge (indexSmallArray cs k) r of
+       in case merge (indexChildren cs k) r of
             One x -> One (inner h m (replaceAt cs k x))
             Two x y -> fromChildren h m (snoc2 cs k x y)
             None -> None
@@ -1281,7 +1360,7 @@ merge l r = case compare (nodeHeight l) (nodeHeight r) of
   LT -> case r of
     Inner mr h _ cs ->
       let m = nodeMetrics l <> mr
-       in case merge l (indexSmallArray cs 0) of
+       in case merge l (indexChildren cs 0) of
             One x -> One (inner h m (replaceAt cs 0 x))
             Two x y -> fromChildren h m (cons2 x y cs 1)
             None -> None
@@ -1315,41 +1394,41 @@ mergeEq l@(Leaf ml al bl) r@(Leaf mr ar br)
     half = total `quot` 2
 mergeEq l@(Inner ml h _ csl) r@(Inner mr _ _ csr)
   | nl >= minChildren && nr >= minChildren = Two l r
-  | nl + nr <= maxChildren = One (inner h (ml <> mr) (csl <> csr))
+  | nl + nr <= maxChildren = One (inner h (ml <> mr) (append2 csl 0 nl csr 0 nr))
   | half <= nl =
       -- Hand the last children of the left node over to the right one.
       let moved = sumMetrics csl half (nl - half)
        in Two
-            (inner h (ml `subMetrics` moved) (cloneSmallArray csl 0 half))
+            (inner h (ml `subMetrics` moved) (cloneChildren csl 0 half))
             (inner h (moved <> mr) (append2 csl half (nl - half) csr 0 nr))
   | otherwise =
       let cnt = half - nl
           moved = sumMetrics csr 0 cnt
        in Two
             (inner h (ml <> moved) (append2 csl 0 nl csr 0 cnt))
-            (inner h (mr `subMetrics` moved) (cloneSmallArray csr cnt (nr - cnt)))
+            (inner h (mr `subMetrics` moved) (cloneChildren csr cnt (nr - cnt)))
   where
-    nl = sizeofSmallArray csl
-    nr = sizeofSmallArray csr
+    nl = sizeofChildren csl
+    nr = sizeofChildren csr
     half = (nl + nr + 1) `quot` 2
 mergeEq _ _ = unreachable "mergeEq"
 {-# INLINABLE mergeEq #-}
 {-# SPECIALIZE mergeEq :: Node () -> Node () -> Result () #-}
 
 -- | One node of height @h@ if the children fit, else two.
-fromChildren :: Monoid a => Int -> Metrics -> SmallArray (Node a) -> Result a
+fromChildren :: Monoid a => Int -> Metrics -> Children a -> Result a
 fromChildren !h !m !cs
   | n <= maxChildren = One (inner h m cs)
   | otherwise =
       let half = (n + 1) `quot` 2
           ml = sumMetrics cs 0 half
        in Two
-            (inner h ml (cloneSmallArray cs 0 half))
-            (inner h (m `subMetrics` ml) (cloneSmallArray cs half (n - half)))
+            (inner h ml (cloneChildren cs 0 half))
+            (inner h (m `subMetrics` ml) (cloneChildren cs half (n - half)))
   where
-    n = sizeofSmallArray cs
+    n = sizeofChildren cs
 {-# INLINABLE fromChildren #-}
-{-# SPECIALIZE fromChildren :: Int -> Metrics -> SmallArray (Node ()) -> Result () #-}
+{-# SPECIALIZE fromChildren :: Int -> Metrics -> Children () -> Result () #-}
 
 ------------------------------------------------------------------------------
 -- Breaking
@@ -1380,8 +1459,8 @@ dropRoot u k root
 
 splitRoot :: Measure a => Unit -> Int -> Node a -> (# Node a, Node a #)
 splitRoot u k root
-  | k <= 0 = pair emptyNode root
-  | beyondEnd u k (nodeMetrics root) = pair root emptyNode
+  | k <= 0 = (# emptyNode, root #)
+  | beyondEnd u k (nodeMetrics root) = (# root, emptyNode #)
   | otherwise = splitNode u k root
 {-# INLINABLE splitRoot #-}
 {-# SPECIALIZE splitRoot :: Unit -> Int -> Node () -> (# Node (), Node () #) #-}
@@ -1389,50 +1468,50 @@ splitRoot u k root
 -- | Children @0 .. i-1@ of a node of height @h@, whose metrics are @before@,
 -- followed by a lower tree, which may be empty or undersized: it is settled
 -- with its sibling, and the rest is lined up once.
-joinLeft :: Measure a => Int -> SmallArray (Node a) -> Int -> Metrics -> Node a -> Node a
+joinLeft :: Measure a => Int -> Children a -> Int -> Metrics -> Node a -> Node a
 joinLeft !h !cs !i !before !l
   | i == 0 = l
-  | nodeIsEmpty l = if i == 1 then indexSmallArray cs 0 else inner h before (cloneSmallArray cs 0 i)
-  | otherwise = case merge (indexSmallArray cs (i - 1)) l of
+  | nodeIsEmpty l = if i == 1 then indexChildren cs 0 else inner h before (cloneChildren cs 0 i)
+  | otherwise = case merge (indexChildren cs (i - 1)) l of
       One x
         | i == 1 -> x
-        | otherwise -> inner h m $ runSmallArray $ do
-            out <- thawSmallArray cs 0 i
-            writeSmallArray out (i - 1) x
+        | otherwise -> inner h m $ runChildren $ do
+            out <- thawChildren cs 0 i
+            writeChildren out (i - 1) x
             pure out
       Two x y -> inner h m (snoc2 cs (i - 1) x y)
       None -> unreachable "joinLeft"
   where
     m = before <> nodeMetrics l
 {-# INLINABLE joinLeft #-}
-{-# SPECIALIZE joinLeft :: Int -> SmallArray (Node ()) -> Int -> Metrics -> Node () -> Node () #-}
+{-# SPECIALIZE joinLeft :: Int -> Children () -> Int -> Metrics -> Node () -> Node () #-}
 
 -- | A lower tree followed by the children after child @i@ of a node of
 -- height @h@, whose metrics are @after@.
-joinRight :: Measure a => Int -> SmallArray (Node a) -> Int -> Metrics -> Node a -> Node a
+joinRight :: Measure a => Int -> Children a -> Int -> Metrics -> Node a -> Node a
 joinRight !h !cs !i !after !r
   | rest == 0 = r
-  | nodeIsEmpty r = if rest == 1 then indexSmallArray cs (i + 1) else inner h after (cloneSmallArray cs (i + 1) rest)
-  | otherwise = case merge r (indexSmallArray cs (i + 1)) of
+  | nodeIsEmpty r = if rest == 1 then indexChildren cs (i + 1) else inner h after (cloneChildren cs (i + 1) rest)
+  | otherwise = case merge r (indexChildren cs (i + 1)) of
       One x
         | rest == 1 -> x
-        | otherwise -> inner h m $ runSmallArray $ do
-            out <- thawSmallArray cs (i + 1) rest
-            writeSmallArray out 0 x
+        | otherwise -> inner h m $ runChildren $ do
+            out <- thawChildren cs (i + 1) rest
+            writeChildren out 0 x
             pure out
       Two x y -> inner h m (cons2 x y cs (i + 2))
       None -> unreachable "joinRight"
   where
-    rest = sizeofSmallArray cs - i - 1
+    rest = sizeofChildren cs - i - 1
     m = nodeMetrics r <> after
 {-# INLINABLE joinRight #-}
-{-# SPECIALIZE joinRight :: Int -> SmallArray (Node ()) -> Int -> Metrics -> Node () -> Node () #-}
+{-# SPECIALIZE joinRight :: Int -> Children () -> Int -> Metrics -> Node () -> Node () #-}
 
 takeNode :: Measure a => Unit -> Int -> Node a -> Node a
 takeNode u k node = case node of
   Leaf m _ arr -> leafPrefix (leafOffset u k m arr) node
   Inner _ h _ cs -> case seekChild u k cs of
-    Seek i before -> joinLeft h cs i before (takeNode u (k - count u before) (indexSmallArray cs i))
+    Seek i before -> joinLeft h cs i before (takeNode u (k - count u before) (indexChildren cs i))
 {-# INLINABLE takeNode #-}
 {-# SPECIALIZE takeNode :: Unit -> Int -> Node () -> Node () #-}
 
@@ -1441,7 +1520,7 @@ dropNode u k node = case node of
   Leaf m _ arr -> leafSuffix (leafOffset u k m arr) node
   Inner total h _ cs -> case seekChild u k cs of
     Seek i before ->
-      let child = indexSmallArray cs i
+      let child = indexChildren cs i
           after = total `subMetrics` before `subMetrics` nodeMetrics child
        in joinRight h cs i after (dropNode u (k - count u before) child)
 {-# INLINABLE dropNode #-}
@@ -1451,20 +1530,20 @@ dropNode u k node = case node of
 splitNode :: Measure a => Unit -> Int -> Node a -> (# Node a, Node a #)
 splitNode u k node = case node of
   Leaf m _ arr
-    | b <= 0 -> pair emptyNode node
-    | b >= size -> pair node emptyNode
+    | b <= 0 -> (# emptyNode, node #)
+    | b >= size -> (# node, emptyNode #)
     | otherwise ->
         let pm = leafPrefixMetrics m arr b
-         in pair (mkLeafWith pm (cloneByteArray arr 0 b)) (mkLeafWith (m `subMetrics` pm) (cloneByteArray arr b (size - b)))
+         in (# mkLeafWith pm (cloneByteArray arr 0 b), mkLeafWith (m `subMetrics` pm) (cloneByteArray arr b (size - b)) #)
     where
       size = sizeofByteArray arr
       b = leafOffset u k m arr
   Inner total h _ cs -> case seekChild u k cs of
     Seek i before ->
-      let child = indexSmallArray cs i
+      let child = indexChildren cs i
           after = total `subMetrics` before `subMetrics` nodeMetrics child
        in case splitNode u (k - count u before) child of
-            (# l, r #) -> pair (joinLeft h cs i before l) (joinRight h cs i after r)
+            (# l, r #) -> (# joinLeft h cs i before l, joinRight h cs i after r #)
 {-# INLINABLE splitNode #-}
 {-# SPECIALIZE splitNode :: Unit -> Int -> Node () -> (# Node (), Node () #) #-}
 
@@ -1480,7 +1559,7 @@ metricsAtNode u k root
     go !acc !j node = case node of
       Leaf m _ arr -> acc <> leafPrefixMetrics m arr (leafOffset u j m arr)
       Inner _ _ _ cs -> case seekChild u j cs of
-        Seek i before -> go (acc <> before) (j - count u before) (indexSmallArray cs i)
+        Seek i before -> go (acc <> before) (j - count u before) (indexChildren cs i)
 
 -- | Just the byte offset of 'metricsAtNode', which is all that editing needs
 -- and spares measuring the prefix of a leaf.
@@ -1493,14 +1572,14 @@ byteOffsetAtNode u k root
     go !acc !j node = case node of
       Leaf m _ arr -> acc + leafOffset u j m arr
       Inner _ _ _ cs -> case seekUnitBytes u j cs of
-        SoughtBytes i j' b -> go (acc + b) j' (indexSmallArray cs i)
+        SoughtBytes i j' b -> go (acc + b) j' (indexChildren cs i)
 
 -- | The byte at offset @i@, for @0 <= i < size@.
 indexByteNode :: Int -> Node a -> Word8
 indexByteNode !i node = case node of
   Leaf _ _ arr -> byteAt arr i
   Inner _ _ _ cs -> case seekByte i cs of
-    Sought c i' -> indexByteNode i' (indexSmallArray cs c)
+    Sought c i' -> indexByteNode i' (indexChildren cs c)
 
 -- | Bytes @i .. j-1@ as a 'Text', given boundaries @0 <= i <= j <= size@.
 -- A range inside a single chunk is returned as a view of that chunk.
@@ -1519,7 +1598,7 @@ sliceToText !i !j node
                     pure out
                in TI.Text (A.ByteArray ba) 0 (j - i)
           where
-            child = indexSmallArray cs c
+            child = indexChildren cs c
             j' = j - (i - i')
 
 -- | Copy bytes @i .. j-1@ of a node to offset @d@ of a buffer.
@@ -1532,9 +1611,9 @@ copyRange !out !d !i !j node = case node of
   Inner _ _ _ cs -> case seekByte i cs of
     Sought c0 i0 -> go c0 (i - i0)
     where
-      n = sizeofSmallArray cs
+      n = sizeofChildren cs
       go !c !start = when (c < n && start < j) $ do
-        let child = indexSmallArray cs c
+        let child = indexChildren cs c
             end = start + nodeBytes child
         if i <= start && end <= j
           then () <$ copyNode out (d + start - i) child
@@ -1555,10 +1634,10 @@ copyNode !out !d node = case node of
     pure (d + size)
   Inner _ _ _ cs -> go 0 d
     where
-      n = sizeofSmallArray cs
+      n = sizeofChildren cs
       go !c !d'
         | c >= n = pure d'
-        | otherwise = copyNode out d' (indexSmallArray cs c) >>= go (c + 1)
+        | otherwise = copyNode out d' (indexChildren cs c) >>= go (c + 1)
 
 -- | Locations of the start of line @l@ and of the end of its content, that
 -- is before the terminating @\n@ or @\r\n@, or at the end of the rope.
@@ -1605,9 +1684,9 @@ lineText !l root
               then across
               else viewSlice arr from (contentEnd arr from lf - from)
       Inner _ _ _ cs
-        | j <= 0 -> go j (indexSmallArray cs 0)
+        | j <= 0 -> go j (indexChildren cs 0)
         | otherwise -> case seekUnit Lines j cs of
-            Sought i j' -> go j' (indexSmallArray cs i)
+            Sought i j' -> go j' (indexChildren cs i)
     -- The general case: a line across leaves.
     across = case lineSpan l root of
       Span start end -> sliceToText (bytes start) (bytes end) root
@@ -1633,7 +1712,7 @@ positionAtNode !from !to !k root
               then general
               else Position (ls + leafNewlinesBefore m arr b) column
       Inner _ _ _ cs -> case seekChild from j cs of
-        Seek i before -> go (ls + newlines before) (bs + bytes before) (j - count from before) (indexSmallArray cs i)
+        Seek i before -> go (ls + newlines before) (bs + bytes before) (j - count from before) (indexChildren cs i)
     -- The general case: a line that starts in another leaf.
     general = positionOfMetrics to (metricsAtNode from k root) root
 
@@ -1662,9 +1741,9 @@ metricsAtPositionNode !u (Position l0 c) root
                     !b = column m arr from to
                  in acc <> leafPrefixMetrics m arr b
       Inner _ _ _ cs
-        | j <= 0 -> go acc j (indexSmallArray cs 0)
+        | j <= 0 -> go acc j (indexChildren cs 0)
         | otherwise -> case seekChild Lines j cs of
-            Seek i before -> go (acc <> before) (j - newlines before) (indexSmallArray cs i)
+            Seek i before -> go (acc <> before) (j - newlines before) (indexChildren cs i)
     -- The offset of the column within a leaf, given those of the start of
     -- the line and of the end of its content.
     column !m !arr !from !to
@@ -1708,12 +1787,12 @@ metricsWhereNode p root
                 mid = if down > lo then down else roundUp arr (half + 1)
          in m <> sliceMetrics arr 0 (search 0 (sizeofByteArray arr))
       Inner _ _ _ cs ->
-        let n = sizeofSmallArray cs
+        let n = sizeofChildren cs
             loop !i !m' !a'
               | i >= n - 1 || p m'' a'' = go m' a' c
               | otherwise = loop (i + 1) m'' a''
               where
-                c = indexSmallArray cs i
+                c = indexChildren cs i
                 m'' = m' <> nodeMetrics c
                 a'' = a' <> nodeAnn c
          in loop 0 m a
@@ -1767,7 +1846,7 @@ editNode !least u !k !d !src !soff !slen node = case node of
       m' = kept <> sliceMetrics src soff slen
   Inner m h _ cs -> case seekUnit u k cs of
     Sought c k' ->
-      let old = indexSmallArray cs c
+      let old = indexChildren cs c
        in case editNode least u k' d src soff slen old of
             (# None, _ #) -> (# None, 0# #)
             (# One new, room #) ->
@@ -1779,16 +1858,16 @@ editNode !least u !k !d !src !soff !slen node = case node of
 
 -- | Replace the text from offset @i@ up to offset @j@. Comes with the room
 -- of 'editNode', or none if it does not know.
-editRoot :: Measure a => Unit -> Int -> Int -> Text -> Node a -> (# Node a, Int #)
+editRoot :: Measure a => Unit -> Int -> Int -> Text -> Node a -> (# Node a, Int# #)
 editRoot u i j t@(TI.Text (A.ByteArray ba) off len) root =
   case editNode (if nodeHeight root == 0 then 0 else minChunk) u from (max 0 (j - from)) (ByteArray ba) off len root of
-    (# One node, room #) -> (# node, I# room #)
-    (# Two x y, room #) -> pair (mkInner2 x y) (I# room)
+    (# One node, room #) -> (# node, room #)
+    (# Two x y, room #) -> (# mkInner2 x y, room #)
     (# None, _ #)
-      | bi < bj -> pair (takeRoot Bytes bi root `appendNode` fromTextNode t `appendNode` dropRoot Bytes bj root) 0
-      | len <= 0 -> (# root, 0 #)
+      | bi < bj -> (# takeRoot Bytes bi root `appendNode` fromTextNode t `appendNode` dropRoot Bytes bj root, 0# #)
+      | len <= 0 -> (# root, 0# #)
       | otherwise -> case splitRoot Bytes bi root of
-          (# l, r #) -> pair (l `appendNode` fromTextNode t `appendNode` r) 0
+          (# l, r #) -> (# l `appendNode` fromTextNode t `appendNode` r, 0# #)
   where
     from = max 0 i
     -- Both offsets as bytes. Offsets of the original rope rather than of some
@@ -1797,7 +1876,7 @@ editRoot u i j t@(TI.Text (A.ByteArray ba) off len) root =
     bi = byteOffsetAtNode u i root
     bj = if j <= i then bi else byteOffsetAtNode u j root
 {-# INLINABLE editRoot #-}
-{-# SPECIALIZE editRoot :: Unit -> Int -> Int -> Text -> Node () -> (# Node (), Int #) #-}
+{-# SPECIALIZE editRoot :: Unit -> Int -> Int -> Text -> Node () -> (# Node (), Int# #) #-}
 
 edited :: Measure a => Unit -> Int -> Int -> Text -> Node a -> Node a
 edited u i j t root = case editRoot u i j t root of
@@ -1830,7 +1909,9 @@ edited u i j t root = case editRoot u i j t root of
 -- an offset.
 typing :: Measure a => Node a -> Unit -> Int -> ByteArray -> Metrics -> Int -> Rope a
 typing base u start run typed room =
-  Typing (edited u start start (chunkText run) base) base u start run (packMetrics typed) room
+  -- The box is the thunk: the run goes in when someone opens it.
+  let root = Lazy (edited u start start (chunkText run) base)
+   in Typing root base u start run (packMetrics typed) room
 {-# INLINE typing #-}
 
 -- | The offset at which a keystroke would continue a run.
@@ -1843,22 +1924,23 @@ typingNext u start typed = start + count u (unpackMetrics typed)
 -- for typing and begins a run, which the ones after it add to.
 insertText :: Measure a => Unit -> Int -> Text -> Rope a -> Rope a
 insertText u i t@(TI.Text (A.ByteArray ba) off len) r = case r of
-  Typing root base ru start run typed room
+  Typing lazyRoot base ru start run typed room
     | typingNext ru start typed == i && ru == u && len <= room ->
         let tm = sliceMetrics src off len
          in typing base u start (concatSlices run 0 (sizeofByteArray run) src off len) (unpackMetrics typed <> tm) (room - len)
-    | otherwise -> settled root ru (typingNext ru start typed) room
+    | otherwise -> case lazyRoot of
+        Lazy root -> settled root ru (typingNext ru start typed) room
   Settled root hu hint room -> settled root hu hint room
   where
     src = ByteArray ba
-    settled !root !hu !hint !room
+    settled root !hu !hint !room
       | hint == i && i >= 0 && hu == u && len <= min room maxPending =
           let tm = sliceMetrics src off len
            in typing root u i (cloneByteArray src off len) tm (min room maxPending - len)
       | otherwise = case editRoot u i i t root of
           (# root', room' #) ->
             let grown = count u (nodeMetrics root') - count u (nodeMetrics root)
-             in Settled root' u (if u == Lines then -1 else max 0 i + grown) room'
+             in Settled root' u (if u == Lines then -1 else max 0 i + grown) (I# room')
 {-# INLINABLE insertText #-}
 {-# SPECIALIZE insertText :: Unit -> Int -> Text -> Rope () -> Rope () #-}
 
@@ -1936,7 +2018,11 @@ instance NFData a => NFData (Rope a) where
   rnf (Rope root) = go root
     where
       go (Leaf _ a _) = rnf a
-      go (Inner _ _ a cs) = rnf a `seq` F.foldl' (\() c -> go c) () cs
+      go (Inner _ _ a cs) = rnf a `seq` children 0
+        where
+          children !i
+            | i >= sizeofChildren cs = ()
+            | otherwise = go (indexChildren cs i) `seq` children (i + 1)
 
 ------------------------------------------------------------------------------
 -- Construction
@@ -1954,7 +2040,7 @@ singleton = fromText . T.singleton
 -- | /O(n)/. The text is copied into chunks, except that a text of at most
 -- 'maxChunk' bytes which owns its whole buffer is shared.
 fromText :: Measure a => Text -> Rope a
-fromText = Rope . fromTextNode
+fromText t = Rope (fromTextNode t)
 {-# INLINE fromText #-}
 
 -- | /O(n)/.
@@ -1997,7 +2083,11 @@ foldrNode f = go
     go z (Leaf _ _ arr)
       | sizeofByteArray arr == 0 = z
       | otherwise = f arr z
-    go z (Inner _ _ _ cs) = F.foldr (flip go) z cs
+    go z (Inner _ _ _ cs) = children 0
+      where
+        children !i
+          | i >= sizeofChildren cs = z
+          | otherwise = go (children (i + 1)) (indexChildren cs i)
 {-# INLINE foldrNode #-}
 
 -- | Strict left fold over the chunks of 'toChunks'. It is a walk of the tree
@@ -2014,7 +2104,11 @@ foldlNode' f = go
     go !acc (Leaf _ _ arr)
       | sizeofByteArray arr == 0 = acc
       | otherwise = f acc arr
-    go !acc (Inner _ _ _ cs) = F.foldl' go acc cs
+    go !acc (Inner _ _ _ cs) = children acc 0
+      where
+        children !acc' !i
+          | i >= sizeofChildren cs = acc'
+          | otherwise = children (go acc' (indexChildren cs i)) (i + 1)
 {-# INLINE foldlNode' #-}
 
 ------------------------------------------------------------------------------
@@ -2052,10 +2146,10 @@ pourNode h !buf !ptr used@(I# used#) node = case node of
       size = sizeofByteArray arr
   Inner _ _ _ cs -> go 0 used
     where
-      n = sizeofSmallArray cs
+      n = sizeofChildren cs
       go !c !used'
         | c >= n = pure used'
-        | otherwise = pourNode h buf ptr used' (indexSmallArray cs c) >>= go (c + 1)
+        | otherwise = pourNode h buf ptr used' (indexChildren cs c) >>= go (c + 1)
 
 -- | Write out what is in the buffer.
 --
@@ -2091,7 +2185,7 @@ chunkAt u k (Rope root)
     go !i node = case node of
       Leaf _ _ arr -> viewSlice arr i (sizeofByteArray arr - i)
       Inner _ _ _ cs -> case seekByte i cs of
-        Sought c i' -> go i' (indexSmallArray cs c)
+        Sought c i' -> go i' (indexChildren cs c)
 
 ------------------------------------------------------------------------------
 -- Queries
@@ -2340,11 +2434,18 @@ metricsWhere p (Rope root) = metricsWhereNode p root
 
 -- | /O(n)/. Annotate the same text with another measure. The text itself is
 -- shared, not copied.
-remeasure :: Measure b => Rope a -> Rope b
+remeasure :: forall a b. Measure b => Rope a -> Rope b
 remeasure (Rope root) = Rope (go root)
   where
+    go :: Node a -> Node b
     go (Leaf m _ arr) = mkLeafWith m arr
-    go (Inner m h _ cs) = inner h m (mapSmallArray' go cs)
+    go (Inner m h _ cs) = inner h m $ runChildren $ do
+      let n = sizeofChildren cs
+      out <- newChildren n (go (indexChildren cs 0))
+      let fill !i
+            | i >= n = pure out
+            | otherwise = writeChildren out i (go (indexChildren cs i)) >> fill (i + 1)
+      fill 1
 {-# INLINABLE remeasure #-}
 
 ------------------------------------------------------------------------------
@@ -2355,7 +2456,7 @@ remeasure (Rope root) = Rope (go root)
 invariants :: (Measure a, Eq a) => Rope a -> [String]
 invariants rope = case rope of
   Settled root _ _ _ -> go True root
-  Typing root base u start run typed room ->
+  Typing (Lazy root) base u start run typed room ->
     go True root
       ++ map ("without what was typed: " ++) (go True base)
       ++ [ "a run of " ++ show (sizeofByteArray run) ++ " bytes with room for " ++ show room | sizeofByteArray run <= 0 || room < 0 || sizeofByteArray run + room > maxPending ]
@@ -2364,6 +2465,7 @@ invariants rope = case rope of
       ++ [ "the run caches " ++ show (unpackMetrics typed) ++ " instead of " ++ show (naive run) | unpackMetrics typed /= naive run ]
       ++ [ "the rope reports " ++ show (metrics rope) ++ " instead of " ++ show (nodeMetrics root) | metrics rope /= nodeMetrics root ]
   where
+    go :: (Measure a, Eq a) => Bool -> Node a -> [String]
     go isRoot node = case node of
       Leaf m a arr ->
         let size = sizeofByteArray arr
@@ -2373,15 +2475,16 @@ invariants rope = case rope of
               ++ [ "leaf caches " ++ show m ++ " instead of " ++ show (naive arr) | m /= naive arr ]
               ++ [ "leaf caches a wrong annotation" | a /= measureChunk (chunkText arr) ]
       Inner m h a cs ->
-        let n = sizeofSmallArray cs
-            kids = F.toList cs
-            total = mconcat (map nodeMetrics kids)
+        let n = sizeofChildren cs
+            -- In boxes: there is no list of what is unlifted.
+            kids = [Lazy (indexChildren cs i) | i <- [0 .. n - 1]]
+            total = mconcat [nodeMetrics c | Lazy c <- kids]
          in [ "inner node with " ++ show n ++ " children is too large" | n > maxChildren ]
               ++ [ "inner node with " ++ show n ++ " children is too small" | n < (if isRoot then 2 else minChildren) ]
-              ++ [ "child of height " ++ show (nodeHeight c) ++ " below a node of height " ++ show h | c <- kids, nodeHeight c /= h - 1 ]
+              ++ [ "child of height " ++ show (nodeHeight c) ++ " below a node of height " ++ show h | Lazy c <- kids, nodeHeight c /= h - 1 ]
               ++ [ "inner node caches " ++ show m ++ " instead of " ++ show total | m /= total ]
-              ++ [ "inner node caches a wrong annotation" | a /= mconcat (map nodeAnn kids) ]
-              ++ concatMap (go False) kids
+              ++ [ "inner node caches a wrong annotation" | a /= mconcat [nodeAnn c | Lazy c <- kids] ]
+              ++ concat [go False c | Lazy c <- kids]
     naive arr =
       let bs = [ byteAt arr i | i <- [0 .. sizeofByteArray arr - 1] ]
           cs = L.length (filter (not . isContByte) bs)
