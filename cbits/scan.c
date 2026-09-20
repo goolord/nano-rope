@@ -24,6 +24,8 @@
  * functions that are handed the size of the whole array.
  */
 
+#ifndef LEVEL
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -144,237 +146,30 @@ static inline uint32_t nth_bit(uint32_t m, HsInt k)
   return (uint32_t)__builtin_ctz(m);
 }
 
-/* What both levels make of the movemask bits of a vector, each with its own
- * way of counting them.
- *
- * pack_tail: the counts of a metrics scan in the last t lanes of a vector of
- * the given width. units: units in the lanes set in `lanes`, out of the
- * continuation and 4-byte leader bits of a vector. */
-#define MASK_HELPERS(level, attr)                                                                       \
-  attr static inline HsWord64 pack_tail_##level(uint32_t conts, uint32_t fours, uint32_t nls, int width, \
-                                                size_t t)                                               \
-  {                                                                                                     \
-    int shift = width - (int)t;                                                                         \
-    return PACK(popcount_##level(conts >> shift), popcount_##level(fours >> shift),                     \
-                popcount_##level(nls >> shift));                                                        \
-  }                                                                                                     \
-  attr static inline HsInt units_##level(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)      \
-  {                                                                                                     \
-    return (HsInt)popcount_##level(lanes & ~conts) + (wide ? (HsInt)popcount_##level(lanes & fours) : 0); \
-  }                                                                                                     \
-  /* The lane of the first code point that does not fit into k units, with u <= k of them counted      \
-   * already, in a vector whose `lanes` hold more than the rest. Read off the bits: where every unit   \
-   * is a code point it is the leader after those that fit. */                                         \
-  attr static inline uint32_t units_stop_##level(uint32_t lanes, uint32_t conts, uint32_t fours, HsInt k, \
-                                                 HsInt u, int wide)                                     \
-  {                                                                                                     \
-    uint32_t leaders = lanes & ~conts;                                                                  \
-    if (!wide || (fours & lanes) == 0)                                                                  \
-      return nth_bit(leaders, k - u + 1);                                                               \
-    for (;;) {                                                                                          \
-      uint32_t lane = (uint32_t)__builtin_ctz(leaders);                                                 \
-      HsInt w = (fours >> lane) & 1 ? 2 : 1;                                                            \
-      if (u + w > k)                                                                                    \
-        return lane;                                                                                    \
-      u += w;                                                                                           \
-      leaders &= leaders - 1;                                                                           \
-    }                                                                                                   \
-  }
-
-MASK_HELPERS(sse2, )
-MASK_HELPERS(avx2, AVX2)
+#define NR_CAT_(a, b) a##b
+#define NR_CAT(a, b) NR_CAT_(a, b)
 
 /* ------------------------------------------------------------------------
- * Level 1: SSE2.
- *
- * Continuation bytes 0x80 .. 0xBF are exactly the signed bytes below -64;
- * leaders of 4-byte sequences are the bytes whose unsigned maximum with 0xF0
- * is themselves.
+ * Level 1: SSE2, and level 2: AVX2, the same twice as wide. Both are the
+ * second half of this file, which includes itself once for each; whatever is
+ * shorter than a vector goes a level down.
  */
-
-static inline __m128i conts128(__m128i x)
-{
-  return _mm_cmpgt_epi8(_mm_set1_epi8((char)0xC0), x);
-}
-
-static inline __m128i fours128(__m128i x)
-{
-  return _mm_cmpeq_epi8(_mm_max_epu8(x, _mm_set1_epi8((char)0xF0)), x);
-}
-
-static inline __m128i newlines128(__m128i x)
-{
-  return _mm_cmpeq_epi8(x, _mm_set1_epi8('\n'));
-}
-
-static inline uint32_t bits128(__m128i m)
-{
-  return (uint32_t)_mm_movemask_epi8(m);
-}
 
 static inline HsWord64 sum128(__m128i v)
 {
   return (HsWord64)_mm_cvtsi128_si64(v) + (HsWord64)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v));
 }
 
-static HsWord64 metrics_sse2(bytes s, size_t n)
-{
-  if (n < 16)
-    return metrics_c(s, n);
-  const __m128i zero = _mm_setzero_si128();
-  __m128i sum = zero; /* packed as by PACK, in each 64-bit lane */
-  size_t i = 0;
-  while (n - i >= 16) {
-    size_t v = (n - i) / 16;
-    if (v > FLUSH)
-      v = FLUSH;
-    __m128i ac = zero, af = zero, an = zero;
-    for (; v > 0; v--, i += 16) {
-      __m128i x = _mm_loadu_si128((const __m128i *)(s + i));
-      ac = _mm_sub_epi8(ac, conts128(x));
-      af = _mm_sub_epi8(af, fours128(x));
-      an = _mm_sub_epi8(an, newlines128(x));
-    }
-    sum = _mm_add_epi64(sum, _mm_sad_epu8(ac, zero));
-    sum = _mm_add_epi64(sum, _mm_slli_epi64(_mm_sad_epu8(af, zero), 21));
-    sum = _mm_add_epi64(sum, _mm_slli_epi64(_mm_sad_epu8(an, zero), 42));
-  }
-  HsWord64 packed = sum128(sum);
-  if (i < n) {
-    __m128i x = _mm_loadu_si128((const __m128i *)(s + n - 16));
-    packed += pack_tail_sse2(bits128(conts128(x)), bits128(fours128(x)), bits128(newlines128(x)), 16, n - i);
-  }
-  return packed;
-}
-
-static HsInt newlines_sse2(bytes s, size_t n)
-{
-  if (n < 16)
-    return newlines_c(s, n);
-  const __m128i zero = _mm_setzero_si128();
-  __m128i sn = zero;
-  size_t i = 0;
-  while (n - i >= 16) {
-    size_t v = (n - i) / 16;
-    if (v > FLUSH)
-      v = FLUSH;
-    __m128i an = zero;
-    for (; v > 0; v--, i += 16)
-      an = _mm_sub_epi8(an, newlines128(_mm_loadu_si128((const __m128i *)(s + i))));
-    sn = _mm_add_epi64(sn, _mm_sad_epu8(an, zero));
-  }
-  HsInt nls = (HsInt)sum128(sn);
-  if (i < n) {
-    __m128i x = _mm_loadu_si128((const __m128i *)(s + n - 16));
-    nls += popcount_sse2(bits128(newlines128(x)) >> (16 - (n - i)));
-  }
-  return nls;
-}
-
-static uint32_t newline_mask128(bytes p)
-{
-  return bits128(newlines128(_mm_loadu_si128((const __m128i *)p)));
-}
-
-static HsInt find_newline_sse2(bytes s, size_t i, size_t n)
-{
-  if (n < 16)
-    return find_newline_c(s, i, n);
-  for (; n - i >= 16; i += 16) {
-    uint32_t m = newline_mask128(s + i);
-    if (m)
-      return (HsInt)(i + __builtin_ctz(m));
-  }
-  if (i < n) {
-    uint32_t m = newline_mask128(s + n - 16) >> (16 - (n - i));
-    if (m)
-      return (HsInt)(i + __builtin_ctz(m));
-  }
-  return (HsInt)n;
-}
-
-static HsInt find_newline_back_sse2(bytes s, size_t i)
-{
-  if (i < 16)
-    return find_newline_back_c(s, i);
-  for (; i >= 16; i -= 16) {
-    uint32_t m = newline_mask128(s + i - 16);
-    if (m)
-      return (HsInt)(i - 16 + 31 - __builtin_clz(m));
-  }
-  if (i > 0) {
-    uint32_t m = newline_mask128(s) & ((1u << i) - 1);
-    if (m)
-      return (HsInt)(31 - __builtin_clz(m));
-  }
-  return -1;
-}
-
-static HsInt nth_newline_sse2(bytes s, size_t i, size_t n, HsInt k)
-{
-  if (n < 16)
-    return nth_newline_c(s, i, n, k);
-  for (; n - i >= 16; i += 16) {
-    uint32_t m = newline_mask128(s + i);
-    HsInt c = popcount_sse2(m);
-    if (c >= k)
-      return (HsInt)(i + nth_bit(m, k) + 1);
-    k -= c;
-  }
-  if (i < n) {
-    uint32_t m = newline_mask128(s + n - 16) >> (16 - (n - i));
-    if (popcount_sse2(m) >= k)
-      return (HsInt)(i + nth_bit(m, k) + 1);
-  }
-  return (HsInt)n;
-}
-
-static HsInt scan_units_sse2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
-{
-  if (to < 16)
-    return scan_units_c(s, i, to, k, u, wide);
-  for (; to - i >= 16; i += 16) {
-    __m128i x = _mm_loadu_si128((const __m128i *)(s + i));
-    uint32_t conts = bits128(conts128(x)), fours = bits128(fours128(x));
-    HsInt c = units_sse2(0xFFFF, conts, fours, wide);
-    if (u + c > k)
-      return (HsInt)(i + units_stop_sse2(0xFFFF, conts, fours, k, u, wide));
-    u += c;
-  }
-  if (i < to) {
-    __m128i x = _mm_loadu_si128((const __m128i *)(s + to - 16));
-    uint32_t conts = bits128(conts128(x)), fours = bits128(fours128(x));
-    uint32_t lanes = 0xFFFFu & ~((1u << (16 - (to - i))) - 1);
-    if (u + units_sse2(lanes, conts, fours, wide) > k)
-      return (HsInt)(to - 16 + units_stop_sse2(lanes, conts, fours, k, u, wide));
-  }
-  return (HsInt)to;
-}
-
-/* ------------------------------------------------------------------------
- * Level 2: AVX2. The same as SSE2, twice as wide; whatever is shorter than
- * a vector goes to SSE2.
- */
-
-AVX2 static inline __m256i conts256(__m256i x)
-{
-  return _mm256_cmpgt_epi8(_mm256_set1_epi8((char)0xC0), x);
-}
-
-AVX2 static inline __m256i fours256(__m256i x)
-{
-  return _mm256_cmpeq_epi8(_mm256_max_epu8(x, _mm256_set1_epi8((char)0xF0)), x);
-}
-
-AVX2 static inline __m256i newlines256(__m256i x)
-{
-  return _mm256_cmpeq_epi8(x, _mm256_set1_epi8('\n'));
-}
-
-AVX2 static inline uint32_t bits256(__m256i m)
-{
-  return (uint32_t)_mm256_movemask_epi8(m);
-}
+#define LEVEL sse2
+#define LOWER c
+#define ATTR
+#define W 16
+#define V __m128i
+#define MM(op) _mm_##op
+#define LOAD(p) _mm_loadu_si128((const __m128i *)(p))
+#define ZERO _mm_setzero_si128()
+#define SUM(v) sum128(v)
+#include "scan.c"
 
 AVX2 static inline HsWord64 sum256(__m256i v)
 {
@@ -382,139 +177,16 @@ AVX2 static inline HsWord64 sum256(__m256i v)
   return (HsWord64)_mm_cvtsi128_si64(w) + (HsWord64)_mm_extract_epi64(w, 1);
 }
 
-AVX2 static HsWord64 metrics_avx2(bytes s, size_t n)
-{
-  if (n < 32)
-    return metrics_sse2(s, n);
-  const __m256i zero = _mm256_setzero_si256();
-  __m256i sum = zero; /* packed as by PACK, in each 64-bit lane */
-  size_t i = 0;
-  while (n - i >= 32) {
-    size_t v = (n - i) / 32;
-    if (v > FLUSH)
-      v = FLUSH;
-    __m256i ac = zero, af = zero, an = zero;
-    for (; v > 0; v--, i += 32) {
-      __m256i x = _mm256_loadu_si256((const __m256i *)(s + i));
-      ac = _mm256_sub_epi8(ac, conts256(x));
-      af = _mm256_sub_epi8(af, fours256(x));
-      an = _mm256_sub_epi8(an, newlines256(x));
-    }
-    sum = _mm256_add_epi64(sum, _mm256_sad_epu8(ac, zero));
-    sum = _mm256_add_epi64(sum, _mm256_slli_epi64(_mm256_sad_epu8(af, zero), 21));
-    sum = _mm256_add_epi64(sum, _mm256_slli_epi64(_mm256_sad_epu8(an, zero), 42));
-  }
-  HsWord64 packed = sum256(sum);
-  if (i < n) {
-    __m256i x = _mm256_loadu_si256((const __m256i *)(s + n - 32));
-    packed += pack_tail_avx2(bits256(conts256(x)), bits256(fours256(x)), bits256(newlines256(x)), 32, n - i);
-  }
-  return packed;
-}
-
-AVX2 static HsInt newlines_avx2(bytes s, size_t n)
-{
-  if (n < 32)
-    return newlines_sse2(s, n);
-  const __m256i zero = _mm256_setzero_si256();
-  __m256i sn = zero;
-  size_t i = 0;
-  while (n - i >= 32) {
-    size_t v = (n - i) / 32;
-    if (v > FLUSH)
-      v = FLUSH;
-    __m256i an = zero;
-    for (; v > 0; v--, i += 32)
-      an = _mm256_sub_epi8(an, newlines256(_mm256_loadu_si256((const __m256i *)(s + i))));
-    sn = _mm256_add_epi64(sn, _mm256_sad_epu8(an, zero));
-  }
-  HsInt nls = (HsInt)sum256(sn);
-  if (i < n) {
-    __m256i x = _mm256_loadu_si256((const __m256i *)(s + n - 32));
-    nls += popcount_avx2(bits256(newlines256(x)) >> (32 - (n - i)));
-  }
-  return nls;
-}
-
-AVX2 static inline uint32_t newline_mask256(bytes p)
-{
-  return bits256(newlines256(_mm256_loadu_si256((const __m256i *)p)));
-}
-
-AVX2 static HsInt find_newline_avx2(bytes s, size_t i, size_t n)
-{
-  if (n < 32)
-    return find_newline_sse2(s, i, n);
-  for (; n - i >= 32; i += 32) {
-    uint32_t m = newline_mask256(s + i);
-    if (m)
-      return (HsInt)(i + __builtin_ctz(m));
-  }
-  if (i < n) {
-    uint32_t m = newline_mask256(s + n - 32) >> (32 - (n - i));
-    if (m)
-      return (HsInt)(i + __builtin_ctz(m));
-  }
-  return (HsInt)n;
-}
-
-AVX2 static HsInt find_newline_back_avx2(bytes s, size_t i)
-{
-  if (i < 32)
-    return find_newline_back_sse2(s, i);
-  for (; i >= 32; i -= 32) {
-    uint32_t m = newline_mask256(s + i - 32);
-    if (m)
-      return (HsInt)(i - 32 + 31 - __builtin_clz(m));
-  }
-  if (i > 0) {
-    uint32_t m = newline_mask256(s) & ((1u << i) - 1);
-    if (m)
-      return (HsInt)(31 - __builtin_clz(m));
-  }
-  return -1;
-}
-
-AVX2 static HsInt nth_newline_avx2(bytes s, size_t i, size_t n, HsInt k)
-{
-  if (n < 32)
-    return nth_newline_sse2(s, i, n, k);
-  for (; n - i >= 32; i += 32) {
-    uint32_t m = newline_mask256(s + i);
-    HsInt c = popcount_avx2(m);
-    if (c >= k)
-      return (HsInt)(i + nth_bit(m, k) + 1);
-    k -= c;
-  }
-  if (i < n) {
-    uint32_t m = newline_mask256(s + n - 32) >> (32 - (n - i));
-    if (popcount_avx2(m) >= k)
-      return (HsInt)(i + nth_bit(m, k) + 1);
-  }
-  return (HsInt)n;
-}
-
-AVX2 static HsInt scan_units_avx2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
-{
-  if (to < 32)
-    return scan_units_sse2(s, i, to, k, u, wide);
-  for (; to - i >= 32; i += 32) {
-    __m256i x = _mm256_loadu_si256((const __m256i *)(s + i));
-    uint32_t conts = bits256(conts256(x)), fours = bits256(fours256(x));
-    HsInt c = units_avx2(0xFFFFFFFFu, conts, fours, wide);
-    if (u + c > k)
-      return (HsInt)(i + units_stop_avx2(0xFFFFFFFFu, conts, fours, k, u, wide));
-    u += c;
-  }
-  if (i < to) {
-    __m256i x = _mm256_loadu_si256((const __m256i *)(s + to - 32));
-    uint32_t conts = bits256(conts256(x)), fours = bits256(fours256(x));
-    uint32_t lanes = ~((1u << (32 - (to - i))) - 1);
-    if (u + units_avx2(lanes, conts, fours, wide) > k)
-      return (HsInt)(to - 32 + units_stop_avx2(lanes, conts, fours, k, u, wide));
-  }
-  return (HsInt)to;
-}
+#define LEVEL avx2
+#define LOWER sse2
+#define ATTR AVX2
+#define W 32
+#define V __m256i
+#define MM(op) _mm256_##op
+#define LOAD(p) _mm256_loadu_si256((const __m256i *)(p))
+#define ZERO _mm256_setzero_si256()
+#define SUM(v) sum256(v)
+#include "scan.c"
 
 #endif /* NR_X86 */
 
@@ -626,3 +298,227 @@ HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, 
     return from < to ? from : to;
   DISPATCH(level, scan_units, s, (size_t)from, (size_t)to, k, 0, (int)wide)
 }
+
+#else
+/* ------------------------------------------------------------------------
+ * One level of SIMD: the scans over vectors of W bytes. The file includes
+ * itself here once per level, having said what a vector is:
+ *
+ *   LEVEL     the suffix of the functions of this level
+ *   LOWER     that of the level taking whatever is shorter than a vector
+ *   ATTR      the attributes of a function of this level
+ *   W         the bytes in a vector, V its type, MM(op) its intrinsics
+ *   LOAD(p)   the vector at p, unaligned; ZERO, the one of zeros
+ *   SUM(v)    the sum of the 64-bit lanes of a vector
+ *
+ * and popcount_LEVEL, the bits set in a word.
+ */
+
+#define FN(name) NR_CAT(name##_, LEVEL)
+#define LO(name) NR_CAT(name##_, LOWER)
+/* Every lane of a vector, as movemask bits. */
+#define ALL ((uint32_t)(((uint64_t)1 << W) - 1))
+
+/* Continuation bytes 0x80 .. 0xBF are exactly the signed bytes below -64;
+ * leaders of 4-byte sequences are the bytes whose unsigned maximum with 0xF0
+ * is themselves. */
+ATTR static inline V FN(is_cont)(V x)
+{
+  return MM(cmpgt_epi8)(MM(set1_epi8)((char)0xC0), x);
+}
+
+ATTR static inline V FN(is_four)(V x)
+{
+  return MM(cmpeq_epi8)(MM(max_epu8)(x, MM(set1_epi8)((char)0xF0)), x);
+}
+
+ATTR static inline V FN(is_newline)(V x)
+{
+  return MM(cmpeq_epi8)(x, MM(set1_epi8)('\n'));
+}
+
+ATTR static inline uint32_t FN(bits)(V m)
+{
+  return (uint32_t)MM(movemask_epi8)(m);
+}
+
+ATTR static inline uint32_t FN(newline_mask)(bytes p)
+{
+  return FN(bits)(FN(is_newline)(LOAD(p)));
+}
+
+/* The counts of a metrics scan in the last t lanes of a vector. */
+ATTR static inline HsWord64 FN(pack_tail)(uint32_t conts, uint32_t fours, uint32_t nls, size_t t)
+{
+  int shift = W - (int)t;
+  return PACK(FN(popcount)(conts >> shift), FN(popcount)(fours >> shift), FN(popcount)(nls >> shift));
+}
+
+/* Units in the lanes set in `lanes`, out of the continuation and 4-byte
+ * leader bits of a vector. */
+ATTR static inline HsInt FN(units)(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)
+{
+  return (HsInt)FN(popcount)(lanes & ~conts) + (wide ? (HsInt)FN(popcount)(lanes & fours) : 0);
+}
+
+/* The lane of the first code point that does not fit into k units, with
+ * u <= k of them counted already, in a vector whose `lanes` hold more than
+ * the rest. Read off the bits: where every unit is a code point it is the
+ * leader after those that fit. */
+ATTR static inline uint32_t FN(units_stop)(uint32_t lanes, uint32_t conts, uint32_t fours, HsInt k, HsInt u,
+                                           int wide)
+{
+  uint32_t leaders = lanes & ~conts;
+  if (!wide || (fours & lanes) == 0)
+    return nth_bit(leaders, k - u + 1);
+  for (;;) {
+    uint32_t lane = (uint32_t)__builtin_ctz(leaders);
+    HsInt w = (fours >> lane) & 1 ? 2 : 1;
+    if (u + w > k)
+      return lane;
+    u += w;
+    leaders &= leaders - 1;
+  }
+}
+
+ATTR static HsWord64 FN(metrics)(bytes s, size_t n)
+{
+  if (n < W)
+    return LO(metrics)(s, n);
+  const V zero = ZERO;
+  V sum = zero; /* packed as by PACK, in each 64-bit lane */
+  size_t i = 0;
+  while (n - i >= W) {
+    size_t v = (n - i) / W;
+    if (v > FLUSH)
+      v = FLUSH;
+    V ac = zero, af = zero, an = zero;
+    for (; v > 0; v--, i += W) {
+      V x = LOAD(s + i);
+      ac = MM(sub_epi8)(ac, FN(is_cont)(x));
+      af = MM(sub_epi8)(af, FN(is_four)(x));
+      an = MM(sub_epi8)(an, FN(is_newline)(x));
+    }
+    sum = MM(add_epi64)(sum, MM(sad_epu8)(ac, zero));
+    sum = MM(add_epi64)(sum, MM(slli_epi64)(MM(sad_epu8)(af, zero), 21));
+    sum = MM(add_epi64)(sum, MM(slli_epi64)(MM(sad_epu8)(an, zero), 42));
+  }
+  HsWord64 packed = SUM(sum);
+  if (i < n) {
+    V x = LOAD(s + n - W);
+    packed += FN(pack_tail)(FN(bits)(FN(is_cont)(x)), FN(bits)(FN(is_four)(x)), FN(bits)(FN(is_newline)(x)), n - i);
+  }
+  return packed;
+}
+
+ATTR static HsInt FN(newlines)(bytes s, size_t n)
+{
+  if (n < W)
+    return LO(newlines)(s, n);
+  const V zero = ZERO;
+  V sn = zero;
+  size_t i = 0;
+  while (n - i >= W) {
+    size_t v = (n - i) / W;
+    if (v > FLUSH)
+      v = FLUSH;
+    V an = zero;
+    for (; v > 0; v--, i += W)
+      an = MM(sub_epi8)(an, FN(is_newline)(LOAD(s + i)));
+    sn = MM(add_epi64)(sn, MM(sad_epu8)(an, zero));
+  }
+  HsInt nls = (HsInt)SUM(sn);
+  if (i < n)
+    nls += FN(popcount)(FN(newline_mask)(s + n - W) >> (W - (n - i)));
+  return nls;
+}
+
+ATTR static HsInt FN(find_newline)(bytes s, size_t i, size_t n)
+{
+  if (n < W)
+    return LO(find_newline)(s, i, n);
+  for (; n - i >= W; i += W) {
+    uint32_t m = FN(newline_mask)(s + i);
+    if (m)
+      return (HsInt)(i + __builtin_ctz(m));
+  }
+  if (i < n) {
+    uint32_t m = FN(newline_mask)(s + n - W) >> (W - (n - i));
+    if (m)
+      return (HsInt)(i + __builtin_ctz(m));
+  }
+  return (HsInt)n;
+}
+
+ATTR static HsInt FN(find_newline_back)(bytes s, size_t i)
+{
+  if (i < W)
+    return LO(find_newline_back)(s, i);
+  for (; i >= W; i -= W) {
+    uint32_t m = FN(newline_mask)(s + i - W);
+    if (m)
+      return (HsInt)(i - W + 31 - __builtin_clz(m));
+  }
+  if (i > 0) {
+    uint32_t m = FN(newline_mask)(s) & ((1u << i) - 1);
+    if (m)
+      return (HsInt)(31 - __builtin_clz(m));
+  }
+  return -1;
+}
+
+ATTR static HsInt FN(nth_newline)(bytes s, size_t i, size_t n, HsInt k)
+{
+  if (n < W)
+    return LO(nth_newline)(s, i, n, k);
+  for (; n - i >= W; i += W) {
+    uint32_t m = FN(newline_mask)(s + i);
+    HsInt c = FN(popcount)(m);
+    if (c >= k)
+      return (HsInt)(i + nth_bit(m, k) + 1);
+    k -= c;
+  }
+  if (i < n) {
+    uint32_t m = FN(newline_mask)(s + n - W) >> (W - (n - i));
+    if (FN(popcount)(m) >= k)
+      return (HsInt)(i + nth_bit(m, k) + 1);
+  }
+  return (HsInt)n;
+}
+
+ATTR static HsInt FN(scan_units)(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
+{
+  if (to < W)
+    return LO(scan_units)(s, i, to, k, u, wide);
+  for (; to - i >= W; i += W) {
+    V x = LOAD(s + i);
+    uint32_t conts = FN(bits)(FN(is_cont)(x)), fours = FN(bits)(FN(is_four)(x));
+    HsInt c = FN(units)(ALL, conts, fours, wide);
+    if (u + c > k)
+      return (HsInt)(i + FN(units_stop)(ALL, conts, fours, k, u, wide));
+    u += c;
+  }
+  if (i < to) {
+    V x = LOAD(s + to - W);
+    uint32_t conts = FN(bits)(FN(is_cont)(x)), fours = FN(bits)(FN(is_four)(x));
+    uint32_t lanes = ALL & ~((1u << (W - (to - i))) - 1);
+    if (u + FN(units)(lanes, conts, fours, wide) > k)
+      return (HsInt)(to - W + FN(units_stop)(lanes, conts, fours, k, u, wide));
+  }
+  return (HsInt)to;
+}
+
+#undef FN
+#undef LO
+#undef ALL
+#undef LEVEL
+#undef LOWER
+#undef ATTR
+#undef W
+#undef V
+#undef MM
+#undef LOAD
+#undef ZERO
+#undef SUM
+
+#endif /* LEVEL */
