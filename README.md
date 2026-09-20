@@ -205,18 +205,8 @@ scans and omit the C code.
 
 ### Benchmarks
 
-Selected results from the checked-in run on about 4 MB of generated source
-text (100,000 lines), using GHC 9.14.1:
-
-| Workload | Time |
-| --- | ---: |
-| 10,000 random inserts, after 10,000 prior inserts | 4.0 ms |
-| 10,000 edits at UTF-16 positions | 5.8 ms |
-| 10,000 line lookups, after 10,000 prior inserts | 1.5 ms |
-| Typing: 100 bursts of 100 characters | 0.4 ms |
-| Typing with a line read after every character | 2.6 ms |
-| Constructing a rope with `fromText` | 0.71 ms |
-| Converting an edited rope with `toText` | 0.21 ms |
+The chart below shows results on about 4 MB of generated source text
+(100,000 lines), using GHC 9.14.1.
 
 The fresh rope retains about 4.55 MB for 4.03 MB of text, and about 4.60 MB after
 10,000 random inserts. Retaining earlier versions for undo uses additional
@@ -231,6 +221,8 @@ and comparisons with text-rope, yi-rope, and core-text. The
 [raw results](bench/results.csv) and [benchmark source](bench/Main.hs) provide
 the workload details. Results depend on hardware, compiler, and document shape;
 fresh and edited ropes can have different costs.
+
+![Benchmark timings, allocation, and live heap for nano-rope, text-rope, yi-rope, and core-text](bench/results.svg)
 
 ### Language-server workloads
 
