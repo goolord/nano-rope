@@ -1,11 +1,11 @@
 /*
- * Scanning the chunks of a rope with SIMD instructions.
+ * UTF-8 chunk scans with portable C, SSE2, and AVX2 implementations.
  *
- * Every function here reads bytes of UTF-8 (or any bytes, for the counts) and
- * nothing else: no allocation, no state but the choice of instruction set.
- * They are called from Data.Text.NanoRope.Internal through unsafe foreign
- * calls, which hand over the payload of an unpinned byte array directly.
- * Slices shorter than 32 bytes are left to the Haskell, 8 bytes at a time.
+ * Scans read bytes without allocating or modifying the input. Unit scans
+ * assume valid UTF-8; byte-counting scans also accept partial sequences.
+ * Data.Text.NanoRope.Internal passes unpinned array payloads through unsafe
+ * foreign calls. The default build handles slices shorter than 32 bytes in
+ * Haskell; the small-chunk test build also sends those slices here.
  *
  * Three levels, all computing exactly the same results:
  *
@@ -13,15 +13,13 @@
  *   1  SSE2, 16 bytes at a time (every x86-64 has it);
  *   2  AVX2, 32 bytes at a time, if the CPU and the OS support it.
  *
- * Every exported function takes the level to run at, no higher than
- * nano_rope_simd_level(): the Haskell asks for that once, and the test suite
- * holds every level to the same results.
+ * Each exported scan takes a level no higher than nano_rope_simd_level().
+ * Haskell caches this choice; tests compare all supported levels.
  *
- * A vector loop leaves a tail shorter than a vector. As long as the whole
- * range is at least a vector long, the tail is read as the last vector of
- * the range, overlapping bytes already seen, which are masked off. Nothing is
- * ever read outside the range asked about, except before it for the
- * functions that are handed the size of the whole array.
+ * Short tails use an overlapping vector load with already-counted lanes
+ * masked out. Loads stay within the supplied buffer bounds. Scans given a
+ * whole-array bound may load bytes before the requested start, but exclude
+ * them from the result.
  */
 
 #ifndef LEVEL
@@ -42,14 +40,13 @@
 
 typedef const uint8_t *bytes;
 
-/* The three counts of a metrics scan in one word, 21 bits each. The caller
- * never asks about 2^21 bytes or more at once. */
+/* Pack three counts into 21 bits each. Requires an input shorter than
+ * 2^21 bytes; Haskell handles larger slices separately. */
 #define PACK(conts, fours, nls) \
   ((HsWord64)(conts) | (HsWord64)(fours) << 21 | (HsWord64)(nls) << 42)
 
 /* ------------------------------------------------------------------------
- * Level 0: portable C. They also handle what is shorter than a vector, and
- * scan_units_c finishes off the vector a unit count falls in.
+ * Level 0: portable C, also used for inputs shorter than a vector.
  */
 
 static HsWord64 metrics_c(bytes s, size_t n)
@@ -88,7 +85,7 @@ static HsInt find_newline_back_c(bytes s, size_t i)
   return -1;
 }
 
-/* Just after the k-th '\n' (k >= 1) from i on, or n. */
+/* Offset after the k-th '\n' at or after i (k >= 1), or n. */
 static HsInt nth_newline_c(bytes s, size_t i, size_t n, HsInt k)
 {
   for (; i < n; i++)
@@ -97,9 +94,10 @@ static HsInt nth_newline_c(bytes s, size_t i, size_t n, HsInt k)
   return (HsInt)n;
 }
 
-/* From the code point boundary i, the offset in front of the first code
- * point that does not fit into k units, with u units counted already, or
- * `to`. A unit is a code point, or a UTF-16 code unit if wide. */
+/* Return the offset of the first code point that would exceed k units, or `to`.
+ * Start at i with u units already counted. Continuation bytes are skipped,
+ * so scans may resume inside a sequence. `wide` selects UTF-16 units
+ * rather than code points. */
 static HsInt scan_units_c(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
 {
   for (; i < to; i++) {
@@ -116,13 +114,11 @@ static HsInt scan_units_c(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wi
 
 #if NR_X86
 
-/* A byte counter goes up by one per vector, so it has to be emptied into
- * the wide sums at least every 255 vectors. */
+/* Flush byte counters to wider sums every 255 vectors to avoid overflow. */
 #define FLUSH 255
 
-/* Bits set, without the POPCNT instruction, which not every x86-64 has.
- * Spelled out: left to __builtin_popcount this is a call into the runtime of
- * the compiler, one more symbol for a linker to go looking for. */
+/* Count set bits without POPCNT or compiler-runtime calls, so the baseline
+ * scan works on x86-64 CPUs without POPCNT and with GHC's runtime linker. */
 static inline uint32_t popcount_sse2(uint32_t m)
 {
   m = m - ((m >> 1) & 0x55555555u);
@@ -138,7 +134,7 @@ AVX2 static inline uint32_t popcount_avx2(uint32_t m)
   return (uint32_t)__builtin_popcount(m);
 }
 
-/* Position of the k-th (1-based) set bit, for k <= popcount m. */
+/* Position of the k-th set bit; requires 1 <= k <= popcount(m). */
 static inline uint32_t nth_bit(uint32_t m, HsInt k)
 {
   while (--k > 0)
@@ -150,9 +146,8 @@ static inline uint32_t nth_bit(uint32_t m, HsInt k)
 #define NR_CAT(a, b) NR_CAT_(a, b)
 
 /* ------------------------------------------------------------------------
- * Level 1: SSE2, and level 2: AVX2, the same twice as wide. Both are the
- * second half of this file, which includes itself once for each; whatever is
- * shorter than a vector goes a level down.
+ * Instantiate the shared vector scans twice: SSE2 with 16-byte vectors,
+ * then AVX2 with 32-byte vectors. Short inputs fall back to the lower level.
  */
 
 static inline HsWord64 sum128(__m128i v)
@@ -191,17 +186,13 @@ AVX2 static inline HsWord64 sum256(__m256i v)
 #endif /* NR_X86 */
 
 /* ------------------------------------------------------------------------
- * The exported functions, one per scan, at a given level no higher than
- * nano_rope_simd_level(): Haskell asks for that once and passes it along.
+ * Exported scans. Callers must provide valid bounds and a supported level.
  */
 
 #if NR_X86
-/* Does the CPU have AVX2, and does the OS save the registers it needs?
- *
- * Asked of the CPU itself. __builtin_cpu_supports("avx2") says the same, but
- * reads what __cpu_indicator_init of the compiler's runtime leaves behind,
- * and that is a symbol the linker of GHCi does not resolve on Windows: there
- * went Template Haskell in everything that depends on this package. */
+/* Check CPU and OS support for AVX2 directly. Compiler feature-detection
+ * builtins depend on runtime symbols that GHCi's Windows linker cannot
+ * resolve, including when loading code for Template Haskell. */
 static int has_avx2(void)
 {
   unsigned int a, b, c, d;
@@ -277,10 +268,9 @@ HsInt nano_rope_nth_newline(HsInt level, bytes s, HsInt n, HsInt k)
   DISPATCH(level, nth_newline, s, 0, (size_t)n, k)
 }
 
-/* A line of s[0 .. n): the offset just after the k-th '\n', or 0 for k <= 0,
- * and that of the first '\n' at or after it, or n. The former in the low 32
- * bits, the latter in the high ones. Whoever wants a line wants both, and
- * here they are one call. */
+/* Find a line start and its terminator in one foreign call. Pack the offset
+ * after the k-th '\n' (zero for k <= 0) into the low 32 bits, and the next
+ * '\n' offset into the high 32 bits. Missing endpoints use n. */
 HsWord64 nano_rope_line_span(HsInt level, bytes s, HsInt n, HsInt k)
 {
   HsInt from = k <= 0 ? 0 : nano_rope_nth_newline(level, s, n, k);
@@ -288,12 +278,12 @@ HsWord64 nano_rope_line_span(HsInt level, bytes s, HsInt n, HsInt k)
   return (HsWord64)from | (HsWord64)lf << 32;
 }
 
-/* Walking over the code points of s[from .. to) from the boundary `from`,
- * the offset in front of the first one that does not fit into k units, or
- * `to`. Units are code points, or UTF-16 code units if wide. */
+/* Return the end of the longest prefix of s[from .. to) fitting in k units.
+ * Both endpoints must be code point boundaries in valid UTF-8. `wide`
+ * selects UTF-16 units rather than code points. */
 HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, HsInt wide)
 {
-  /* Nothing fits into no units, and the vector loops count on k >= 0. */
+  /* Handle empty prefixes before entering loops that require k >= 0. */
   if (k <= 0)
     return from < to ? from : to;
   DISPATCH(level, scan_units, s, (size_t)from, (size_t)to, k, 0, (int)wide)
@@ -301,17 +291,16 @@ HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, 
 
 #else
 /* ------------------------------------------------------------------------
- * One level of SIMD: the scans over vectors of W bytes. The file includes
- * itself here once per level, having said what a vector is:
+ * Shared scans over W-byte vectors. Each self-include supplies:
  *
  *   LEVEL     the suffix of the functions of this level
- *   LOWER     that of the level taking whatever is shorter than a vector
+ *   LOWER     the fallback implementation for shorter inputs
  *   ATTR      the attributes of a function of this level
  *   W         the bytes in a vector, V its type, MM(op) its intrinsics
  *   LOAD(p)   the vector at p, unaligned; ZERO, the one of zeros
  *   SUM(v)    the sum of the 64-bit lanes of a vector
  *
- * and popcount_LEVEL, the bits set in a word.
+ * plus popcount_LEVEL, the matching population-count function.
  */
 
 #define FN(name) NR_CAT(name##_, LEVEL)
@@ -319,9 +308,8 @@ HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, 
 /* Every lane of a vector, as movemask bits. */
 #define ALL ((uint32_t)(((uint64_t)1 << W) - 1))
 
-/* Continuation bytes 0x80 .. 0xBF are exactly the signed bytes below -64;
- * leaders of 4-byte sequences are the bytes whose unsigned maximum with 0xF0
- * is themselves. */
+/* Continuation bytes 0x80 .. 0xBF are signed bytes below -64.
+ * In valid UTF-8, 4-byte sequence leaders are unsigned bytes >= 0xF0. */
 ATTR static inline V FN(is_cont)(V x)
 {
   return MM(cmpgt_epi8)(MM(set1_epi8)((char)0xC0), x);
@@ -354,17 +342,15 @@ ATTR static inline HsWord64 FN(pack_tail)(uint32_t conts, uint32_t fours, uint32
   return PACK(FN(popcount)(conts >> shift), FN(popcount)(fours >> shift), FN(popcount)(nls >> shift));
 }
 
-/* Units in the lanes set in `lanes`, out of the continuation and 4-byte
- * leader bits of a vector. */
+/* Count units in selected lanes using continuation and 4-byte leader masks. */
 ATTR static inline HsInt FN(units)(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)
 {
   return (HsInt)FN(popcount)(lanes & ~conts) + (wide ? (HsInt)FN(popcount)(lanes & fours) : 0);
 }
 
-/* The lane of the first code point that does not fit into k units, with
- * u <= k of them counted already, in a vector whose `lanes` hold more than
- * the rest. Read off the bits: where every unit is a code point it is the
- * leader after those that fit. */
+/* Find the first code point lane that would exceed k units. Requires u <= k
+ * units already counted and more than k - u units in the selected lanes.
+ * When each code point counts once, select the next leader bit directly. */
 ATTR static inline uint32_t FN(units_stop)(uint32_t lanes, uint32_t conts, uint32_t fours, HsInt k, HsInt u,
                                            int wide)
 {

@@ -1,219 +1,273 @@
 # nano-rope
 
-A persistent text rope for editors, language servers and parsers.
+A persistent UTF-8 text rope for Haskell, built for editors, language servers,
+and parsers. Edit a document, look up a line, or convert between byte and UTF-16
+offsets without scanning the whole text.
+
+- **One rope, four units.** Index by bytes, Unicode code points, UTF-16 code
+  units, or lines, with logarithmic-time lookups and conversions.
+- **Small edits, small copies.** A B-tree of chunks up to 512 bytes shares
+  unchanged text between versions. Keep old ropes for undo or snapshots.
+- **Efficient typing.** Consecutive insertions can share a buffer of up to
+  128 bytes, reducing tree updates during a run of keystrokes.
+- **Predictable chunk sizes.** Chunks are split by size, so even a document
+  with one long line has a balanced tree.
+- **Chunk-based reads and output.** Read chunks without copying their text,
+  or stream UTF-8 to a handle without flattening the document.
+- **Custom summaries.** Cache a monoidal measure at each node and search by it.
+
+## Quick start
+
+Requires GHC 9.4 or later. Add `nano-rope` and `text` to your Cabal
+`build-depends`. Import the API qualified and enable `OverloadedStrings`
+for text literals:
 
 ```haskell
+{-# LANGUAGE OverloadedStrings #-}
+
 import Data.Text.NanoRope (Rope, Unit (..), Position (..))
 import qualified Data.Text.NanoRope as Rope
 
-rope :: Rope
-rope = Rope.fromText "let x = \"😀\"\nlet y = x\n"
+document :: Rope
+document = Rope.fromText "let x = \"😀\"\nlet y = x\n"
 
-Rope.length Utf16 rope                            -- 23
-Rope.insert Chars 4 "xs@" rope
-Rope.replace Lines 1 2 "let z = x\n" rope
-Rope.splitAtPosition Utf16 (Position 1 4) rope    -- an LSP position
-Rope.offsetToPosition Bytes Utf16 17 rope         -- Position 1 2
-Rope.getLine 1 rope                               -- "let y = x"
+edited :: Rope
+edited = Rope.replace Lines 1 2 "let z = x\n" document
 ```
 
-* Bytes, code points, UTF-16 code units and lines are tracked at every node,
-  so you can index by any of them and convert between them in `O(log n)`.
-* Measuring chunks and searching them for line feeds, code points or UTF-16
-  offsets is done with SIMD (SSE2, or AVX2 where the CPU has it) through a
-  little C. Build with `-f -simd` for pure Haskell.
-* A B-tree of flat UTF-8 chunks (up to 512 bytes, up to 16 children per node).
-  Chunks are split by size, not by line, so one huge line is fine.
-* An edit copies one chunk and the path to it. Consecutive keystrokes are
-  buffered (up to 128 bytes) and flushed into the tree when you next read.
-* Cache your own monoid at every node and search by it.
-* Persistent: old versions stay valid and share structure, so undo is just a
-  list of ropes. Strict, apart from the keystroke buffer.
-
-## Units
+In GHCi:
 
 ```haskell
-data Unit = Bytes | Chars | Utf16 | Lines
+> Rope.length Utf16 document
+23
+> Rope.getLine 1 edited
+"let z = x"
+> Rope.offsetToPosition Bytes Utf16 17 document
+Position {posLine = 1, posColumn = 2}
 ```
 
-Anything that takes an offset takes a `Unit`. `Bytes` is what tree-sitter,
-PCRE and FFI want; `Utf16` is LSP's default. If the client negotiates a
-`positionEncoding`, `"utf-8"` is `Bytes` and `"utf-32"` is `Chars`. Offsets are
-clamped to the rope and rounded down to a code point.
+`document` is still valid after the edit. Both versions share the unchanged
+parts of the tree.
+
+## Offsets, ranges, and positions
+
+Every offset has an explicit unit:
+
+| Unit | Meaning |
+| --- | --- |
+| `Bytes` | UTF-8 bytes |
+| `Chars` | Unicode code points, not grapheme clusters or display columns |
+| `Utf16` | UTF-16 code units |
+| `Lines` | Zero-based line starts; `length Lines` counts `\n` characters |
+
+Offsets are zero-based and clamped to the document. An offset inside a UTF-8
+sequence or UTF-16 surrogate pair rounds down to the start of that code point.
+Ranges are half-open: `slice u i j` includes `i` and excludes `j`. Both endpoints
+refer to the original rope. If `j <= i`, a slice is empty, a deletion does
+nothing, and a replacement inserts at `i`.
 
 ```haskell
-Rope.splitAt Bytes 120 rope
-Rope.take    Lines 10  rope
-Rope.slice   Utf16 5 9 rope
-Rope.convert Bytes Utf16 120 rope
+firstLine = Rope.take Lines 1 document
+name      = Rope.sliceText Chars 4 5 document  -- "x"
+byte      = Rope.convert Utf16 Bytes 11 document  -- 13
 ```
 
-`metricsAt` gives you a location in every unit at once, e.g. to turn an LSP
-position into what tree-sitter needs:
+`Position` holds a zero-based line and column. The column's unit is supplied
+separately. UTF-16 is the default position encoding in LSP; for negotiated
+encodings, use `Bytes` for `"utf-8"` and `Chars` for `"utf-32"`.
+
+Columns beyond a line's content clamp to before its `\n` or `\r\n`. Lines
+beyond the document clamp to its end; negative lines and columns clamp to zero.
+Only `\n` starts a new line. A lone `\r` is ordinary content.
+
+To get several coordinates for one location, reuse its prefix metrics:
 
 ```haskell
-let m      = Rope.metricsAtPosition Utf16 lspPosition rope
-    byte   = bytes m
-    row    = newlines m
-    column = posColumn (Rope.metricsToPosition Bytes m rope)
+location   = Rope.metricsAtPosition Utf16 (Position 1 4) document
+byteOffset = Rope.bytes location
+row        = Rope.newlines location
+byteColumn = posColumn (Rope.metricsToPosition Bytes location document)
 ```
 
-A column past the end of a line clamps to before its `\n` or `\r\n`, as LSP
-expects. `Rope.chunkAt Bytes i rope` is a zero-copy view of the text at an
-offset, for parsers that read through a callback.
+The metrics contain all four absolute offsets. Computing a column also looks
+up the start of the line.
 
-`metricsAtLineAndPosition` also tells where the line starts, out of the same
-descent. The difference of the two is the column in every unit, so this is
-how a server turns a client's UTF-16 column into the code points GHC counts,
-and notices a column that does not exist:
+If you need columns in several units, `metricsAtLineAndPosition` retrieves
+the line start and position together:
 
 ```haskell
-let (line, at) = Rope.metricsAtLineAndPosition Utf16 lspPosition rope
-    reached    = utf16Units at - utf16Units line   -- short of the column: it was clamped,
-                                                   -- or fell inside a surrogate pair
-    column     = chars at - chars line             -- the same column in code points
+(lineStart, at) = Rope.metricsAtLineAndPosition Utf16 (Position 1 4) document
+reachedColumn  = Rope.utf16Units at - Rope.utf16Units lineStart  -- 4
+codePointColumn = Rope.chars at - Rope.chars lineStart          -- 4
 ```
 
-## Getting the text out
+Compare the reached column with the requested one to detect clamping or
+rounding inside a code point.
+
+`getLine` strips the line terminator and returns empty text for an invalid
+index. `lineCount` includes the final, possibly empty line, so an empty rope
+has one line. `lines` returns `[]` for an empty rope and omits the empty line
+after a trailing `\n`.
+
+## Reading and writing
+
+Choose the form your consumer needs:
+
+- `chunkAt Bytes offset` returns the rest of the chunk at an offset as a
+  zero-copy `Text` view. This is useful for parser read callbacks.
+- `foldlChunks'` walks chunks with a strict accumulator, without building an
+  intermediate list. `foldrChunks` provides a lazy right fold.
+- `toChunks` and `toLazyText` share chunk buffers without copying text.
+- `toText` creates one contiguous `Text`, copying the document unless it
+  already fits in a single chunk.
+- `hPutUtf8` and `writeFileUtf8` stream chunks through a 32 KiB buffer.
 
 ```haskell
-Rope.writeFileUtf8 path rope                       -- or hPutUtf8 to a handle
-Rope.foldlChunks' (\h chunk -> hash h chunk) h0 rope
-Rope.toText rope
+save :: FilePath -> Rope -> IO ()
+save = Rope.writeFileUtf8
 ```
 
-The chunks are UTF-8 already, so saving streams them through a 32 kB buffer:
-the 4 MB document of the benchmarks allocates 98 kB on its way to a file,
-and 8 MB by way of `toText`. It writes bytes, whatever the encoding and
-newline mode of the handle. `foldlChunks'` walks the chunks as zero-copy
-`Text`s and allocates nothing of its own (22 μs for that document, where
-the lazy list of `toChunks` takes 83 μs and a megabyte). `toText` is for
-when one `Text` is what you need: it costs a `memcpy` of the document.
+UTF-8 output preserves the rope's bytes, including line endings. It bypasses
+the handle's encoding and newline translation. Use text I/O with `toLazyText`
+when you want the handle's encoding instead.
 
 ## Custom measures
 
+`Data.Text.NanoRope.Measured` adds a type parameter for a cached summary. For
+example, count tabs and find the prefix before the third one:
+
 ```haskell
-import Data.Text.NanoRope.Measured (Rope, Measure (..))
+{-# LANGUAGE OverloadedStrings #-}
+
+import qualified Data.Text as T
+import Data.Text.NanoRope.Measured (Measure (..), Rope)
 import qualified Data.Text.NanoRope.Measured as Rope
 
-newtype Width = Width Int deriving (Eq, Ord, Show)
+newtype Tabs = Tabs Int deriving (Eq, Ord, Show)
 
-instance Semigroup Width where Width a <> Width b = Width (a + b)
-instance Monoid Width where mempty = Width 0
+instance Semigroup Tabs where
+  Tabs a <> Tabs b = Tabs (a + b)
 
-instance Measure Width where
-  measureChunk = Width . T.foldl' (\n c -> n + wcwidth c) 0
+instance Monoid Tabs where
+  mempty = Tabs 0
 
-Rope.measure rope :: Width                           -- O(1)
-fst (Rope.splitWhere (\_ w -> w > Width 80) rope)    -- O(log n): what fits in 80 columns
+instance Measure Tabs where
+  measureChunk = Tabs . T.count "\t"
+
+document :: Rope Tabs
+document = Rope.fromText "a\tb\tc\td"
+
+tabCount = Rope.measure document  -- Tabs 3
+beforeThirdTab = Rope.toText (fst (Rope.splitWhere (\_ n -> n >= Tabs 3) document))
+-- "a\tb\tc"
 ```
 
-The rope picks the chunk boundaries, so `measureChunk` has to be a monoid
-homomorphism. Tuples of measures are measures. `measured` and `unmeasured`
-convert to and from the plain rope without copying text.
+Chunk boundaries can change after an edit, so a measure must obey these laws:
 
-## Complexity
+```haskell
+measureChunk (a <> b) == measureChunk a <> measureChunk b
+measureChunk mempty   == mempty
+```
 
-| operation | cost |
+Search predicates must be monotone: once true for a prefix, they must stay true
+as it grows. Pairs and triples of measures are supported. The plain module's
+`measured` and `unmeasured` functions rebuild annotations while sharing the
+text buffers.
+
+## Performance
+
+For a document of `n` bytes and inserted or returned text of `k` bytes:
+
+| Operation | Cost |
 | --- | --- |
-| `length`, `metrics`, `measure`, `lineCount` | `O(1)` |
-| `splitAt`, `take`, `drop`, `slice`, `<>` | `O(log n)` |
-| `insert`, `delete`, `replace` | `O(log n + new text)` |
-| `insert` where the last one ended, `delete` of what was just typed | `O(1)` |
-| `metricsAt`, `convert`, positions, `splitWhere`, `chunkAt` | `O(log n)` |
-| `getLine`, `sliceText` | `O(log n + result)`, zero-copy within a chunk |
-| `fromText`, `toText` | `O(n)` |
-| `foldlChunks'`, `toChunks`, `toLazyText`, `hPutUtf8` | `O(n)`, zero-copy but for the write buffer |
+| `null`, `length`, `metrics`, `lineCount` | `O(1)` |
+| `measure` on a settled rope | `O(1)` |
+| `splitAt`, `take`, `drop`, `slice`, `append` | `O(log n)` |
+| `insert`, `replace` | `O(log n + k)` |
+| `delete` | `O(log n)` |
+| `metricsAt`, `convert`, position conversions, `splitWhere`, `chunkAt` | `O(log n)` |
+| `getLine`, `sliceText` | `O(log n + k)`; zero-copy within a chunk |
+| `fromText`, `toText`, `lines`, UTF-8 output | `O(n)` |
+| Chunk folds, `toChunks`, `toLazyText` | `O(n)` traversal, excluding consumer work |
 
-## Benchmarks
+These bounds assume constant-time combination of custom measures and linear-time
+chunk measurement. Searches also assume a constant-time predicate.
 
-10,000 operations on 4 MB of source code, GHC 9.14.1. Rows marked * run on a
-rope that has already had 10,000 random inserts.
+An insertion that continues the previous one in the same unit (`Bytes`, `Chars`,
+or `Utf16`) can be buffered while space remains. Updating this bounded buffer
+is `O(1)` in document size. Deleting a suffix of buffered `Chars` input can use
+the same fast path. Reading the tree, including `measure`, applies any pending
+insertion first; `length` and `metrics` include it without forcing that update.
 
-| workload | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
-| --- | ---: | ---: | ---: | ---: |
-| random inserts * | 4.0 ms | 22.1 ms | 99 ms | 140 ms |
-| edits at UTF-16 positions | 5.8 ms | 45.1 ms | — | — |
-| `getLine` * | 1.5 ms | 16.1 ms | 102 ms | — |
-| typing, 100 bursts of 100 | 0.4 ms | 3.0 ms | 59 ms | 1.7 s |
-| the same, reading the line after each key | 2.6 ms | 146 ms | 227 ms | — |
-| `splitAt`, both halves * | 6.9 ms | 21.8 ms | 89 ms | 54 ms |
-| `toText` (once) * | 0.21 ms | 0.49 ms | 2.3 ms | 4.0 ms |
-| `fromText` (once) | 0.71 ms | 2.0 ms | 4.0 ms | 10 ns |
-| `toText` (once), fresh rope | 0.20 ms | 52 ns | 1.2 ms | 93 ns |
+Chunk scans use SSE2 or AVX2 on supported x86-64 systems, with portable C
+elsewhere. Short scans use Haskell. Build with `-f -simd` to use only Haskell
+scans and omit the C code.
 
-yi-rope has no UTF-16, and core-text has neither UTF-16 nor lines.
+### Benchmarks
 
-nano-rope is far slower at loading and saving than core-text, and at saving
-a fresh rope than text-rope. A freshly loaded text-rope or core-text is one
-big chunk, and core-text is the `Text` it was loaded from, so they hand it
-back as it is. The cost comes later: their first reads and splits walk the
-whole text (10,000 `getLine`s on a fresh text-rope take 0.22 s), and core-text
-re-measures the chunk on every edit next to it, hence its 1.7 s of typing.
+Selected results from the checked-in run on about 4 MB of generated source
+text (100,000 lines), using GHC 9.14.1:
 
-### A language server
+| Workload | Time |
+| --- | ---: |
+| 10,000 random inserts, after 10,000 prior inserts | 4.0 ms |
+| 10,000 edits at UTF-16 positions | 5.8 ms |
+| 10,000 line lookups, after 10,000 prior inserts | 1.5 ms |
+| Typing: 100 bursts of 100 characters | 0.4 ms |
+| Typing with a line read after every character | 2.6 ms |
+| Constructing a rope with `fromText` | 0.71 ms |
+| Converting an edited rope with `toText` | 0.21 ms |
 
-What `lsp` and `haskell-language-server` do with the rope of an open
-document, call for call (`bench/Lsp.hs`): a module of 8,000 lines, 326 kB,
-nearly all of it ASCII as source code is. A position and the start of its
-line come out of one descent with `metricsAtLineAndPosition`; the last
-column is the same work asking for them one at a time.
+The fresh rope retains about 4.55 MB for 4.03 MB of text, and about 4.60 MB after
+10,000 random inserts. Retaining earlier versions for undo uses additional
+memory for the chunks and tree paths those versions still reference.
 
-| workload | one descent | two |
+nano-rope builds bounded chunks and their metrics up front. This gives fast
+lookups from the first edit, at the cost of copying most input text during
+construction. Converting back to a contiguous `Text` usually copies it again.
+
+The [full chart](bench/results.svg) includes timings, allocation, live heap,
+and comparisons with text-rope, yi-rope, and core-text. The
+[raw results](bench/results.csv) and [benchmark source](bench/Main.hs) provide
+the workload details. Results depend on hardware, compiler, and document shape;
+fresh and edited ropes can have different costs.
+
+### Language-server workloads
+
+[Language-server benchmarks](bench/Lsp.hs) model document changes, completion
+prefix reads, semantic tokens, and position conversions on an 8,000-line
+module (326 kB). They compare the combined `metricsAtLineAndPosition` lookup
+with separate line-start and position lookups within nano-rope.
+
+| Workload | Combined lookup | Separate lookups |
 | --- | ---: | ---: |
-| typing, 5,130 keystrokes at UTF-16 positions | 1.4 ms | 2.3 ms |
-| the same, reading the line under the cursor after each key | 1.7 ms | 2.9 ms |
-| a rename, 199 edits at once, and `toText` | 0.11 ms | 0.13 ms |
-| where 47,761 tokens start and end, and their text | 10.0 ms | 15.1 ms |
-| 11,941 positions from UTF-16 to code points and back | 2.2 ms | 3.3 ms |
-| three lines around each of those, as `Text` and as `lines` of a `slice` | 4.9 ms | |
+| Typing: 5,130 changes at UTF-16 positions | 1.4 ms | 2.3 ms |
+| Typing with a completion-prefix read after each change | 1.7 ms | 2.9 ms |
+| Rename: 199 edits followed by `toText` | 0.11 ms | 0.13 ms |
+| Locate and read 47,761 tokens | 10.0 ms | 15.1 ms |
+| Convert 11,941 positions to code points and back | 2.2 ms | 3.3 ms |
 
-### Memory
-
-The same runs, by what they allocate, and the heap that stays live holding the
-4.03 MB document once the `Text` it came from is dropped.
-
-| | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
-| --- | ---: | ---: | ---: | ---: |
-| allocated by random inserts * | 12.6 MB | 87.3 MB | 336 MB | 304 MB |
-| allocated by edits at UTF-16 positions | 12.9 MB | 148 MB | — | — |
-| allocated by `getLine` * | 0.37 MB | 78.9 MB | 260 MB | — |
-| allocated by `splitAt`, both halves * | 26.6 MB | 107 MB | 185 MB | 160 MB |
-| allocated by `fromText` (once) | 4.55 MB | 11.7 MB | 2.71 MB | 55 B |
-| live heap, fresh rope | 4.55 MB | 5.08 MB | 4.56 MB | 4.03 MB |
-| live heap after 10,000 random inserts | 4.60 MB | 11.6 MB | 7.90 MB | 5.02 MB |
-
-An edit allocates the new chunk, a node and an array of pointers for each level
-of the tree, and nothing else: about 1.3 kB per insert here. That is also what
-an old version keeps alive, so it is the price of a step of undo. Looking
-something up allocates nothing but the answer, and `fromText` allocates the
-rope it builds and no garbage.
-
-A fresh core-text is smaller because it is the `Text` it was loaded from, and
-yi-rope allocates less to load than the text is long, so it does not copy all
-of it either. nano-rope copies the text into chunks of its own. Of the 0.52
-MB nano-rope adds to the text, each of the 7,900 chunks accounts for some 66
-bytes: the array's header, a leaf of four words (its metrics share one of
-them) and its share of the inner nodes.
-
-![Time, allocation and live heap of nano-rope, text-rope, yi-rope and core-text](bench/results.svg)
-
-The chart has everything, including allocation and memory use. To regenerate
-it:
-
-```
-cabal bench -f compare-text-rope -f compare-yi-rope -f compare-core-text \
-  --benchmark-options="--chart bench/results.svg"
-```
-
-The numbers are saved next to it in `bench/results.csv`; add `--redraw` to
-redraw from those without re-running.
+Reading three-line ranges around those positions takes 4.9 ms, using both
+`sliceText` and `lines` of a `slice`. All results are in the same CSV.
 
 ## Development
 
-```
-cabal test     # properties against a Text model and the instance laws,
-               # also with 16-byte chunks
-cabal test -f -simd   # the same without the C
+```sh
+cabal test
+cabal test -f -simd
+cabal haddock
 cabal bench
 ```
+
+The tests compare operations with a `Text` model, check tree invariants and
+instance laws, and exercise each available scan implementation. They run with
+both normal chunks and 16-byte chunks to exercise deeper trees on small inputs.
+
+To regenerate the comparison chart and its CSV:
+
+```sh
+cabal bench -f compare-text-rope -f compare-yi-rope -f compare-core-text --benchmark-options="--chart bench/results.svg"
+```
+
+Add `--redraw` inside `--benchmark-options` to reuse the CSV timings and
+allocation results. Live-heap measurements are collected again.

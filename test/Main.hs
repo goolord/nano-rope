@@ -1,14 +1,11 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Properties of the rope against a model of plain 'Text' with naive,
--- obviously correct implementations of every unit. After every operation the
--- structural invariants of the tree are checked as well, which includes all
--- cached metrics and annotations. The instances are held to the laws of
--- their classes on top of that.
+-- | Compare rope operations with a simple 'Text' model. Check tree
+-- invariants, cached metrics, and annotations after each operation, and
+-- test the laws of the public instances and custom measures.
 --
--- This file is compiled twice: against the library as it ships, and against
--- a build with tiny chunks and nodes (see the cabal file).
+-- Compiled with both default and small chunk/node sizes; see nano-rope.cabal.
 module Main (main) where
 
 import Control.Exception (ErrorCall, bracket, try)
@@ -95,7 +92,7 @@ main =
       , testGroup
           "laws"
           [ testProperty "the ropes they are tried on" prop_lawRopes
-          , -- Enough for three ropes picked independently to be equal now and then.
+          , -- Use enough samples to exercise laws requiring three equal ropes.
             adjustOption (\(QuickCheckTests n) -> QuickCheckTests (max 500 n)) $
               lawsOf "Rope" $
                 map ($ Proxy @R) [eqLaws, ordLaws, eqOrdLaws, semigroupLaws, monoidLaws, semigroupMonoidLaws, showLaws]
@@ -107,7 +104,7 @@ main =
               , lawsOf "pairs" [measureLaws (Proxy @(Breaks, Width))]
               , lawsOf "triples" [measureLaws (Proxy @((), Width, Breaks))]
               ]
-          , -- The measures of this file, which the rest of it relies on.
+          , -- Validate the custom measures used by the other properties.
             testGroup
               "test measures"
               [ lawsOf "Breaks" $ map ($ Proxy @Breaks) [semigroupLaws, monoidLaws, semigroupMonoidLaws, measureLaws]
@@ -134,11 +131,10 @@ main =
       ]
 
 ------------------------------------------------------------------------------
--- A measure with some bite
+-- Custom test measures
 
--- | Line breaks where @\\r\\n@, @\\r@ and @\\n@ each count once. Needs to
--- remember its edges to be a homomorphism: gluing @"a\\r"@ to @"\\nb"@ makes
--- one break out of two.
+-- | Count CRLF, CR, and LF as one break each. Track boundary characters
+-- so combining @"a\\r"@ and @"\\nb"@ counts their shared CRLF only once.
 data Breaks
   = NoText
   | Breaks !Int !Bool !Bool
@@ -166,7 +162,8 @@ instance Measure Breaks where
           (T.head t == '\n')
           (T.last t == '\r')
 
--- | Display width, with everything beyond Latin taking two columns.
+-- | A synthetic width measure for testing: code points from U+1100 count
+-- as two, all others as one. This is not a Unicode display-width algorithm.
 newtype Width = Width Int
   deriving (Eq, Ord, Show)
 
@@ -206,7 +203,7 @@ naiveMetrics t =
   where
     s = T.unpack t
 
--- | The number of characters before the location of an offset.
+-- | Convert a clamped, rounded offset to a code point count.
 charsAt :: Unit -> Int -> Text -> Int
 charsAt u k t
   | k <= 0 = 0
@@ -221,13 +218,14 @@ charsAt u k t
     s = T.unpack t
     fitting w = L.length (takeWhile (<= k) (drop 1 (scanl (+) 0 (map w s))))
 
--- | The characters before a range of offsets and before its end.
+-- | Resolve both range endpoints to code point counts in the original text.
 charRange :: Unit -> Int -> Int -> Text -> (Int, Int)
 charRange u i j t = (ni, if j <= i then ni else charsAt u j t)
   where
     ni = charsAt u i t
 
--- | Start and content of every line.
+-- | Code point offset and content of each line, keeping an empty final line
+-- when present.
 lineTable :: Text -> [(Int, Text)]
 lineTable = go 0 . T.splitOn "\n"
   where
@@ -257,8 +255,8 @@ naivePosition u n t = Position (T.count "\n" before) (Rope.count u (naiveMetrics
 ------------------------------------------------------------------------------
 -- Generators
 
--- | 1 for the small build, 64 for the real one: sizes are scaled so that both
--- grow trees of a few levels.
+-- | Scale inputs by chunk size (1 for the small build, 32 for the default)
+-- so both builds exercise trees with several levels.
 sizeFactor :: Int
 sizeFactor = maxChunk `quot` 16
 
@@ -274,9 +272,7 @@ genPiece =
     , (2, pure <$> elements "\128512\119070\127881") -- four bytes, surrogate pairs
     ]
 
--- | Source code is ASCII, give or take a comment: whole chunks of it, which
--- take ways of their own through the rope that a chunk with one accent in it
--- does not.
+-- | Generate ASCII-only chunks to exercise paths skipped by mixed UTF-8 input.
 genAsciiPiece :: Gen String
 genAsciiPiece =
   frequency
@@ -285,8 +281,8 @@ genAsciiPiece =
     , (1, pure "\r\n")
     ]
 
--- | Text of any script, of ASCII alone, or of ASCII with something else now
--- and then, so that chunks of both kinds end up in one tree.
+-- | Generate mixed UTF-8, ASCII-only, and mostly ASCII documents so trees
+-- exercise both ASCII and general Unicode paths.
 genText :: Int -> Gen Text
 genText n = do
   oneLine <- frequency [(4, pure False), (1, pure True)]
@@ -299,7 +295,7 @@ genText n = do
   t <- T.pack . concat <$> vectorOf n piece
   pure (if oneLine then T.filter (/= '\n') t else t)
 
--- | Every candidate is strictly shorter, or shrinking would never end.
+-- | Produce strictly shorter candidates so shrinking terminates.
 shrinkText :: Text -> [Text]
 shrinkText t =
   [half | h > 0, half <- [T.take h t, T.drop h t]]
@@ -318,7 +314,7 @@ instance Arbitrary Doc where
     Doc <$> genText n
   shrink (Doc t) = Doc <$> shrinkText t
 
--- | Something to insert: usually a keystroke, sometimes a paste.
+-- | Inserted text, weighted toward keystrokes with occasional larger pastes.
 newtype Snippet = Snippet Text
   deriving (Show)
 
@@ -331,8 +327,8 @@ instance Arbitrary Snippet where
 instance Arbitrary Unit where
   arbitrary = elements [minBound .. maxBound]
 
--- | An offset relative to the length of whatever it is applied to, reaching
--- a little beyond both ends.
+-- | A relative offset, resolved against the input length with values just
+-- outside both ends to exercise clamping.
 newtype Offset = Offset Int
   deriving (Show)
 
@@ -371,7 +367,7 @@ instance Arbitrary Op where
       , (4, Typed <$> arbitrary <*> arbitrary <*> resize 6 (listOf arbitrary) <*> choose (0, 4))
       ]
     where
-      -- Ends of ranges, as lengths: mostly short, so that the text survives.
+      -- Prefer short ranges so edit sequences retain enough text to test.
       nearby = Offset <$> frequency [(5, choose (0, 20)), (1, choose (0, 1000))]
   shrink op = case op of
     Insert u i s -> Insert u i <$> shrink s
@@ -421,15 +417,15 @@ apply op (r, t) = case op of
         (na, nb) = charRange u (cursor - erased) cursor t'
      in (Rope.delete u (cursor - erased) cursor r', T.take na t' <> T.drop nb t')
 
--- | Insert at a cursor and move it to where the next keystroke goes: by what
--- the text measures, from the offset asked for or the start of the rope.
+-- | Insert at the cursor and advance by the inserted text's length in the
+-- chosen unit, starting from at least zero.
 keystroke :: Unit -> (R, Text, Int) -> Snippet -> (R, Text, Int)
 keystroke u (r, t, cursor) (Snippet s) =
   (Rope.insert u cursor s r, T.take n t <> s <> T.drop n t, max 0 cursor + Rope.count u (naiveMetrics s))
   where
     n = charsAt u cursor t
 
--- | A rope with some history, and the text it should hold.
+-- | A rope after a sequence of edits, paired with its expected text.
 data Edited = Edited R Text
 
 instance Show Edited where
@@ -476,8 +472,8 @@ prop_chunks (Edited r t) =
   where
     chunks = Rope.toChunks r
 
--- | What is written is the UTF-8 of the text, to the byte: to a handle that
--- has something in it already, and to a file, which is replaced.
+-- | Check exact UTF-8 bytes when writing to an existing handle and when
+-- replacing a file.
 prop_output :: Edited -> Property
 prop_output (Edited r t) = ioProperty $ do
   (written, replaced) <- withTempFile $ \path h -> do
@@ -490,8 +486,8 @@ prop_output (Edited r t) = ioProperty $ do
     pure (written, replaced)
   pure (written === "before " <> TE.encodeUtf8 t .&&. replaced === TE.encodeUtf8 t)
 
--- | The documents of the other properties fit the buffer of the library as
--- it ships. This one fills it several times over, and not to the brim.
+-- | Exercise multiple output-buffer flushes and a partially filled final
+-- buffer with a document larger than the default buffer.
 prop_outputLarge :: Property
 prop_outputLarge = ioProperty $ do
   written <- withTempFile $ \path h -> do
@@ -502,7 +498,7 @@ prop_outputLarge = ioProperty $ do
   where
     t = T.replicate 9000 "na\239ve \20013\25991 \128512\r\n"
 
--- | A measure that has no answer for an exclamation mark.
+-- | A deliberately partial measure that throws on @!@.
 data Calm = Calm
   deriving (Eq, Show)
 
@@ -517,8 +513,8 @@ instance Measure Calm where
     | T.any (== '!') t = error "not calm"
     | otherwise = Calm
 
--- | A rope that cannot be evaluated leaves the file as it was: here the
--- keystrokes still waiting to go into the tree are the ones without a measure.
+-- | A failure while measuring pending input must occur before the existing
+-- file is opened and truncated.
 prop_outputFails :: Property
 prop_outputFails = ioProperty $ do
   (outcome, kept) <- withTempFile $ \path h -> do
@@ -604,8 +600,7 @@ instance Arbitrary Burst where
       , Erasing <$> choose (1, 16 * sizeFactor)
       ]
 
--- | Lots of small edits at a cursor, one keystroke at a time: fills chunks
--- until they split and drains them until they merge.
+-- | Repeated typing and erasing at a cursor exercises chunk splits and merges.
 prop_typing :: Doc -> Offset -> Property
 prop_typing (Doc t0) start = forAll (resize 10 (listOf arbitrary)) $ \bursts ->
   let cursor = max 0 (min (T.length t0) (resolve Chars start t0))
@@ -622,9 +617,9 @@ prop_typing (Doc t0) start = forAll (resize 10 (listOf arbitrary)) $ \bursts ->
       | c <= 0 = st
       | otherwise = (Rope.delete Chars (c - 1) c r, T.take (c - 1) t <> T.drop c t, c - 1)
 
--- | Keystrokes that continue each other, in any unit and from any offset,
--- also one that is clamped or falls inside a code point. Every rope on the
--- way is right, whether or not it has been looked at before typing on.
+-- | Consecutive insertions agree with the model in every unit, including
+-- clamped offsets and offsets inside code points. Check intermediate ropes
+-- as well as a run whose intermediate values are not read.
 prop_run :: Edited -> Unit -> Offset -> Property
 prop_run (Edited r0 t0) u i = forAll (resize 12 (listOf arbitrary)) $ \snippets ->
   let steps = L.scanl (keystroke u) (r0, t0, resolve u i t0) snippets
@@ -632,12 +627,12 @@ prop_run (Edited r0 t0) u i = forAll (resize 12 (listOf arbitrary)) $ \snippets 
    in counterexample (show (u, resolve u i t0)) $
         holds unread final .&&. conjoin [holds r t | (r, t, _) <- steps]
 
--- | An insertion joins a run where the run ends and nowhere else: not where
--- it would end if it were counted in another unit, neither inside it.
+-- | Insertions near buffered input must use the actual offset, rather than
+-- incorrectly extending the buffer at an interior or differently counted offset.
 prop_nearRun :: Edited -> Unit -> Offset -> Property
 prop_nearRun (Edited r0 t0) u i = forAll ((,) <$> key <*> key) $ \(s1, s2) ->
   let (r, t, _) = L.foldl' (keystroke u) (r0, t0, start) [Snippet "a", Snippet s1, Snippet s2]
-      -- In bytes, the longest way to count what was typed.
+      -- Byte length bounds the inserted length in every unit.
       typed = Rope.count Bytes (naiveMetrics t) - Rope.count Bytes (naiveMetrics t0)
    in conjoin
         [ counterexample (show (u, start, k)) (holds (Rope.insert u k "-" r) (T.take n t <> "-" <> T.drop n t))
@@ -646,11 +641,11 @@ prop_nearRun (Edited r0 t0) u i = forAll ((,) <$> key <*> key) $ \(s1, s2) ->
         ]
   where
     start = resolve u i t0
-    -- What a key or two make, short enough to wait in a run.
+    -- Short inputs can stay in the typing buffer.
     key = choose (1, 2) >>= genText
 
--- | A rope in the middle of typing is a value like any other: typing on from
--- it twice gives two ropes and leaves the first alone.
+-- | Branching from a rope with pending input preserves the original and
+-- produces independent edited versions.
 prop_branching :: Edited -> Offset -> Snippet -> Snippet -> Snippet -> Property
 prop_branching (Edited r0 t0) i s1 s2 s3 =
   conjoin
@@ -707,8 +702,8 @@ prop_toPosition (Edited r t) from to i =
   where
     k = resolve from i t
 
--- | Positions of actual locations survive the trip through offsets, unless
--- they sit inside a line terminator, which no position can address.
+-- | Positions round-trip through offsets except inside CRLF, where input
+-- positions clamp to the end of the line's content.
 prop_positionRoundtrip :: Edited -> Unit -> Unit -> Offset -> Property
 prop_positionRoundtrip (Edited r t) u via i =
   via /= Lines && not insideTerminator ==>
@@ -789,10 +784,9 @@ lawsOf :: String -> [Laws] -> TestTree
 lawsOf name sets =
   testGroup name [testGroup cls [testProperty law p | (law, p) <- properties] | Laws cls properties <- sets]
 
--- | The laws speak of ropes that are equal, or that differ late, and two
--- documents picked at random are neither. These are a few texts over a
--- common stem, some of them alike in every metric, of several chunks and of
--- two heights in either build.
+-- | Related texts make equality and ordering laws useful: some are equal,
+-- some differ only near the end, and some share metrics despite differing
+-- in content. Sizes exercise multiple chunks and tree heights in both builds.
 lawTexts :: [(Int, Text)]
 lawTexts =
   [ (1, "")
@@ -805,9 +799,8 @@ lawTexts =
   where
     stem = T.take (2 * maxChunk) (T.replicate maxChunk "ab\nc\233 \8364\r\n\128512xyz")
 
--- | A rope of a text by one of several routes, which leave it in different
--- chunks: all at once, out of pieces, with its end typed and maybe still
--- waiting, with a gap filled in, or cut out of something longer.
+-- | Build the same text with different chunk boundaries: directly, by
+-- concatenation, by typing a suffix, by filling a gap, or by slicing.
 ropeOf :: Measure a => Text -> Gen (Rope a)
 ropeOf t =
   oneof
@@ -831,13 +824,13 @@ ropeOf t =
   where
     n = T.length t
 
--- | For the laws only, see 'lawTexts'. Everything else is tried on 'Edited'.
+-- | Generator for instance laws; see 'lawTexts'. Operation tests use 'Edited'.
 instance Measure a => Arbitrary (Rope a) where
   arbitrary = frequency [(w, pure t) | (w, t) <- lawTexts] >>= ropeOf
   shrink r = Rope.fromText <$> shrinkText (Rope.toText r)
 
--- | The laws are tried on what they are about: equal ropes in different
--- chunks, and different ropes which no metric tells apart.
+-- | Require coverage of equal ropes with different chunks and unequal ropes
+-- with identical metrics.
 prop_lawRopes :: R -> R -> Property
 prop_lawRopes a b =
   checkCoverage $
@@ -845,8 +838,8 @@ prop_lawRopes a b =
       cover 5 (a /= b && Rope.metrics a == Rope.metrics b) "different, with the same metrics" $
         holds a (Rope.toText a) .&&. holds b (Rope.toText b)
 
--- | What "Test.QuickCheck.Classes.Base" leaves out. The instances define '=='
--- and 'compare', and the rest of both classes has to agree with those.
+-- | Additional checks that derived comparison operators agree with '=='
+-- and 'compare'.
 eqOrdLaws :: forall a. (Ord a, Arbitrary a, Show a) => Proxy a -> Laws
 eqOrdLaws _ =
   Laws
@@ -868,7 +861,7 @@ eqOrdLaws _ =
       EQ -> EQ
       GT -> LT
 
--- | Whatever is read off a rope is read off its parts.
+-- | Text, metrics, and measures preserve concatenation and the empty rope.
 homomorphismLaws :: Laws
 homomorphismLaws =
   Laws
@@ -881,8 +874,8 @@ homomorphismLaws =
     homomorphism :: (Monoid b, Eq b, Show b) => (R -> b) -> Property
     homomorphism f = property $ \a b -> f (a <> b) === f a <> f b .&&. f mempty === mempty
 
--- | 'IsString' has no laws. Ropes are held to what 'Text' does, which is to
--- replace surrogates.
+-- | String conversion matches 'Text', including replacement of surrogate
+-- code points with the Unicode replacement character.
 isStringLaws :: Laws
 isStringLaws =
   Laws
@@ -893,7 +886,7 @@ isStringLaws =
   where
     genString = concat <$> listOf (frequency [(9, genPiece), (1, vectorOf 1 (choose ('\xD800', '\xDFFF')))])
 
--- | The laws of 'Measure': chunks are cut anywhere, and none of it may show.
+-- | Measures preserve concatenation and identity, independent of chunk boundaries.
 measureLaws :: forall a. (Measure a, Eq a, Show a) => Proxy a -> Laws
 measureLaws _ =
   Laws
@@ -902,7 +895,7 @@ measureLaws _ =
     , ("Identity", (measureChunk T.empty :: a) === mempty)
     ]
 
--- | Measurements of some text, as they come up in a rope.
+-- | Generate a measurement from text rather than arbitrary field values.
 measured :: (Text -> a) -> Gen a
 measured f = (\(Snippet t) -> f t) <$> arbitrary
 
@@ -930,7 +923,7 @@ prop_plain (Edited r t) u i (Snippet s) =
     k = resolve u i t
     plain = Plain.unmeasured r
 
--- | One big document, tall even in the real build, edited all over.
+-- | Exercise edits on a tree of height at least two in both builds.
 prop_big :: Property
 prop_big = forAll (genText (6000 * sizeFactor)) $ \t0 ->
   forAll (vectorOf 30 arbitrary) $ \ops ->
@@ -941,12 +934,9 @@ prop_big = forAll (genText (6000 * sizeFactor)) $ \t0 ->
 ------------------------------------------------------------------------------
 -- Chunk scans
 
--- | UTF-8 in an array of its own, for the scans to be held against a model:
--- every implementation of them (see 'kernels') gives the same results. Also
--- long lines, as line feeds found in the first vector looked at leave the
--- rest of a scan untried; and now and then a long run of one piece, which
--- fills the byte counters of the vector loops (255 vectors of 32 bytes, all
--- of them matching).
+-- | UTF-8 inputs for comparing every scan implementation with a model.
+-- Long lines exercise searches beyond the first vector. Repeated pieces
+-- exercise counter flushing at the 255-vector limit.
 newtype Scanned = Scanned Text
   deriving (Show)
 
@@ -969,11 +959,11 @@ byteList arr = [indexByteArray arr i | i <- [0 .. sizeofByteArray arr - 1]]
 isContByte :: Word8 -> Bool
 isContByte b = b >= 0x80 && b < 0xC0
 
--- | Every implementation gives what the model says.
+-- | Check every available scan implementation against the expected result.
 allKernels :: (Eq b, Show b) => (Kernels -> b) -> b -> Property
 allKernels run expected = conjoin [counterexample (kernelsName k) (run k === expected) | k <- kernels]
 
--- | A slice of an array of this size: often short, often long.
+-- | Generate short and long slices, including array boundaries.
 genSlice :: Int -> Gen (Int, Int)
 genSlice size = do
   off <- frequency [(1, pure 0), (4, choose (0, size))]
@@ -1013,9 +1003,8 @@ prop_scanPrevious (Scanned t) = forAll (choose (0, sizeofByteArray arr)) $ \to -
   where
     arr = bytesOfText t
 
--- | Where a line starts, which is just after the k-th line feed, and where
--- the line feed that ends it is: for the lines there are, the one after the
--- last and the ones before the first.
+-- | Check line-start and terminator offsets, including indices before
+-- the first line and beyond the last.
 prop_scanLine :: Scanned -> Property
 prop_scanLine (Scanned t) = forAll (choose (-1, L.length lfs + 2)) $ \n ->
   let from
@@ -1027,8 +1016,8 @@ prop_scanLine (Scanned t) = forAll (choose (-1, L.length lfs + 2)) $ \n ->
     size = sizeofByteArray arr
     lfs = lineFeeds arr
 
--- | Between two code point boundaries: the end of the longest run of whole
--- code points that fits into @k@ units, decoded rather than scanned.
+-- | Compare unit scans with a decoded model of the longest prefix that fits
+-- in @k@ units. Both slice endpoints are code point boundaries.
 prop_scanUnits :: Scanned -> Bool -> Property
 prop_scanUnits (Scanned t) wide = forAll (genSlice (L.length bounds - 1)) $ \(i, n) ->
   let from = bounds !! i

@@ -3,33 +3,40 @@
 -- Copyright   : (c) 2026 goolord
 -- License     : MIT
 --
--- A text rope for editors, language servers and parsers.
+-- A persistent UTF-8 text rope for editors, language servers, and parsers.
 --
--- * __Flat chunks.__ Leaves are unpinned byte arrays of at most 512 bytes of
---   UTF-8, referenced straight from the tree.
--- * __A B-tree.__ Up to 16 children per node. Every node carries the sizes of
---   its subtree, so that seeking reads the heads of a node's children and an
---   edit copies one small array of pointers per level.
--- * __Cheap keystrokes.__ An edit within a chunk is one descent and one copy
---   of that chunk, and typing on from where the last insertion ended does
---   not even touch the tree, see 'insert'.
--- * __Every unit at once.__ Bytes, code points, UTF-16 code units and lines
---   are tracked at every node. Any of them addresses the rope in /O(log n)/,
---   and any converts to any other in /O(log n)/, see 'Unit' and 'convert'.
--- * __Long lines are not special.__ Chunks are cut by size, never by line.
--- * __Custom measures.__ "Data.Text.NanoRope.Measured" caches a monoid of
---   your choice at every node and searches by it.
+-- * __Multi-unit indexing.__ Cached metrics support /O(log n)/ lookups and
+--   conversions in bytes, code points, UTF-16 code units, and lines.
+-- * __Small edits.__ A B-tree of chunks up to 512 bytes shares unchanged
+--   subtrees between versions. Consecutive keystrokes can be buffered; see
+--   'insert'.
+-- * __Bounded chunks.__ Chunk sizes depend on bytes, not line lengths.
+-- * __Chunk-based I/O.__ Read chunk views or stream UTF-8 without flattening
+--   the document.
+-- * __Custom summaries.__ "Data.Text.NanoRope.Measured" adds cached monoidal
+--   measures and searches over them.
 --
--- This module is meant to be imported qualified:
+-- Import this module qualified:
 --
 -- > import Data.Text.NanoRope (Rope, Unit (..), Position (..))
 -- > import qualified Data.Text.NanoRope as Rope
 --
+-- Offsets are zero-based, clamped to the document, and rounded down to code
+-- point boundaries. Ranges are half-open: the start is included and the end
+-- is excluded. 'Chars' counts code points, not grapheme clusters or display
+-- columns. Only @\\n@ starts a new line.
+--
+-- Complexity bounds use /n/ for the document's byte length. They assume the
+-- tree is evaluated: a read after buffered typing may first apply a pending
+-- insertion. 'null', 'length', 'lineCount', and 'metrics' do not force it.
+--
 -- = Example: a language server
 --
--- A client sends a range of UTF-16 positions to replace. The parser
--- downstream wants to hear about it in bytes.
+-- Convert a client's UTF-16 range to byte offsets before replacing it.
+-- The returned offsets refer to the original document.
 --
+-- > import Data.Text (Text)
+-- >
 -- > applyChange :: Position -> Position -> Text -> Rope -> (Rope, (Int, Int))
 -- > applyChange from to new rope = (Rope.replace Bytes i j new rope, (i, j))
 -- >   where
@@ -116,19 +123,17 @@ import qualified Data.Text.NanoRope.Internal as M
 import System.IO (Handle)
 import Prelude hiding (drop, getLine, length, lines, null, splitAt, take)
 
--- | A rope of text. This is "Data.Text.NanoRope.Measured"'s rope without a
--- custom measure, so the two interfaces mix freely and all instances ('Eq',
--- 'Ord', 'Show', 'Semigroup', 'Monoid', 'Data.String.IsString',
--- 'Control.DeepSeq.NFData') are shared.
+-- | A rope with only the built-in metrics. This is the measured rope
+-- specialised to @()@, with the same 'Eq', 'Ord', 'Show', 'Semigroup',
+-- 'Monoid', 'Data.String.IsString', and 'Control.DeepSeq.NFData' instances.
 type Rope = M.Rope ()
 
 -- $conversions
--- The 'Metrics' of the prefix of a rope up to some location describe that
--- location in every unit at once. All conversions go through this hub:
--- 'metricsAt', 'metricsAtPosition' and 'metricsWhere' lead into it, 'count'
--- and 'metricsToPosition' lead out of it. When you need more than one unit of
--- the same location (tree-sitter wants a byte offset /and/ a row and byte
--- column), take them from the same 'Metrics' and pay for one descent.
+-- Prefix t'Metrics' describe a location in all four units. Obtain them with
+-- 'metricsAt', 'metricsAtPosition', or 'metricsWhere', then use 'count' for
+-- absolute offsets. Reusing the metrics avoids repeating the lookup for
+-- each unit. 'metricsToPosition' also looks up the line start to calculate
+-- a column; use metrics from the same rope.
 
 -- | The empty rope.
 empty :: Rope
@@ -138,24 +143,25 @@ empty = M.empty
 singleton :: Char -> Rope
 singleton = M.singleton
 
--- | /O(n)/. The text is copied into chunks, except that a text of at most a
--- chunk which owns its whole buffer is shared.
+-- | /O(n)/. Build a rope from strict text. Copies the text into chunks,
+-- unless it is at most 512 bytes and occupies its entire backing buffer.
 fromText :: Text -> Rope
 fromText = M.fromText
 
--- | /O(n)/.
+-- | Build a rope by appending the chunks of a lazy 'TL.Text'.
 fromLazyText :: TL.Text -> Rope
 fromLazyText = M.fromLazyText
 
--- | /O(n)/. A rope of a single chunk is converted without copying.
+-- | /O(n)/. Flatten the rope to strict text. A single chunk is shared
+-- without copying; multiple chunks are copied into one buffer.
 toText :: Rope -> Text
 toText = M.toText
 
--- | /O(n)/, without copying any text: the lazy text shares the chunks.
+-- | /O(n)/. Convert to lazy text, sharing the chunk buffers.
 toLazyText :: Rope -> TL.Text
 toLazyText = M.toLazyText
 
--- | /O(n)/.
+-- | /O(n)/. Decode the rope to a 'String'.
 toString :: Rope -> String
 toString = M.toString
 
@@ -164,46 +170,44 @@ toString = M.toString
 toChunks :: Rope -> [Text]
 toChunks = M.toChunks
 
--- | Lazy right fold over the chunks of 'toChunks'.
+-- | Lazy right fold over non-empty chunks in document order, without
+-- building the list returned by 'toChunks'.
 foldrChunks :: (Text -> b -> b) -> b -> Rope -> b
 foldrChunks = M.foldrChunks
 
--- | Strict left fold over the chunks of 'toChunks'. It is a walk of the tree
--- and allocates nothing of its own, where the list of 'toChunks' costs a
--- hundred bytes or so a chunk: the fold for whoever consumes a whole rope,
--- to hash it or to hand it to a parser or a socket.
+-- | Strict left fold over non-empty chunks in document order. Walks the
+-- tree directly, sharing text buffers and avoiding an intermediate list.
+-- Useful for consumers such as hashes and parsers.
 foldlChunks' :: (b -> Text -> b) -> b -> Rope -> b
 foldlChunks' = M.foldlChunks'
 
 -- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
--- offset; empty exactly when the offset is at or beyond the end.
+-- offset. Returns empty text when the clamped offset is at the end.
 --
--- This is the shape of a parser's read callback (such as tree-sitter's
--- @TSInput@): ask for the text at a byte offset, consume it, ask again at
--- the following offset.
+-- For a parser read callback, request a byte offset, consume the returned
+-- text, then advance by its byte length. Offsets are clamped and rounded
+-- as described at 'Unit'.
 chunkAt :: Unit -> Int -> Rope -> Text
 chunkAt = M.chunkAt
 
--- | Write the text to a handle as UTF-8, which is what the chunks hold
--- already: they are poured through one small buffer, and no 'Text' of the
--- whole document is made on the way as it would be by way of 'toText'.
+-- | /O(n)/. Write UTF-8 to a handle through a 32 KiB buffer, without
+-- constructing a 'Text' for the whole document.
 --
--- Like 'System.IO.hPutBuf' this writes bytes. The encoding and the newline
--- mode of the handle have no say, so a @\\r\\n@ in the rope is a @\\r\\n@
--- in the file on every platform. That is what a file, a pipe or a socket
--- wants; a console may not, and text for one is better off as 'toLazyText'.
+-- Like 'System.IO.hPutBuf', this bypasses the handle's encoding and newline
+-- translation, preserving the rope's bytes on every platform. To use the
+-- handle's text encoding instead, pass 'toLazyText' to text I/O.
 hPutUtf8 :: Handle -> Rope -> IO ()
 hPutUtf8 = M.hPutUtf8
 
--- | Write the text to a file as UTF-8 with 'hPutUtf8', replacing what was
--- there.
+-- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents.
 --
--- The rope is evaluated first, keystrokes that were waiting included: should
--- that fail, the file is as it was.
+-- Evaluates the tree, including pending input, before opening the file.
+-- An evaluation failure leaves an existing file untouched. The write itself
+-- is not atomic.
 writeFileUtf8 :: FilePath -> Rope -> IO ()
 writeFileUtf8 = M.writeFileUtf8
 
--- | /O(1)/.
+-- | /O(1)/. Whether the rope is empty, including pending input.
 null :: Rope -> Bool
 null = M.null
 
@@ -214,74 +218,77 @@ null = M.null
 length :: Unit -> Rope -> Int
 length = M.length
 
--- | /O(1)/. Number of lines: one more than the number of @\\n@, so that the
--- valid line indices are @[0 .. lineCount - 1]@. The last line may be empty.
+-- | /O(1)/. Number of @\\n@ characters plus one. An empty rope has one line;
+-- a trailing @\\n@ adds an empty final line. Valid indices range from zero
+-- to @lineCount rope - 1@. See 'lines' for a list that omits that final empty line.
 lineCount :: Rope -> Int
 lineCount = M.lineCount
 
--- | /O(1)/. All measurements of the rope.
+-- | /O(1)/. All built-in measurements, including pending input.
 metrics :: Rope -> Metrics
 metrics = M.metrics
 
--- | /O(log n)/, more precisely proportional to the difference in height.
--- Same as '<>'.
+-- | /O(log n)/. Concatenate two ropes, sharing unaffected subtrees.
+-- Equivalent to '<>'. The traversal follows the difference in tree heights.
 append :: Rope -> Rope -> Rope
 append = M.append
 
 -- | /O(log n)/. Split at an offset, clamped to the rope and rounded down to
--- a code point boundary (see 'Unit'). Both halves come out of one descent;
--- 'take' and 'drop' are cheaper if you are after just one of them.
+-- a code point boundary (see 'Unit'). Finds both halves in one descent.
+-- Use 'take' or 'drop' if you need only one half.
 --
 -- >>> splitAt Lines 1 "fst\nsnd\n"
 -- ("fst\n","snd\n")
 splitAt :: Unit -> Int -> Rope -> (Rope, Rope)
 splitAt = M.splitAt
 
--- | /O(log n)/. The prefix up to an offset.
+-- | /O(log n)/. The prefix before an offset, clamped and rounded as in 'splitAt'.
 take :: Unit -> Int -> Rope -> Rope
 take = M.take
 
--- | /O(log n)/. The suffix from an offset.
+-- | /O(log n)/. The suffix from an offset, clamped and rounded as in 'splitAt'.
 drop :: Unit -> Int -> Rope -> Rope
 drop = M.drop
 
--- | /O(log n)/. @slice u i j@ is the text from offset @i@ up to offset @j@.
+-- | /O(log n)/. Extract the half-open range @[i, j)@. Both offsets are
+-- clamped and rounded in the original rope. Returns empty when @j <= i@.
 slice :: Unit -> Int -> Int -> Rope -> Rope
 slice = M.slice
 
--- | /O(log n + length of the result)/. Like 'slice', but straight to 'Text'
--- without building a rope in between. A range within a single chunk is
--- returned as a zero-copy view of that chunk.
+-- | /O(log n + result bytes)/. Like 'slice', but returns 'Text' directly.
+-- A range within one chunk is a zero-copy view; a range spanning chunks
+-- is copied into one buffer.
 sliceText :: Unit -> Int -> Int -> Rope -> Text
 sliceText = M.sliceText
 
--- | /O(log n + length of the text)/. Insert text at an offset.
+-- | /O(log n + inserted bytes)/. Insert text at a clamped, code-point-aligned
+-- offset. Empty input leaves the rope unchanged.
 --
--- An insertion confined to one chunk, as nearly all are, copies that chunk
--- and the path to it and nothing else; a chunk that overflows splits in two.
+-- Small insertions copy the affected chunk and its path through the tree.
+-- An overflowing chunk can split in two.
 --
--- Typing is cheaper still. An insertion that starts where the one before it
--- ended (in the same unit, which is not 'Lines') is held back: up to 128
--- bytes of such keystrokes wait next to the tree and go into it at once, when
--- the rope is read or edited elsewhere. A keystroke then costs a copy of what
--- is waiting, /O(1)/, and 'length' and 'metrics' answer without looking at
--- the tree. This is the one lazy spot of a rope: evaluating it to weak head
--- normal form leaves up to one such insertion undone.
+-- Consecutive insertions in the same unit ('Bytes', 'Chars', or 'Utf16')
+-- can use a buffer of up to 128 bytes, limited by the target chunk's free
+-- space. Updating that bounded buffer is /O(1)/ in document size. A tree
+-- read, an edit elsewhere, or an insertion that exceeds the buffer's capacity
+-- forces the pending insertion.
+-- 'length' and 'metrics' include pending input without forcing it.
+-- Evaluating a rope to weak head normal form may leave this insertion deferred.
 insert :: Unit -> Int -> Text -> Rope -> Rope
 insert = M.insert
 
--- | /O(log n)/. @delete u i j@ removes the text from offset @i@ up to
--- offset @j@. Erasing the end of what was just typed (see 'insert') by code
--- points is /O(1)/ as well.
+-- | /O(log n)/. Remove the half-open range @[i, j)@, clamping and rounding
+-- both offsets in the original rope. Does nothing when @j <= i@.
+-- Deleting a suffix of buffered 'Chars' input can take /O(1)/; see 'insert'.
 delete :: Unit -> Int -> Int -> Rope -> Rope
 delete = M.delete
 
--- | /O(log n + length of the text)/. @replace u i j t@ replaces the text
--- from offset @i@ up to offset @j@ by @t@.
+-- | /O(log n + inserted bytes)/. Replace the half-open range @[i, j)@ with
+-- text, clamping and rounding both offsets in the original rope. When
+-- @j <= i@, insert at @i@ instead.
 --
--- An edit confined to one chunk that neither overflows nor underflows, as
--- nearly all keystrokes are, copies that chunk and the path to it and
--- nothing else.
+-- An edit that stays within one chunk and keeps it within its size bounds
+-- copies only that chunk and the path to it.
 replace :: Unit -> Int -> Int -> Text -> Rope -> Rope
 replace = M.replace
 
@@ -291,15 +298,15 @@ replace = M.replace
 getLine :: Int -> Rope -> Text
 getLine = M.getLine
 
--- | The lines of the rope without their terminators, lazily. Like
--- 'Data.Text.lines', a trailing @\\n@ does not start another line; unlike
--- it, @\\r\\n@ is stripped too.
+-- | /O(n)/. Lines without their @\\n@ or @\\r\\n@ terminators, produced
+-- lazily. Returns @[]@ for an empty rope and omits the empty line after a
+-- trailing @\\n@. A lone @\\r@ is preserved. Lines within one chunk share
+-- its buffer.
 lines :: Rope -> [Text]
 lines = M.lines
 
--- | /O(log n)/. The 'Metrics' of the prefix ending at an offset, in other
--- words the same location expressed in every unit at once. The offset is
--- clamped and rounded as described at 'Unit'.
+-- | /O(log n)/. Measure the prefix ending at an offset to express that
+-- location in all four units. The offset is clamped and rounded as in 'splitAt'.
 --
 -- >>> metricsAt Chars 3 "a😀\nb"
 -- Metrics {bytes = 6, chars = 3, utf16Units = 4, newlines = 1}
@@ -315,10 +322,12 @@ metricsAt = M.metricsAt
 convert :: Unit -> Unit -> Int -> Rope -> Int
 convert = M.convert
 
--- | /O(log n)/. Split at a line and column, the column counted in the given
--- unit. A column beyond the end of the line is clamped to the end of its
--- content (before the @\\n@ or @\\r\\n@) and a line beyond the last one to the
--- end of the rope, as the Language Server Protocol asks for.
+-- | /O(log n)/. Split at a zero-based line and column, with the column in
+-- the given unit. Negative coordinates clamp to zero. A column beyond the
+-- line's content clamps to before its @\\n@ or @\\r\\n@; a line beyond the
+-- document clamps to its end. Offsets inside code points round down.
+-- For 'Lines' columns, zero means the line start and any positive value
+-- means the end of its content.
 splitAtPosition :: Unit -> Position -> Rope -> (Rope, Rope)
 splitAtPosition = M.splitAtPosition
 
@@ -327,14 +336,10 @@ splitAtPosition = M.splitAtPosition
 metricsAtPosition :: Unit -> Position -> Rope -> Metrics
 metricsAtPosition = M.metricsAtPosition
 
--- | /O(log n)/. Where the line of a position starts, and 'metricsAtPosition':
--- @('metricsAt' 'Lines' line, 'metricsAtPosition' u position)@, out of one
--- descent where those are two.
---
--- The difference of the two is the column that was reached, in every unit
--- at once. That converts a column from one unit to another, and tells a
--- column that was clamped to the end of its line, or rounded down to the
--- start of a code point, from one that is where it was asked for:
+-- | /O(log n)/. Return prefix metrics for the line start and the position,
+-- sharing their lookup. Clamps coordinates as in 'metricsAtPosition'.
+-- Subtract corresponding counts to get the reached column in any unit.
+-- Comparing it with the requested column detects clamping or rounding:
 --
 -- >>> let (line, at) = metricsAtLineAndPosition Utf16 (Position 1 3) "a😀\nb😀c"
 -- >>> (utf16Units at - utf16Units line, chars at - chars line, bytes at)
@@ -344,12 +349,15 @@ metricsAtLineAndPosition = M.metricsAtLineAndPosition
 {-# INLINE metricsAtLineAndPosition #-}
 
 -- | /O(log n)/. The position, with its column in the given unit, of a
--- location obtained from 'metricsAt', 'metricsAtPosition' or 'metricsWhere'.
+-- location obtained from 'metricsAt', 'metricsAtPosition', or 'metricsWhere'
+-- on the same rope. Does not clamp or validate the supplied metrics.
 metricsToPosition :: Unit -> Metrics -> Rope -> Position
 metricsToPosition = M.metricsToPosition
 
 -- | /O(log n)/. @offsetToPosition from to@ turns an offset in unit @from@
 -- into a position with its column in unit @to@.
+-- An offset inside a line terminator remains there; converting the result
+-- back with 'positionToOffset' clamps it to the end of the line's content.
 --
 -- >>> offsetToPosition Bytes Utf16 11 "a😀\nb😀c"
 -- Position {posLine = 1, posColumn = 3}
@@ -358,20 +366,23 @@ offsetToPosition = M.offsetToPosition
 
 -- | /O(log n)/. @positionToOffset from to@ turns a position with its column
 -- in unit @from@ into an offset in unit @to@.
+-- Coordinates are clamped as in 'splitAtPosition'.
 --
 -- >>> positionToOffset Utf16 Bytes (Position 1 3) "a😀\nb😀c"
 -- 11
 positionToOffset :: Unit -> Unit -> Position -> Rope -> Int
 positionToOffset = M.positionToOffset
 
--- | /O(log n)/. Split where a predicate on the metrics of the prefix turns
--- true: the first half is the longest prefix (of whole code points) for which
--- the predicate is false. The predicate has to be monotone, that is stay true
--- once it is true.
+-- | /O(log n)/ for a constant-time predicate. Split after the longest
+-- code-point-aligned prefix for which the predicate is false. The predicate
+-- must be monotone: once true, it must stay true as the prefix grows.
+-- If true for the empty prefix, split at the start; if never true, split
+-- at the end.
 splitWhere :: (Metrics -> Bool) -> Rope -> (Rope, Rope)
 splitWhere p = M.splitWhere (\m _ -> p m)
 
--- | /O(log n)/. The location where 'splitWhere' splits.
+-- | /O(log n)/ for a constant-time predicate. Prefix metrics at the split
+-- point chosen by 'splitWhere', without constructing either half.
 metricsWhere :: (Metrics -> Bool) -> Rope -> Metrics
 metricsWhere p = M.metricsWhere (\m _ -> p m)
 

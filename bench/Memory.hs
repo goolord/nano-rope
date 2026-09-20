@@ -1,8 +1,8 @@
--- Full laziness would float a document out of the action that makes it and
--- keep it for the next one, which would then find it already paid for.
+-- Prevent full laziness from sharing an input across measurements, which
+-- would undercount the memory retained by later runs.
 {-# OPTIONS_GHC -fno-full-laziness #-}
 
--- | How much of the heap a structure holds on to. Needs @+RTS -T@.
+-- | Measure retained heap with RTS statistics. Requires @+RTS -T@.
 module Memory
   ( fresh
   , footprint
@@ -13,7 +13,7 @@ import Foreign.StablePtr (freeStablePtr, newStablePtr)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
 import System.Mem (performMajorGC)
 
--- | A value made anew, which nothing else holds on to.
+-- | Construct and evaluate a fresh input for one measurement.
 fresh :: (n -> a) -> n -> IO a
 fresh make n = evaluate (make n)
 {-# NOINLINE fresh #-}
@@ -24,18 +24,17 @@ liveBytes = do
   performMajorGC
   fromIntegral . gcdetails_live_bytes . gc <$> getRTSStats
 
--- | How many more bytes are live while a structure built from a freshly made
--- input is, and the input is not. A structure that shares the input's
--- buffers keeps them alive and pays for them here.
+-- | Measure additional live bytes while retaining the built value but no
+-- separate reference to its input. Input buffers shared by the result
+-- remain live and are included in the measurement.
 footprint :: (n -> i) -> n -> (i -> a) -> (a -> ()) -> IO Double
 footprint make n build deep = do
   before <- liveBytes
   input <- fresh make n
   let a = build input
   _ <- evaluate (deep a)
-  -- With what built it, which is alive before: were that to die meanwhile,
-  -- as the edits of the last library to be measured do, it would be taken
-  -- off what the structure weighs.
+  -- Keep the builder alive across both measurements so collecting its
+  -- captured inputs cannot reduce the apparent size of the result.
   keep <- newStablePtr (a, build)
   after <- liveBytes
   freeStablePtr keep

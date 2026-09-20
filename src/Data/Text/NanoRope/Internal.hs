@@ -7,9 +7,9 @@
 {-# LANGUAGE UnliftedDatatypes #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 {-# LANGUAGE ViewPatterns #-}
--- Constructor specialisation clones the recursive workers before they can be
--- specialised to a measure, and the clones then take the measure as a
--- dictionary at run time. The SPECIALIZE pragmas below are what we want.
+-- Constructor specialisation can clone recursive workers before measure
+-- specialisation, leaving runtime dictionary arguments in the clones.
+-- Use the explicit SPECIALIZE pragmas below instead.
 {-# OPTIONS_GHC -fno-spec-constr #-}
 
 -- |
@@ -17,48 +17,37 @@
 -- Copyright   : (c) 2026 goolord
 -- License     : MIT
 --
--- Internals of the rope: the B-tree representation, the chunk scanning
--- primitives and an invariant checker. Everything is exposed for testing,
--- benchmarking and the adventurous, with __no stability guarantees__.
--- Import "Data.Text.NanoRope" or "Data.Text.NanoRope.Measured" instead.
+-- B-tree representation, chunk scans, and invariant checks. These internals
+-- are exposed for testing and benchmarking, with __no API stability guarantees__.
+-- Use "Data.Text.NanoRope" or "Data.Text.NanoRope.Measured" in application code.
 --
 -- = Representation
 --
--- A rope is a B-tree. Leaves hold a flat, unpinned, exactly-sized
--- 'ByteArray' of UTF-8 (at most 'maxChunk' bytes, always cut at code point
--- boundaries). Inner nodes hold up to 'maxChildren' children. Every node
--- carries the 'Metrics' of its own subtree unpacked next to its header (a
--- leaf packs them into one word), so seeking by any unit is a linear scan
--- over the heads of at most 'maxChildren' children per level.
+-- Leaves hold exactly-sized, unpinned UTF-8 arrays of at most 'maxChunk'
+-- bytes, split at code point boundaries. Inner nodes have up to 'maxChildren'
+-- children. Each node caches its subtree's t'Metrics'; leaves pack these into
+-- 64 bits. Seeking scans at most 'maxChildren' child headers per level.
 --
--- Nothing about a child is kept in its parent but the pointer. An edit
--- therefore copies one small array of pointers per level: persistence is
--- paid for in allocation, and this is what keeps the bill short.
+-- Parents store child pointers rather than duplicating each child's metrics.
+-- A small edit copies the affected leaf and the nodes and pointer arrays on
+-- its path, sharing the rest of the tree.
 --
--- Nodes are unlifted: a node is never a thunk, and the compiler knows. What
--- seeking reads of a child is then a load and a look at the tag of the
--- pointer. Were they lifted, every child read out of an array would have to
--- be evaluated first, for all that it always is already, and an evaluation
--- inside a loop saves the state of the loop to the stack and fetches it
--- back: that was most of what a descent cost.
+-- Nodes are unlifted, so GHC knows that reading a child cannot require
+-- evaluating a thunk. This avoids evaluation checks and register spills
+-- in traversal loops.
 --
--- The bill is meant to be exactly that: an edit allocates the new leaf, a
--- node and an array of pointers per level, and the rope; looking something
--- up allocates nothing but the answer. What keeps it so is strictness that
--- the compiler can see, and none of it is visible in the types: offsets and
--- metrics travel unboxed only through arguments that are strict on every
--- path, results that are single-constructor records, and helpers that are
--- either inlined or not at all (see the notes at the seeks and the scans).
--- Check the allocation of the benchmarks after touching any of it.
+-- Allocation in the hot paths depends on GHC's strictness and inlining
+-- decisions. Strict arguments, unpacked result records, and carefully placed
+-- helpers keep offsets and metrics unboxed. See the seeking and scanning
+-- notes, and check benchmark allocation after changing these paths.
 --
 -- = Scanning
 --
--- Whatever reads through a chunk (measuring it, finding a line feed,
--- counting code points or UTF-16 code units up to some offset) is one of a
--- few scans. Slices of 32 bytes or more are scanned by C with SIMD
--- instructions, AVX2 or SSE2 as the CPU allows (see 'kernels'); shorter ones,
--- and all of them if the package is built with @-f -simd@, by Haskell
--- reading 8 bytes at a time.
+-- Chunk scans measure text, find line feeds, and locate code point or UTF-16
+-- offsets. In the default build, slices of at least 32 bytes use C: SSE2 or
+-- AVX2 on supported x86-64 systems, portable C elsewhere. Shorter slices use
+-- Haskell scans processing up to 8 bytes at a time. Build with @-f -simd@ to
+-- use only Haskell scans. See 'kernels' for the available implementations.
 module Data.Text.NanoRope.Internal
   ( -- * Types
     Rope (.., Rope)
@@ -203,17 +192,15 @@ import Prelude hiding (drop, getLine, length, lines, null, splitAt, take)
 ------------------------------------------------------------------------------
 -- Tuning constants
 
--- | Maximum number of bytes in a leaf. No more than 65535 divided by
--- 'maxChildren': the metrics of a leaf are kept in 16 bits each, and those of
--- the leaves of a node are added up that way (see 'sumMetrics').
+-- | Maximum leaf size in bytes. Must not exceed @65535 / maxChildren@:
+-- @sumMetrics@ adds packed 16-bit leaf counts without unpacking them.
 maxChunk :: Int
 
 -- | Maximum number of children of an inner node.
 maxChildren :: Int
 #ifdef NANO_ROPE_SMALL
--- Tiny nodes, so that the test suite grows deep trees out of short inputs.
--- Six children rather than four, because an inner node can only be undersized
--- if the minimum is more than two.
+-- Small nodes exercise deep trees with short test inputs. Six children
+-- allow non-root inner nodes with two children to be undersized.
 maxChunk = 16
 maxChildren = 6
 #else
@@ -233,19 +220,16 @@ minChunk = maxChunk `quot` 4
 minChildren :: Int
 minChildren = maxChildren `quot` 2
 
--- | Maximum number of bytes of keystrokes waiting to be inserted, see
--- 'Typing'. Every keystroke copies what is waiting, so this is kept well
--- below a chunk.
+-- | Maximum buffered input in bytes; see 'Typing'. Each keystroke copies
+-- the buffer, so it stays smaller than a chunk.
 maxPending :: Int
 maxPending = maxChunk `quot` 4
 
--- | Size of the buffer that 'hPutUtf8' pours the chunks through, in bytes: 32
--- kB. So many chunks, because a chunk has to fit whatever 'maxChunk' is, and
--- no less than the buffer of a handle, which is then bypassed rather than
--- copied into.
+-- | UTF-8 output buffer size in bytes: 32 KiB in the default build.
+-- Holds whole chunks and batches writes to reduce per-chunk I/O overhead.
 outputBuffer :: Int
 #ifdef NANO_ROPE_SMALL
--- A few chunks, so that the test suite fills it over and over.
+-- A small buffer makes tests exercise repeated flushes.
 outputBuffer = 4 * maxChunk
 #else
 outputBuffer = 64 * maxChunk
@@ -254,16 +238,15 @@ outputBuffer = 64 * maxChunk
 ------------------------------------------------------------------------------
 -- Metrics
 
--- | The built-in measurements of a piece of text, all maintained at every
--- node of the tree. 'Metrics' of a /prefix/ of a rope double as a location
--- expressed in every unit at once, see 'metricsAt'.
+-- | Built-in counts cached at every tree node. The metrics of a rope's
+-- prefix also describe its endpoint in all four units; see 'metricsAt'.
 data Metrics = Metrics
   { bytes :: {-# UNPACK #-} !Int
-  -- ^ UTF-8 code units.
+  -- ^ UTF-8 bytes.
   , chars :: {-# UNPACK #-} !Int
-  -- ^ Unicode code points.
+  -- ^ Unicode code points, not grapheme clusters or display columns.
   , utf16Units :: {-# UNPACK #-} !Int
-  -- ^ UTF-16 code units, as used by the Language Server Protocol.
+  -- ^ UTF-16 code units, the default position unit in LSP.
   , newlines :: {-# UNPACK #-} !Int
   -- ^ Line feeds (@\\n@).
   }
@@ -287,22 +270,24 @@ subMetrics (Metrics b1 c1 u1 l1) (Metrics b2 c2 u2 l2) =
   Metrics (b1 - b2) (c1 - c2) (u1 - u2) (l1 - l2)
 {-# INLINE subMetrics #-}
 
--- | A unit for offsets and lengths.
+-- | A unit for offsets and lengths. Public offset operations clamp negative
+-- offsets to the start and offsets beyond the document to its end.
 data Unit
-  = -- | UTF-8 code units. An offset inside a code point is rounded down to
+  = -- | UTF-8 bytes. An offset inside a code point is rounded down to
     -- the start of that code point.
     Bytes
-  | -- | Unicode code points.
+  | -- | Unicode code points, not grapheme clusters or display columns.
     Chars
   | -- | UTF-16 code units. An offset between the two halves of a surrogate
     -- pair is rounded down to the start of that code point.
     Utf16
-  | -- | Lines. Offset @n@ is the start of the @n@-th line (0-based), that is
-    -- the location just after the @n@-th @\\n@.
+  | -- | Zero-based line starts. Offset zero is the document start; offset
+    -- @n > 0@ is just after the @n@-th @\\n@. Length in this unit counts
+    -- line feeds, not lines. A lone @\\r@ does not start a line.
     Lines
   deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | Project one unit out of 'Metrics'.
+-- | Read the count for one unit from t'Metrics'.
 count :: Unit -> Metrics -> Int
 count Bytes = bytes
 count Chars = chars
@@ -310,11 +295,13 @@ count Utf16 = utf16Units
 count Lines = newlines
 {-# INLINE count #-}
 
--- | A 0-based line and a 0-based column within that line. The unit of the
--- column is given separately to the functions consuming a 'Position'.
+-- | A zero-based line and column. Position functions take the column's
+-- unit separately; columns are not necessarily display widths.
 data Position = Position
   { posLine :: !Int
+  -- ^ Zero-based line index.
   , posColumn :: !Int
+  -- ^ Offset from the line start, in the unit supplied to the operation.
   }
   deriving (Eq, Ord, Show)
 
@@ -325,7 +312,7 @@ instance NFData Position where
 -- Custom measures
 
 -- | A user-defined monoidal summary of text, cached at every node of the
--- tree alongside the built-in 'Metrics'.
+-- tree alongside the built-in t'Metrics'.
 --
 -- Chunk boundaries are an implementation detail and can fall between any two
 -- code points, so 'measureChunk' must be a monoid homomorphism:
@@ -333,10 +320,9 @@ instance NFData Position where
 -- > measureChunk (x <> y) == measureChunk x <> measureChunk y
 -- > measureChunk mempty   == mempty
 --
--- Measures which seem to need context across a boundary can usually be made
--- lawful by remembering a little about their edges: to count @\\r\\n@ as a
--- single line break, track whether a piece ends in @\\r@ and whether it starts
--- with @\\n@, and fix the count up in '<>'.
+-- A context-sensitive measure may need boundary information. For example,
+-- counting @\\r\\n@ as one break requires tracking whether each non-empty
+-- piece starts with @\\n@ or ends with @\\r@, then adjusting the count in '<>'.
 --
 -- Annotations are kept in weak head normal form; give your measure strict
 -- fields to avoid building up thunks.
@@ -362,34 +348,30 @@ instance (Measure a, Measure b, Measure c) => Measure (a, b, c) where
 -- The tree
 
 -- | A rope of text annotated with a custom measure @a@. Use @()@ (or the
--- monomorphic interface in "Data.Text.NanoRope") when the built-in 'Metrics'
+-- monomorphic interface in "Data.Text.NanoRope") when the built-in t'Metrics'
 -- are all you need.
 --
--- To everything but 'insert' and 'delete' a rope is its tree, which is what
--- the pattern v'Rope' matches and builds.
+-- The v'Rope' pattern exposes the tree after applying pending input.
+-- Editing and metric queries can inspect the buffer directly.
 data Rope a
-  = -- | A tree, and where the last insertion into it ended, as a unit and an
-    -- offset: the one place at which a keystroke would continue it. The
-    -- offset is negative if there is no such place. Last, the room left in
-    -- the leaf that insertion went to, as far as known.
+  = -- | A tree, the unit and end offset of the last insertion, and the known
+    -- free space in its target leaf. A negative offset disables buffering
+    -- of a subsequent insertion.
     Settled
       (Node a)
       !Unit
       {-# UNPACK #-} !Int
       {-# UNPACK #-} !Int
-  | -- | A tree and a run of keystrokes at one spot of it which are yet to be
-    -- inserted. Typing on appends to the run, copying neither a leaf nor the
-    -- path to it; whoever wants to read the rope gets the first field, the
-    -- one lazy thing in here, which inserts the whole run at once.
+  | -- | A tree with a pending insertion. Further keystrokes extend the
+    -- buffer without copying a tree path. The first field lazily applies
+    -- the whole insertion when a reader needs the tree.
     --
-    -- The others: the tree without the run, the unit and the offset at
-    -- which the run is to go in, its text (at most 'maxPending' bytes), the
-    -- metrics of that text packed like those of a leaf, and the room left
-    -- for the run to grow.
+    -- Remaining fields: the base tree, insertion unit and offset, buffered
+    -- text (at most 'maxPending' bytes), its packed metrics, and remaining
+    -- buffer capacity.
     --
-    -- Every keystroke makes one of these, so it is kept small: where a
-    -- keystroke would continue the run and the metrics of everything are
-    -- worked out ('typingNext', 'metrics') rather than kept.
+    -- To keep this constructor small, @typingNext@ and 'metrics' calculate
+    -- the next insertion offset and total metrics rather than storing them.
     Typing
       (Lazy a)
       (Node a)
@@ -399,12 +381,12 @@ data Rope a
       {-# UNPACK #-} !PackedMetrics
       {-# UNPACK #-} !Int
 
--- | A node in a box. A node is never a thunk, but the box can be one: this
--- is how the tree of a 'Typing' rope is put off.
+-- | A lifted wrapper that can defer construction of an unlifted node.
+-- Used for the pending tree update in 'Typing'.
 data Lazy a = Lazy (Node a)
 
--- | The tree of a rope, with everything typed in it. Matching evaluates it,
--- as a node is unlifted: the keystrokes that were waiting go in.
+-- | Match or build a rope's tree. Matching applies pending input and
+-- returns the evaluated, unlifted root.
 pattern Rope :: Node a -> Rope a
 pattern Rope root <- (rootOf -> root)
   where
@@ -417,8 +399,8 @@ rootOf (Settled root _ _ _) = root
 rootOf (Typing (Lazy root) _ _ _ _ _ _) = root
 {-# INLINE rootOf #-}
 
--- | A node of the B-tree. It is unlifted and every field is strict, so there
--- is no such thing as a tree that is not fully built.
+-- | An unlifted B-tree node. Nodes cannot be thunks;
+-- custom annotations are evaluated only to weak head normal form.
 --
 -- Both constructors start with the metrics of their subtree, which is all
 -- that seeking reads of a node it does not descend into.
@@ -428,9 +410,8 @@ data Node a
     -- v'Leaf' matches and builds. The payload occupies the whole array:
     -- there is no offset or length to chase.
     --
-    -- None of the metrics of a leaf exceeds 'maxChunk', so the four of them
-    -- share a word, 16 bits each (see 'PackedMetrics'). Spelled out they made
-    -- the leaves of a document three words heavier each, some 4% of it.
+    -- All four metrics fit in 16 bits each (see 'PackedMetrics'), saving
+    -- three machine words per leaf on a 64-bit system.
     PackedLeaf
       {-# UNPACK #-} !PackedMetrics
       !a
@@ -450,11 +431,11 @@ pattern Leaf m a arr <- PackedLeaf (unpackMetrics -> !m) a arr
 
 {-# COMPLETE Leaf, Inner #-}
 
--- | The 'Metrics' of at most 65535 bytes of text, 16 bits each: bytes lowest,
--- then code points, UTF-16 code units and line feeds. 64 bits whatever the
--- machine's word is.
+-- | Four 16-bit counts in a 64-bit word, from low to high: bytes, code
+-- points, UTF-16 code units, and line feeds. Supports up to 65535 bytes.
 type PackedMetrics = Word64
 
+-- | Pack metrics whose fields each fit in 16 bits. Does not check bounds.
 packMetrics :: Metrics -> PackedMetrics
 packMetrics (Metrics b c u l) =
   fromIntegral b
@@ -463,6 +444,7 @@ packMetrics (Metrics b c u l) =
     .|. (fromIntegral l `unsafeShiftL` 48)
 {-# INLINE packMetrics #-}
 
+-- | Decode the four counts in a packed leaf metric.
 unpackMetrics :: PackedMetrics -> Metrics
 unpackMetrics w = Metrics (field 0) (field 16) (field 32) (field 48)
   where
@@ -492,8 +474,8 @@ nodeIsEmpty :: Node a -> Bool
 nodeIsEmpty node = nodeBytes node == 0
 {-# INLINE nodeIsEmpty #-}
 
--- | Not a constant: there are none of an unlifted type. It is four words to
--- whoever ends up with no text.
+-- | Construct an empty leaf. Unlifted values cannot be top-level constants,
+-- so this allocates a leaf for each empty result.
 emptyNode :: Monoid a => Node a
 emptyNode = PackedLeaf 0 mempty emptyByteArray
 {-# INLINE emptyNode #-}
@@ -501,9 +483,8 @@ emptyNode = PackedLeaf 0 mempty emptyByteArray
 ------------------------------------------------------------------------------
 -- Arrays of nodes
 
--- | The children of an inner node: a small array whose elements are
--- unlifted, which those of a 'Data.Primitive.SmallArray.SmallArray' cannot
--- be. What follows is as much of its interface as the tree needs.
+-- | A small array of unlifted child nodes. The wrappers below provide the
+-- subset of array operations needed by the tree.
 data Children a = Children (SmallArray# (Node a))
 
 data MutableChildren s a = MutableChildren (SmallMutableArray# s (Node a))
@@ -513,13 +494,13 @@ sizeofChildren :: Children a -> Int
 sizeofChildren (Children cs) = I# (sizeofSmallArray# cs)
 {-# INLINE sizeofChildren #-}
 
--- | The child at an index, which is not checked. A load, and no more: what
--- comes out of the array is a node, not something to evaluate to one.
+-- | Read a child without bounds checking. Unlifted elements need no
+-- evaluation check after loading.
 indexChildren :: Children a -> Int -> Node a
 indexChildren (Children cs) (I# i) = case indexSmallArray# cs i of (# node #) -> node
 {-# INLINE indexChildren #-}
 
--- | An array of so many children, all of them the given node.
+-- | Allocate an array filled with the supplied node.
 newChildren :: Int -> Node a -> ST s (MutableChildren s a)
 newChildren (I# n) node = ST $ \s -> case newSmallArray# n node s of
   (# s', m #) -> (# s', MutableChildren m #)
@@ -529,8 +510,7 @@ writeChildren :: MutableChildren s a -> Int -> Node a -> ST s ()
 writeChildren (MutableChildren m) (I# i) node = ST $ \s -> (# writeSmallArray# m i node s, () #)
 {-# INLINE writeChildren #-}
 
--- | @copyChildren dst d src off cnt@ copies @cnt@ children of @src@ from
--- @off@ on to @dst@ from @d@ on.
+-- | Copy @cnt@ children from @src@ at @off@ to @dst@ at @d@.
 copyChildren :: MutableChildren s a -> Int -> Children a -> Int -> Int -> ST s ()
 copyChildren (MutableChildren dst) (I# d) (Children src) (I# off) (I# cnt) =
   ST $ \s -> (# copySmallArray# src off dst d cnt s, () #)
@@ -554,31 +534,24 @@ runChildren (ST build) =
 ------------------------------------------------------------------------------
 -- Seeking
 
--- The seeks are not inlined, and they return strict records rather than
--- unboxed tuples: a record of unpacked fields comes back in registers, but
--- an 'Int' or a 'Metrics' inside an unboxed tuple is a heap object, one for
--- every level of every descent.
+-- Non-inlined workers with unpacked result records let GHC return these
+-- fields in registers. An unboxed tuple containing boxed Int or Metrics
+-- values can instead allocate at every tree level.
 
--- | A child, and the metrics of the children in front of it.
+-- | A child index and the total metrics of preceding children.
 data Seek = Seek {-# UNPACK #-} !Int {-# UNPACK #-} !Metrics
 
--- | A child, and an offset relative to it.
+-- | A child index and an offset within it.
 data Sought = Sought {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
--- | A child, an offset relative to it, and the bytes in front of it.
+-- | A child index, an offset within it, and the byte count before it.
 data SoughtBytes = SoughtBytes {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
--- | The child holding offset @k@ of a unit: the first one at which the
--- running total reaches @k@, or the last one. Comes with the metrics of the
--- children in front of it.
+-- | Find the first child whose cumulative count reaches @k@, or the last
+-- child. Also return the metrics of preceding children.
 --
--- Two loops, one to find the child and one to add up what is in front of
--- it. As one loop it had the four sums, the offset and the counters to
--- carry, more than there are registers to carry them in, and spent its time
--- moving them to the stack and back.
---
--- Like 'seekUnit' it is given what the node holds in all, and adds up the
--- children on the shorter side of the one it found.
+-- Find the child before summing metrics to reduce register pressure.
+-- Use the supplied total to sum whichever side is shorter.
 seekChild :: Unit -> Int -> Metrics -> Children a -> Seek
 seekChild !u !k !total !cs = case seekUnit u k (count u total) cs of
   Sought i _
@@ -588,13 +561,8 @@ seekChild !u !k !total !cs = case seekUnit u k (count u total) cs of
     n = sizeofChildren cs
 {-# NOINLINE seekChild #-}
 
--- | 'seekChild' for when nothing but the unit sought matters: the child and
--- the offset relative to it.
---
--- It is given how much of the unit the node holds in all, which the node
--- knows, and looks for an offset in the second half of that from the last
--- child backwards: a child is a pointer to follow, and this way it follows a
--- quarter of them on average rather than half.
+-- | Like 'seekChild', but return only the child index and relative offset.
+-- Use the supplied total to search from the nearer end of the node.
 seekUnit :: Unit -> Int -> Int -> Children a -> Sought
 seekUnit !u !k !total !cs = case u of
   Bytes -> scan bytes
@@ -624,7 +592,7 @@ seekUnit !u !k !total !cs = case u of
     {-# INLINE scan #-}
 {-# NOINLINE seekUnit #-}
 
--- | 'seekUnit' which also counts the bytes in front of the child.
+-- | Like 'seekUnit', also returning the byte count before the child.
 seekUnitBytes :: Unit -> Int -> Metrics -> Children a -> SoughtBytes
 seekUnitBytes !u !k !total !cs = case u of
   Bytes -> case seekUnit Bytes k (bytes total) cs of Sought i j -> SoughtBytes i j (k - j)
@@ -643,8 +611,8 @@ seekUnitBytes !u !k !total !cs = case u of
     {-# INLINE scan #-}
 {-# NOINLINE seekUnitBytes #-}
 
--- | The child holding the byte at offset @i@: the first one whose running
--- total exceeds @i@, or the last one. Comes with the offset relative to it.
+-- | Find the child containing byte @i@ and its relative offset. Unlike
+-- 'seekChild', an offset at a boundary selects the following child.
 seekByte :: Int -> Children a -> Sought
 seekByte !i !cs = go 0 i
   where
@@ -659,8 +627,8 @@ seekByte !i !cs = go 0 i
 ------------------------------------------------------------------------------
 -- Building inner nodes
 
--- | The annotation of a node with these children. A right fold, which for
--- the measure @()@ never gets going, because its '<>' does not look.
+-- | Combine child annotations with a right fold. The @()@ measure does not
+-- evaluate its arguments, so it avoids traversing the children.
 foldAnn :: Monoid a => Children a -> a
 foldAnn cs = go 0
   where
@@ -672,10 +640,8 @@ foldAnn cs = go 0
 
 -- | Metrics of children @off .. off + cnt - 1@.
 --
--- The children of a node are all leaves or none of them is. The metrics of
--- leaves are added up as they are packed, a word a leaf: no field of theirs
--- overflows into the next one, as the leaves of one node hold no more than
--- 'maxChildren' times 'maxChunk' of anything, which is less than 65536.
+-- Children all have the same height. For leaves, add packed counts directly:
+-- @maxChildren * maxChunk < 65536@ prevents carries between 16-bit fields.
 sumMetrics :: Children a -> Int -> Int -> Metrics
 sumMetrics !cs !off !cnt
   | cnt <= 0 = mempty
@@ -695,9 +661,8 @@ sumMetrics !cs !off !cnt
           Inner (Metrics b' c' w' l') _ _ _ -> spelled (i + 1) (b + b') (c + c') (w + w') (l + l')
           PackedLeaf{} -> unreachable "sumMetrics"
 
--- | An inner node of known height and metrics, out of at least one child.
--- Most nodes are built from pieces of others, whose metrics add up without
--- another look at the children.
+-- | Build an inner node with known height and metrics and at least one
+-- child. Reusing metrics avoids scanning the children again.
 inner :: Monoid a => Int -> Metrics -> Children a -> Node a
 inner h m cs = Inner m h (foldAnn cs) cs
 {-# INLINE inner #-}
@@ -802,8 +767,8 @@ contCount :: Word64 -> Int
 contCount w = byteSum ((w `unsafeShiftR` 7) .&. (complement w `unsafeShiftR` 6) .&. lows)
 {-# INLINE contCount #-}
 
--- | Number of leaders of 4-byte sequences (@1111xxxx@) in a word. These are
--- exactly the code points taking two UTF-16 code units.
+-- | Count 4-byte sequence leaders (@1111xxxx@). For valid UTF-8, each marks
+-- a code point requiring two UTF-16 code units.
 fourCount :: Word64 -> Int
 fourCount w =
   byteSum
@@ -837,7 +802,7 @@ swarMetrics !arr !off !len = goWord off 0 0 0
       | i + 8 <= end =
           let w = indexWord64 arr i
            in if w .&. highs == 0
-                then -- Eight bytes of ASCII, as most are.
+                then -- ASCII needs only the newline count.
                   goWord (i + 8) conts fours (nls + nlCount w)
                 else goWord (i + 8) (conts + contCount w) (fours + fourCount w) (nls + nlCount w)
       | otherwise = goByte i conts fours nls
@@ -926,8 +891,8 @@ swarScanUnits !wide !k !arr !from !to = goWord from 0
         u = if wide && b >= 0xF0 then 2 else 1
 {-# INLINE swarScanUnits #-}
 
--- | Is this all ASCII? Then bytes, code points and UTF-16 code units are the
--- same thing and nothing needs to be scanned to convert between them.
+-- | Whether the text is ASCII, so byte, code point, and UTF-16 offsets
+-- coincide without a scan.
 isAscii :: Metrics -> Bool
 isAscii m = bytes m == chars m
 {-# INLINE isAscii #-}
@@ -950,18 +915,16 @@ leafPrefixMetrics m arr b
   | otherwise = leafCutMetrics m arr b
 {-# INLINE leafPrefixMetrics #-}
 
--- | 'leafPrefixMetrics' for whoever knows the line feeds among those bytes
--- already, having counted them to get there: in a leaf that is all ASCII,
--- that is all there is to know, and nothing is scanned.
+-- | Like 'leafPrefixMetrics', with a known newline count. ASCII leaves
+-- need no additional scan.
 leafPrefixWithLines :: Metrics -> ByteArray -> Int -> Int -> Metrics
 leafPrefixWithLines m arr b nls
   | isAscii m && 0 < b && b < bytes m = Metrics b b b nls
   | otherwise = leafPrefixMetrics m arr b
 {-# INLINE leafPrefixWithLines #-}
 
--- | 'leafPrefixMetrics' of a cut inside the leaf. Apart from the above
--- because it never returns the metrics it is given, which then reach it
--- unboxed.
+-- | Measure a cut strictly inside a leaf. Kept separate from
+-- 'leafPrefixMetrics' so GHC can pass the input metrics unboxed.
 leafCutMetrics :: Metrics -> ByteArray -> Int -> Metrics
 leafCutMetrics !m !arr !b
   | 2 * b > size = m `subMetrics` leafSliceMetrics m arr b (size - b)
@@ -1063,14 +1026,13 @@ swarScanLines !k !arr = goWord 0 0
       | byteAt arr i == 0x0A = if n + 1 == k then i + 1 else goByte (i + 1) (n + 1)
       | otherwise = goByte (i + 1) n
 
--- | Where a line of a chunk starts, and where the @\\n@ that ends it is, or
--- the size of the chunk.
+-- | Byte offsets of a line's start and terminating @\\n@ within a chunk.
+-- A missing endpoint is represented by the chunk size.
 data ChunkLine = ChunkLine {-# UNPACK #-} !Int {-# UNPACK #-} !Int
   deriving (Eq, Show)
 
--- | Line @k@ of a chunk, which starts just after its @k@-th @\\n@, or at 0
--- for the first. 'scanLines' and 'findNewline' in one go, which is one foreign
--- call rather than two for whoever is after a line.
+-- | Find a chunk's zero-based line start and terminator in one scan entry
+-- point, avoiding separate foreign calls to 'scanLines' and 'findNewline'.
 chunkLine :: Int -> ByteArray -> ChunkLine
 chunkLine !k !arr
   | sizeofByteArray arr >= simdMin = cLineSpan simdLevel k arr
@@ -1085,10 +1047,11 @@ swarLineSpan !k !arr = ChunkLine from (swarFindNewline arr from)
 ------------------------------------------------------------------------------
 -- Scanning chunks with SIMD
 
--- | One implementation of the scans over chunks, as the functions above use
--- them. Exposed so that the test suite can hold them all to the same results.
+-- | A set of chunk scan implementations. Exposed so tests can compare
+-- every available implementation against the same model.
 data Kernels = Kernels
   { kernelsName :: String
+  -- ^ Implementation name, such as Haskell, SSE2, or AVX2.
   , kernelMetrics :: ByteArray -> Int -> Int -> Metrics
   -- ^ Like 'sliceMetrics'.
   , kernelNewlines :: ByteArray -> Int -> Int -> Int
@@ -1110,18 +1073,16 @@ data Kernels = Kernels
 swarKernels :: Kernels
 swarKernels = Kernels "Haskell" swarMetrics swarNewlines swarFindNewline swarFindNewlineBack swarScanUnits swarLineSpan
 
--- | Every implementation this machine runs: the Haskell one, then those in C
--- by level of SIMD support. The last one is used on long slices.
+-- | Available scans: Haskell, then C implementations in increasing SIMD
+-- order. The last is used on long slices. Without the @simd@ flag, only
+-- the Haskell implementation is included.
 kernels :: [Kernels]
 kernels = swarKernels : map simdKernels [0 .. simdLevel]
 
--- | Slices at least this long are scanned in C: long enough to make up for a
--- foreign call, which costs a few nanoseconds.
+-- | Minimum slice length for C scans, chosen to offset foreign-call overhead.
 --
--- The scans above choose between the C and the Haskell themselves, with calls
--- to known functions. Picked out of a t'Kernels' they were calls to unknown
--- ones wherever the choice did not inline away, with every argument and
--- result in a box.
+-- Dispatch directly to known functions. Selecting from a t'Kernels' record
+-- can leave indirect calls with boxed arguments and results when not inlined.
 simdMin :: Int
 
 -- | The best level of SIMD support of the machine, as the C numbers them.
@@ -1149,24 +1110,23 @@ cScanUnits :: Int -> Bool -> Int -> ByteArray -> Int -> Int -> Int
 cLineSpan :: Int -> Int -> ByteArray -> ChunkLine
 
 #ifdef NANO_ROPE_SIMD
--- The scans in C (cbits/scan.c), with SSE2 or AVX2. Unsafe calls, which may
--- be handed the payload of an unpinned array: the garbage collector cannot
--- run during one.
+-- Unsafe foreign calls keep the unpinned array payload stable for the call:
+-- GHC cannot perform a moving garbage collection until the call returns.
 
 #ifdef NANO_ROPE_SMALL
--- Everything, so that the tiny chunks of the test suite go through the C.
+-- Exercise C scans even with the test suite's tiny chunks.
 simdMin = 0
 #else
 simdMin = 32
 #endif
 
--- Asked once: a pure foreign call would be inlined into every scan and ask
--- again each time.
+-- Cache CPU detection. A pure foreign call could be inlined and repeated
+-- on every scan.
 simdLevel = unsafeDupablePerformIO c_simdLevel
 {-# NOINLINE simdLevel #-}
 
--- The C counts continuation bytes, 4-byte leaders and line feeds in 21 bits
--- each; chunks are nowhere near that long.
+-- C packs each count into 21 bits. Use Haskell for larger slices to avoid
+-- overflow (normal chunks are much smaller).
 cMetrics level arr@(ByteArray ba) off len
   | len >= 0x200000 = swarMetrics arr off len
   | otherwise =
@@ -1252,8 +1212,8 @@ concatSlices a offa la b offb lb = runByteArray $ do
   copyByteArray out la b offb lb
   pure out
 
--- | @spliceArray arr i j src off len@ replaces bytes @i .. j-1@ of @arr@ with
--- @len@ bytes of @src@.
+-- | @spliceArray arr i j src off len@ replaces bytes @[i, j)@ of @arr@
+-- with @len@ bytes of @src@ starting at @off@.
 spliceArray :: ByteArray -> Int -> Int -> ByteArray -> Int -> Int -> ByteArray
 spliceArray arr i j src soff slen = runByteArray $ do
   out <- newByteArray (sizeofByteArray arr - (j - i) + slen)
@@ -1262,8 +1222,7 @@ spliceArray arr i j src soff slen = runByteArray $ do
   copyByteArray out (i + slen) arr j (sizeofByteArray arr - j)
   pure out
 
--- | The byte at an offset of what 'spliceArray' makes of the same arguments,
--- without making it.
+-- | Read a byte from the result of 'spliceArray' without allocating that result.
 splicedByte :: ByteArray -> Int -> Int -> ByteArray -> Int -> Int -> Int -> Word8
 splicedByte arr i j src soff slen at
   | at < i = byteAt arr at
@@ -1271,13 +1230,12 @@ splicedByte arr i j src soff slen at
   | otherwise = byteAt arr (j + at - i - slen)
 {-# INLINE splicedByte #-}
 
--- | Bytes @from .. to-1@ of what 'spliceArray' makes of the same arguments,
--- without making it: a leaf that overflows goes straight into its two halves.
+-- | Copy bytes @[from, to)@ of a splice directly, without allocating the
+-- full splice. Used to split an overflowing leaf into two buffers.
 splicedSlice :: ByteArray -> Int -> Int -> ByteArray -> Int -> Int -> Int -> Int -> ByteArray
 splicedSlice !arr !i !j !src !soff !slen !from !to = runByteArray $ do
   out <- newByteArray (to - from)
-  -- What is spliced is three pieces, each the bytes from some offset of an
-  -- array; of each, what falls into the slice.
+  -- Copy the overlap with each piece: prefix, inserted text, and suffix.
   let piece !start !end source !sourceOff =
         let lo = max from start
             hi = min to end
@@ -1312,9 +1270,8 @@ leafSuffix b node = case node of
 -- Aiming a little below 'maxChunk' leaves room for moving every cut back to a
 -- code point boundary.
 --
--- Built from the top, every node straight into the array of its parent: with
--- the leaves in a list and a list for every level above them, loading made
--- two thirds of the text's size in garbage.
+-- Build top-down into each parent's child array, avoiding intermediate
+-- lists of leaves and levels.
 treeFromSlice :: Measure a => ByteArray -> Int -> Int -> Node a
 treeFromSlice !arr !off !len = node (levelSizes leaves) 0
   where
@@ -1350,8 +1307,7 @@ treeFromSlice !arr !off !len = node (levelSizes leaves) 0
 {-# INLINABLE treeFromSlice #-}
 {-# SPECIALIZE treeFromSlice :: ByteArray -> Int -> Int -> Node () #-}
 
--- | How many nodes each level of a tree over so many leaves has, from the
--- root down to the leaves.
+-- | Node counts per level for the given leaf count, from root to leaves.
 levelSizes :: Int -> [Int]
 levelSizes = go []
   where
@@ -1503,8 +1459,8 @@ fromChildren !h !m !cs
 ------------------------------------------------------------------------------
 -- Breaking
 
--- | Is offset @k@ at or beyond the end? The start of the last line is the
--- one offset equal to the total which is not necessarily the end.
+-- | Whether @k@ reaches the document end. In 'Lines', an offset equal to
+-- the newline count selects the final line start, which may precede the end.
 beyondEnd :: Unit -> Int -> Metrics -> Bool
 beyondEnd u k total = k > n || (k == n && u /= Lines)
   where
@@ -1535,9 +1491,8 @@ splitRoot u k root
 {-# INLINABLE splitRoot #-}
 {-# SPECIALIZE splitRoot :: Unit -> Int -> Node () -> (# Node (), Node () #) #-}
 
--- | Children @0 .. i-1@ of a node of height @h@, whose metrics are @before@,
--- followed by a lower tree, which may be empty or undersized: it is settled
--- with its sibling, and the rest is lined up once.
+-- | Join children @[0, i)@ (with metrics @before@) to a lower tree.
+-- Merge the boundary sibling as needed to repair an undersized root.
 joinLeft :: Measure a => Int -> Children a -> Int -> Metrics -> Node a -> Node a
 joinLeft !h !cs !i !before !l
   | i == 0 = l
@@ -1635,8 +1590,7 @@ metricsAtNode u k root
       Inner total _ _ cs -> case seekChild u j total cs of
         Seek i before -> go (acc <> before) (j - count u before) (indexChildren cs i)
 
--- | Just the byte offset of 'metricsAtNode', which is all that editing needs
--- and spares measuring the prefix of a leaf.
+-- | Find only the byte offset, avoiding prefix measurement within the leaf.
 byteOffsetAtNode :: Unit -> Int -> Node a -> Int
 byteOffsetAtNode u k root
   | k <= 0 = 0
@@ -1677,8 +1631,8 @@ sliceToText !i !j node
 
 -- | Copy bytes @i .. j-1@ of a node to offset @d@ of a buffer.
 --
--- Only the children at the two ends of the range can be cut by it. The ones
--- in between go to 'copyNode', and they are all of them for 'toText'.
+-- Only boundary children need partial copies. Copy fully covered subtrees
+-- with 'copyNode'.
 copyRange :: MutableByteArray s -> Int -> Int -> Int -> Node a -> ST s ()
 copyRange !out !d !i !j node = case node of
   Leaf _ _ arr -> copyByteArray out d arr i (j - i)
@@ -1697,9 +1651,8 @@ copyRange !out !d !i !j node = case node of
             when (lo < hi) $ copyRange out (d + lo - i) (lo - start) (hi - start) child
         go (c + 1) end
 
--- | Copy all of a node to offset @d@ of a buffer, and return the offset after
--- it. There is nothing to seek and nothing to clamp, which is worth an eighth
--- to a fifth of 'toText'. What is left is a @memcpy@ of the document.
+-- | Copy a whole subtree to buffer offset @d@ and return the next offset.
+-- Full-subtree copies need no seeking or bounds clamping.
 copyNode :: MutableByteArray s -> Int -> Node a -> ST s Int
 copyNode !out !d node = case node of
   Leaf _ _ arr -> do
@@ -1714,7 +1667,7 @@ copyNode !out !d node = case node of
         | otherwise = copyNode out d' (indexChildren cs c) >>= go (c + 1)
 
 -- | Locations of the start of line @l@ and of the end of its content, that
--- is before the terminating @\n@ or @\r\n@, or at the end of the rope.
+-- is before the terminating @\\n@ or @\\r\\n@, or at the end of the rope.
 data Span = Span {-# UNPACK #-} !Metrics {-# UNPACK #-} !Metrics
 
 lineSpan :: Int -> Node a -> Span
@@ -1742,9 +1695,8 @@ contentEnd arr from lf
   | otherwise = lf
 {-# INLINE contentEnd #-}
 
--- | The text of line @l >= 0@. A line that starts and is terminated within
--- one leaf, as most lines are, is found in a single descent and returned as
--- a view of that leaf.
+-- | Text of line @l >= 0@. If its start and terminator are in one leaf,
+-- return a view after one descent. Otherwise use the general range lookup.
 lineText :: Int -> Node a -> Text
 lineText !l root
   | l > newlines (nodeMetrics root) = T.empty
@@ -1763,8 +1715,8 @@ lineText !l root
     across = case lineSpan l root of
       Span start end -> sliceToText (bytes start) (bytes end) root
 
--- | The position of an offset. Found in a single descent if the line it is
--- on starts within the same leaf (as most lines do) or with the rope.
+-- | Find an offset's position. One descent suffices when its line starts
+-- in the same leaf or at the document start.
 positionAtNode :: Unit -> Unit -> Int -> Node a -> Position
 positionAtNode !from !to !k root
   | k <= 0 = Position 0 0
@@ -1799,16 +1751,15 @@ metricsAtPositionNode u pos root = case linePositionNode False u pos root of
   Span _ at -> at
 {-# INLINE metricsAtPositionNode #-}
 
--- | Where the line of a position starts, and where the position is. The
--- former only if asked for: it is not always free.
+-- | Locate a position, optionally computing its line start as well.
+-- When the line start is not requested, its field may repeat the position.
 linePositionNode :: Bool -> Unit -> Position -> Node a -> Span
 linePositionNode !wanted !u (Position l0 c) root
   | l > newlines (nodeMetrics root) = general
   | otherwise = go mempty l root
   where
     l = max 0 l0
-    -- A line that starts and is terminated within one leaf, as most lines
-    -- are, is found in a single descent.
+    -- Fast path: the line start and terminator are in the same leaf.
     go !acc !j node = case node of
       Leaf m _ arr -> case chunkLine j arr of
         ChunkLine from lf ->
@@ -1817,10 +1768,8 @@ linePositionNode !wanted !u (Position l0 c) root
             else
               let !to = contentEnd arr from lf
                   !b = column m arr from to
-                  -- The line starts after the j-th line feed of the leaf,
-                  -- and there is none between there and the column. The
-                  -- start of the line is the way back over the column,
-                  -- which is short, rather than another prefix to count.
+                  -- Reuse the known newline count. Recover the line start
+                  -- by measuring only the column, rather than another prefix.
                   !at = acc <> leafPrefixWithLines m arr b j
                in Span (if wanted then at `subMetrics` sliceOfLine m arr from b else at) at
       Inner total _ _ cs
@@ -1894,19 +1843,16 @@ metricsWhereNode p root
 ------------------------------------------------------------------------------
 -- Editing
 
--- | @editNode least u k d src off len@ replaces the text from offset @k@ up
--- to offset @k + d@ by a slice of a byte array /if/ that stays within one
--- leaf, in a single descent. This is what typing and erasing come to: the
--- leaf is copied once and the path to it is patched. A leaf that outgrows
--- 'maxChunk' splits in two and hands its parent another child, like in any
--- other B-tree. 'None' is a range across leaves, a leaf that would shrink
--- below 'minChunk' or more text than fits into two leaves.
+-- | Replace @[k, k + d)@ with a byte-array slice in one descent, if the
+-- range fits within one leaf. Copy the leaf and rebuild its path, splitting
+-- an overflowing leaf into two. Return 'None' if the range spans leaves,
+-- the leaf would shrink below @least@, or the result is too large to split.
 --
--- Comes with the room that is left in the leaf the new text ended up in.
+-- Also return a conservative estimate of free space in the target leaf.
 --
--- The first argument is the least size the leaf may shrink to: 'minChunk', or
--- nothing at all for a leaf that is the root. (It is not a 'Bool': with one,
--- GHC's constructor specialisation gets ahead of specialising the measure.)
+-- @least@ is 'minChunk', or zero for a root leaf. Using an integer rather
+-- than a Boolean avoids constructor specialisation preceding measure
+-- specialisation.
 editNode :: Measure a => Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node a -> (# Result a, Int# #)
 editNode !least u !k !d !src !soff !slen node = case node of
   Leaf m _ arr
@@ -1915,8 +1861,7 @@ editNode !least u !k !d !src !soff !slen node = case node of
     | size' < least || size' > 2 * maxChunk - 8 -> (# None, 0# #)
     | size' <= maxChunk -> roomy (One (mkLeafWith m' (spliceArray arr bi bj src soff slen))) (maxChunk - size')
     | otherwise ->
-        -- Room for moving the cut back to a code point boundary is what the
-        -- 8 bytes above are for.
+        -- The 8-byte margin above leaves room to align the split to UTF-8.
         let cut = boundary (size' `quot` 2)
             boundary !at
               | isContByte (splicedByte arr bi bj src soff slen at) = boundary (at - 1)
@@ -1948,8 +1893,8 @@ editNode !least u !k !d !src !soff !slen node = case node of
 {-# INLINABLE editNode #-}
 {-# SPECIALIZE editNode :: Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node () -> (# Result (), Int# #) #-}
 
--- | Replace the text from offset @i@ up to offset @j@. Comes with the room
--- of 'editNode', or none if it does not know.
+-- | Replace @[i, j)@, returning the free-space estimate from 'editNode'
+-- or zero when the general split-and-append path is needed.
 editRoot :: Measure a => Unit -> Int -> Int -> Text -> Node a -> (# Node a, Int# #)
 editRoot u i j t@(TI.Text (A.ByteArray ba) off len) root =
   case editNode (if nodeHeight root == 0 then 0 else minChunk) u from (max 0 (j - from)) (ByteArray ba) off len root of
@@ -1962,9 +1907,7 @@ editRoot u i j t@(TI.Text (A.ByteArray ba) off len) root =
           (# l, r #) -> (# l `appendNode` fromTextNode t `appendNode` r, 0# #)
   where
     from = max 0 i
-    -- Both offsets as bytes. Offsets of the original rope rather than of some
-    -- intermediate result, so that they round the same way as everywhere
-    -- else.
+    -- Resolve both endpoints in the original rope so rounding is consistent.
     bi = byteOffsetAtNode u i root
     bj = if j <= i then bi else byteOffsetAtNode u j root
 {-# INLINABLE editRoot #-}
@@ -1978,30 +1921,27 @@ edited u i j t root = case editRoot u i j t root of
 ------------------------------------------------------------------------------
 -- Typing
 
--- The run of keystrokes of a 'Typing' rope stands for one insertion, and it
--- has to come to the same as the insertions it is made of. For offsets in
--- bytes, code points or UTF-16 code units it does:
+-- Buffered input must produce the same text as individual insertions.
+-- For byte, code point, and UTF-16 offsets:
 --
 -- > insert u (max 0 i + n) t2 (insert u i t1 r) == insert u i (t1 <> t2) r
--- >   where n = count u (metrics t1)
+-- >   where n = count u (metrics (fromText t1))
 --
--- even if @i@ is clamped or rounded. Beyond the end, both insertions go to
--- the end. Inside a code point, @t1@ goes in front of that code point, and
--- @i + n@ is as far inside the same code point as @i@ was. Lines are out:
--- text does not end where the line after it starts.
+-- This also holds for clamped or rounded @i@: offsets beyond the end append,
+-- and offsets inside a code point retain the same displacement after @t1@.
+-- 'Lines' does not satisfy this rule, since inserted text need not end at
+-- a line boundary.
 --
--- Whoever reads the rope after every keystroke has the run inserted every
--- time, into the same tree. That is as good as inserting the keystrokes one
--- by one as long as the run fits into the leaf it goes to, which would
--- otherwise split over and over. So a run is given no more room than that
--- leaf has. The insertion before the run went to the same leaf and reports
--- it; should it be wrong, inserting the run is slower, not wrong.
+-- A read after each keystroke applies the growing buffer to its base tree.
+-- Limit buffering to the target leaf's estimated free space to avoid
+-- repeatedly splitting it. The preceding insertion supplies that estimate;
+-- an inaccurate estimate affects performance, not correctness.
 
 -- | A rope with a run of keystrokes, of the given metrics, to be inserted at
 -- an offset.
 typing :: Measure a => Node a -> Unit -> Int -> ByteArray -> Metrics -> Int -> Rope a
 typing base u start run typed room =
-  -- The box is the thunk: the run goes in when someone opens it.
+  -- The lifted wrapper defers the insertion until a reader needs the tree.
   let root = Lazy (edited u start start (chunkText run) base)
    in Typing root base u start run (packMetrics typed) room
 {-# INLINE typing #-}
@@ -2011,9 +1951,8 @@ typingNext :: Unit -> Int -> PackedMetrics -> Int
 typingNext u start typed = start + count u (unpackMetrics typed)
 {-# INLINE typingNext #-}
 
--- | Insert text at an offset. The first insertion at some place goes into the
--- tree and leaves a note of where it ended. One that starts there is taken
--- for typing and begins a run, which the ones after it add to.
+-- | Insert immediately at a new location and remember the endpoint.
+-- A subsequent insertion there may start or extend a bounded input buffer.
 insertText :: Measure a => Unit -> Int -> Text -> Rope a -> Rope a
 insertText u i t@(TI.Text (A.ByteArray ba) off len) r = case r of
   Typing lazyRoot base ru start run typed room
@@ -2036,9 +1975,8 @@ insertText u i t@(TI.Text (A.ByteArray ba) off len) r = case r of
 {-# INLINABLE insertText #-}
 {-# SPECIALIZE insertText :: Unit -> Int -> Text -> Rope () -> Rope () #-}
 
--- | Delete the text from offset @i@ up to offset @j > i@. Erasing the end of
--- what has just been typed shortens the run, given that the run is where its
--- offsets say, which is known of code points that are not beyond the end.
+-- | Delete @[i, j)@ for @j > i@. Shorten a buffered suffix directly when
+-- both operations use 'Chars' and the buffer's start was not clamped.
 deleteRange :: Measure a => Unit -> Int -> Int -> Rope a -> Rope a
 deleteRange u i j r = case r of
   Typing _ base Chars start run typed room
@@ -2129,13 +2067,13 @@ singleton :: Measure a => Char -> Rope a
 singleton = fromText . T.singleton
 {-# INLINE singleton #-}
 
--- | /O(n)/. The text is copied into chunks, except that a text of at most
--- 'maxChunk' bytes which owns its whole buffer is shared.
+-- | /O(n)/. Build a rope from strict text. Copies the text into chunks,
+-- unless it is at most 'maxChunk' bytes and occupies its entire backing buffer.
 fromText :: Measure a => Text -> Rope a
 fromText t = Rope (fromTextNode t)
 {-# INLINE fromText #-}
 
--- | /O(n)/.
+-- | Build a rope by appending the chunks of a lazy 'TL.Text'.
 fromLazyText :: Measure a => TL.Text -> Rope a
 fromLazyText = TL.foldlChunks (\acc t -> acc <> fromText t) empty
 {-# INLINABLE fromLazyText #-}
@@ -2143,15 +2081,16 @@ fromLazyText = TL.foldlChunks (\acc t -> acc <> fromText t) empty
 ------------------------------------------------------------------------------
 -- Deconstruction
 
--- | /O(n)/. A rope of a single chunk is converted without copying.
+-- | /O(n)/. Flatten the rope to strict text. A single chunk is shared
+-- without copying; multiple chunks are copied into one buffer.
 toText :: Rope a -> Text
 toText (Rope root) = sliceToText 0 (nodeBytes root) root
 
--- | /O(n)/, without copying any text: the lazy text shares the chunks.
+-- | /O(n)/. Convert to lazy text, sharing the chunk buffers.
 toLazyText :: Rope a -> TL.Text
 toLazyText = TL.fromChunks . toChunks
 
--- | /O(n)/.
+-- | /O(n)/. Decode the rope to a 'String'.
 toString :: Rope a -> String
 toString = TL.unpack . toLazyText
 
@@ -2160,12 +2099,11 @@ toString = TL.unpack . toLazyText
 toChunks :: Rope a -> [Text]
 toChunks = foldrChunks (:) []
 
--- | Lazy right fold over the chunks of 'toChunks'.
+-- | Lazy right fold over non-empty chunks in document order, without
+-- building the list returned by 'toChunks'.
 foldrChunks :: (Text -> b -> b) -> b -> Rope a -> b
--- The rope is behind a lambda, here and in foldlChunks': a fold is inlined
--- once it has the arguments left of the equals sign, and one written
--- "foldrChunks f z" would otherwise stay a call of an unknown f per chunk,
--- four times slower.
+-- Keep the rope argument behind a lambda, here and in foldlChunks', so GHC
+-- can inline a partial application and specialise the per-chunk function.
 foldrChunks f z = \(Rope root) -> foldrNode (f . chunkText) z root
 {-# INLINE foldrChunks #-}
 
@@ -2182,10 +2120,9 @@ foldrNode f = go
           | otherwise = go (children (i + 1)) (indexChildren cs i)
 {-# INLINE foldrNode #-}
 
--- | Strict left fold over the chunks of 'toChunks'. It is a walk of the tree
--- and allocates nothing of its own, where the list of 'toChunks' costs a
--- hundred bytes or so a chunk: the fold for whoever consumes a whole rope,
--- to hash it or to hand it to a parser or a socket.
+-- | Strict left fold over non-empty chunks in document order. Walks the
+-- tree directly, sharing text buffers and avoiding an intermediate list.
+-- Useful for consumers such as hashes and parsers.
 foldlChunks' :: (b -> Text -> b) -> b -> Rope a -> b
 foldlChunks' f z = \(Rope root) -> foldlNode' (\acc arr -> f acc (chunkText arr)) z root
 {-# INLINE foldlChunks' #-}
@@ -2206,14 +2143,12 @@ foldlNode' f = go
 ------------------------------------------------------------------------------
 -- Output
 
--- | Write the text to a handle as UTF-8, which is what the chunks hold
--- already: they are poured through one small buffer, and no 'Text' of the
--- whole document is made on the way as it would be by way of 'toText'.
+-- | /O(n)/. Write UTF-8 to a handle through a fixed-size buffer, without
+-- constructing a 'Text' for the whole document. See 'outputBuffer'.
 --
--- Like 'hPutBuf' this writes bytes. The encoding and the newline mode of the
--- handle have no say, so a @\\r\\n@ in the rope is a @\\r\\n@ in the file on
--- every platform. That is what a file, a pipe or a socket wants; a console
--- may not, and text for one is better off as 'toLazyText'.
+-- Like 'hPutBuf', this bypasses the handle's encoding and newline
+-- translation, preserving the rope's bytes on every platform. To use the
+-- handle's text encoding instead, pass 'toLazyText' to text I/O.
 hPutUtf8 :: Handle -> Rope a -> IO ()
 hPutUtf8 h (Rope root) = do
   buf <- newPinnedByteArray outputBuffer
@@ -2221,12 +2156,10 @@ hPutUtf8 h (Rope root) = do
     I# used <- pourNode h buf ptr 0 root
     flushBuffer h ptr used
 
--- | Copy a node into a buffer of 'outputBuffer' bytes, @used@ of which are
--- taken, writing the buffer out whenever the next chunk would not fit.
--- Returns how much of it is taken then.
+-- | Copy a subtree into the output buffer, starting at @used@. Flush when
+-- the next chunk would not fit, and return the number of bytes left buffered.
 --
--- At the top level for the sake of that number: as a loop local to
--- 'hPutUtf8' it was a box for every chunk.
+-- Kept at the top level so GHC can unbox the returned count.
 pourNode :: Handle -> MutableByteArray RealWorld -> Ptr Word8 -> Int -> Node a -> IO Int
 pourNode h !buf !ptr used@(I# used#) node = case node of
   Leaf _ _ arr
@@ -2243,31 +2176,30 @@ pourNode h !buf !ptr used@(I# used#) node = case node of
         | c >= n = pure used'
         | otherwise = pourNode h buf ptr used' (indexChildren cs c) >>= go (c + 1)
 
--- | Write out what is in the buffer.
+-- | Write the occupied part of the buffer.
 --
--- 'hPutBuf' wants the number in a box. It is made here, out of sight: a
--- function that hands on a box it was given is given one by its callers in
--- turn, and for 'pourNode' that was a box for every chunk.
+-- Box the count only at the 'hPutBuf' call. Keeping that conversion here
+-- avoids propagating boxed counts through 'pourNode'.
 flushBuffer :: Handle -> Ptr Word8 -> Int# -> IO ()
 flushBuffer h ptr used# = when (used > 0) $ hPutBuf h ptr used
   where
     used = I# used#
 {-# NOINLINE flushBuffer #-}
 
--- | Write the text to a file as UTF-8 with 'hPutUtf8', replacing what was
--- there.
+-- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents.
 --
--- The rope is evaluated first, keystrokes that were waiting and their
--- measure included: should that fail, the file is as it was.
+-- Evaluates the tree, including pending input and annotations to weak head
+-- normal form, before opening the file. An evaluation failure at this stage
+-- leaves an existing file untouched. The write itself is not atomic.
 writeFileUtf8 :: FilePath -> Rope a -> IO ()
 writeFileUtf8 path rope@(Rope _) = withBinaryFile path WriteMode (`hPutUtf8` rope)
 
 -- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
--- offset; empty exactly when the offset is at or beyond the end.
+-- offset. Returns empty text when the clamped offset is at the end.
 --
--- This is the shape of a parser's read callback (such as tree-sitter's
--- @TSInput@): ask for the text at a byte offset, consume it, ask again at
--- the following offset.
+-- For a parser read callback, request a byte offset, consume the returned
+-- text, then advance by its byte length. Offsets are clamped and rounded
+-- as described at 'Unit'.
 chunkAt :: Unit -> Int -> Rope a -> Text
 chunkAt u k (Rope root)
   | b >= nodeBytes root = T.empty
@@ -2282,7 +2214,7 @@ chunkAt u k (Rope root)
 ------------------------------------------------------------------------------
 -- Queries
 
--- | /O(1)/.
+-- | /O(1)/. Whether the rope is empty, including pending input.
 null :: Rope a -> Bool
 null r = bytes (metrics r) == 0
 {-# INLINE null #-}
@@ -2292,19 +2224,22 @@ length :: Unit -> Rope a -> Int
 length u = count u . metrics
 {-# INLINE length #-}
 
--- | /O(1)/. Number of lines: one more than the number of @\\n@, so that the
--- valid line indices are @[0 .. lineCount - 1]@. The last line may be empty.
+-- | /O(1)/. Number of @\\n@ characters plus one. An empty rope has one line;
+-- a trailing @\\n@ adds an empty final line. Valid indices range from zero
+-- to @lineCount rope - 1@. See 'lines' for a list that omits that final empty line.
 lineCount :: Rope a -> Int
 lineCount r = newlines (metrics r) + 1
 {-# INLINE lineCount #-}
 
--- | /O(1)/. All built-in measurements of the rope.
+-- | /O(1)/. All built-in measurements, including pending input.
 metrics :: Rope a -> Metrics
 metrics (Settled root _ _ _) = nodeMetrics root
 metrics (Typing _ base _ _ _ typed _) = nodeMetrics base <> unpackMetrics typed
 {-# INLINE metrics #-}
 
--- | /O(1)/. The custom measure of the rope.
+-- | /O(1)/ on an evaluated tree. Return the cached custom measure.
+-- Applies any pending insertion first, which may take /O(log n)/ plus
+-- the cost of updating the measure.
 measure :: Rope a -> a
 measure (Rope root) = nodeAnn root
 {-# INLINE measure #-}
@@ -2316,15 +2251,15 @@ height (Rope root) = nodeHeight root
 ------------------------------------------------------------------------------
 -- Combining and breaking
 
--- | /O(log n)/, more precisely proportional to the difference in height.
--- Same as '<>'.
+-- | /O(log n)/. Concatenate two ropes, sharing unaffected subtrees.
+-- Equivalent to '<>'. The traversal follows the difference in tree heights.
 append :: Measure a => Rope a -> Rope a -> Rope a
 append (Rope l) (Rope r) = Rope (appendNode l r)
 {-# INLINABLE append #-}
 
 -- | /O(log n)/. Split at an offset, clamped to the rope and rounded down to
--- a code point boundary (see 'Unit'). Both halves come out of one descent;
--- 'take' and 'drop' are cheaper if you are after just one of them.
+-- a code point boundary (see 'Unit'). Finds both halves in one descent.
+-- Use 'take' or 'drop' if you need only one half.
 --
 -- >>> splitAt Lines 1 "fst\nsnd\n"
 -- ("fst\n","snd\n")
@@ -2333,21 +2268,20 @@ splitAt u k (Rope root) = case splitRoot u k root of
   (# l, r #) -> (Rope l, Rope r)
 {-# INLINABLE splitAt #-}
 
--- | /O(log n)/. The prefix up to an offset.
+-- | /O(log n)/. The prefix before an offset, clamped and rounded as in 'splitAt'.
 take :: Measure a => Unit -> Int -> Rope a -> Rope a
 take u k (Rope root) = Rope (takeRoot u k root)
 {-# INLINABLE take #-}
 
--- | /O(log n)/. The suffix from an offset.
+-- | /O(log n)/. The suffix from an offset, clamped and rounded as in 'splitAt'.
 drop :: Measure a => Unit -> Int -> Rope a -> Rope a
 drop u k (Rope root) = Rope (dropRoot u k root)
 {-# INLINABLE drop #-}
 
--- | /O(log n)/. @slice u i j@ is the text from offset @i@ up to offset @j@.
---
--- Nothing above the lowest node that holds all of the range is looked at
--- twice or rebuilt, and a range within a single chunk is one descent and a
--- copy of those bytes.
+-- | /O(log n)/. Extract the half-open range @[i, j)@. Both offsets are
+-- clamped and rounded in the original rope. Returns empty when @j <= i@.
+-- Descends both endpoints together, avoiding reconstruction above the
+-- lowest node containing the range.
 slice :: Measure a => Unit -> Int -> Int -> Rope a -> Rope a
 slice u i j (Rope root)
   | j <= i || j <= 0 = empty
@@ -2355,18 +2289,14 @@ slice u i j (Rope root)
   | otherwise = Rope (sliceNode u (max 0 i) j root)
 {-# INLINABLE slice #-}
 
--- | The lowest node holding all of offsets @i@ up to @j@, with both rebased
--- on it.
+-- | The lowest node containing a range, with both offsets relative to it.
 data Sliced a = Sliced !(Node a) {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
 -- | Follow both ends of a range down as long as they lead into the same
 -- child, for @0 <= i < j@ and @j@ not beyond the end.
 --
--- The one place 'slice' and 'sliceText' part ways: they take the range to
--- the same node by the same steps, and only what they make of it there
--- differs. The offsets are of the original rope all along rather than of
--- some intermediate result, so that they round the same way as each other
--- and as everywhere else.
+-- Shared descent for 'slice' and 'sliceText'. Both endpoints remain relative
+-- to the original text, so rounding is consistent across the two operations.
 sliceDescend :: Unit -> Int -> Int -> Node a -> Sliced a
 sliceDescend !u !i !j node = case node of
   Leaf{} -> Sliced node i j
@@ -2395,9 +2325,9 @@ sliceNode u i j root = case sliceDescend u i j root of
 {-# INLINABLE sliceNode #-}
 {-# SPECIALIZE sliceNode :: Unit -> Int -> Int -> Node () -> Node () #-}
 
--- | /O(log n + length of the result)/. Like 'slice', but straight to 'Text'
--- without building a rope in between. A range within a single chunk is
--- found in one descent and returned as a zero-copy view of that chunk.
+-- | /O(log n + result bytes)/. Like 'slice', but returns 'Text' directly.
+-- A range within one chunk is found in one descent and returned as a
+-- zero-copy view; a range spanning chunks is copied into one buffer.
 sliceText :: Unit -> Int -> Int -> Rope a -> Text
 sliceText u i j (Rope root)
   | j <= i || j <= 0 = T.empty
@@ -2416,39 +2346,40 @@ sliceTextNode u i j root = case sliceDescend u i j root of
 ------------------------------------------------------------------------------
 -- Editing
 
--- | /O(log n + length of the text)/. Insert text at an offset.
+-- | /O(log n + inserted bytes)/. Insert text at a clamped, code-point-aligned
+-- offset. Empty input leaves the rope unchanged.
 --
--- An insertion confined to one chunk, as nearly all are, copies that chunk
--- and the path to it and nothing else; a chunk that overflows splits in two.
+-- Small insertions copy the affected chunk and its path through the tree.
+-- An overflowing chunk can split in two.
 --
--- Typing is cheaper still. An insertion that starts where the one before it
--- ended (in the same unit, which is not 'Lines') is held back: up to
--- 'maxPending' bytes of such keystrokes wait next to the tree and go into it
--- at once, when the rope is read or edited elsewhere. A keystroke then costs
--- a copy of what is waiting, /O(1)/, and 'length' and 'metrics' answer without
--- looking at the tree. This is the one lazy spot of a rope: evaluating it to
--- weak head normal form leaves up to one such insertion undone.
+-- Consecutive insertions in the same unit ('Bytes', 'Chars', or 'Utf16')
+-- can use a buffer of up to 'maxPending' bytes, limited by the target chunk's
+-- free space. Updating that bounded buffer is /O(1)/ in document size.
+-- A tree read, an edit elsewhere, or an insertion that exceeds the buffer's
+-- capacity forces the pending insertion. 'length' and 'metrics' include
+-- pending input without forcing it.
+-- Evaluating a rope to weak head normal form may leave this insertion deferred.
 insert :: Measure a => Unit -> Int -> Text -> Rope a -> Rope a
 insert u i t r
   | T.null t = r
   | otherwise = insertText u i t r
 {-# INLINABLE insert #-}
 
--- | /O(log n)/. @delete u i j@ removes the text from offset @i@ up to
--- offset @j@. Erasing the end of what was just typed (see 'insert') by code
--- points is /O(1)/ as well.
+-- | /O(log n)/. Remove the half-open range @[i, j)@, clamping and rounding
+-- both offsets in the original rope. Does nothing when @j <= i@.
+-- Deleting a suffix of buffered 'Chars' input can take /O(1)/; see 'insert'.
 delete :: Measure a => Unit -> Int -> Int -> Rope a -> Rope a
 delete u i j r
   | j <= i = r
   | otherwise = deleteRange u i j r
 {-# INLINABLE delete #-}
 
--- | /O(log n + length of the text)/. @replace u i j t@ replaces the text
--- from offset @i@ up to offset @j@ by @t@.
+-- | /O(log n + inserted bytes)/. Replace the half-open range @[i, j)@ with
+-- text, clamping and rounding both offsets in the original rope. When
+-- @j <= i@, insert at @i@ instead.
 --
--- An edit confined to one chunk that neither overflows nor underflows, as
--- nearly all keystrokes are, copies that chunk and the path to it and
--- nothing else.
+-- An edit that stays within one chunk and keeps it within its size bounds
+-- copies only that chunk and the path to it.
 replace :: Measure a => Unit -> Int -> Int -> Text -> Rope a -> Rope a
 replace u i j t r
   | j <= i = insert u i t r
@@ -2467,16 +2398,14 @@ getLine l (Rope root)
   | l < 0 = T.empty
   | otherwise = lineText l root
 
--- | /O(n)/. The lines of the rope without their terminators, lazily. Like
--- 'Data.Text.lines', a trailing @\\n@ does not start another line; unlike
--- it, @\\r\\n@ is stripped too. Lines within a single chunk are zero-copy
--- views.
+-- | /O(n)/. Lines without their @\\n@ or @\\r\\n@ terminators, produced
+-- lazily. Returns @[]@ for an empty rope and omits the empty line after a
+-- trailing @\\n@. A lone @\\r@ is preserved. Lines within one chunk share
+-- its buffer.
 lines :: Rope a -> [Text]
 lines (Rope root) = go [] (foldrNode (:) [] root)
   where
-    -- The pieces of an unfinished line, last one first. Never just empty
-    -- pieces: a piece is only carried over if it is the non-empty rest of a
-    -- chunk.
+    -- Carry non-empty pieces of an unfinished line in reverse order.
     go carry [] = [T.concat (reverse carry) | not (L.null carry)]
     go carry (arr : arrs) = from carry arr 0 arrs
     from carry arr i arrs
@@ -2493,9 +2422,8 @@ lines (Rope root) = go [] (foldrNode (:) [] root)
 ------------------------------------------------------------------------------
 -- Conversions
 
--- | /O(log n)/. The 'Metrics' of the prefix ending at an offset, in other
--- words the same location expressed in every unit at once. The offset is
--- clamped and rounded as described at 'Unit'.
+-- | /O(log n)/. Measure the prefix ending at an offset to express that
+-- location in all four units. The offset is clamped and rounded as in 'splitAt'.
 --
 -- >>> metricsAt Chars 3 "a😀\nb"
 -- Metrics {bytes = 6, chars = 3, utf16Units = 4, newlines = 1}
@@ -2515,12 +2443,12 @@ convert from to k = count to . metricsAt from k
 ------------------------------------------------------------------------------
 -- Positions
 
--- | /O(log n)/. Split at a line and column, the column counted in the given
--- unit. A column beyond the end of the line is clamped to the end of its
--- content (before the @\\n@ or @\\r\\n@) and a line beyond the last one to the
--- end of the rope, as the Language Server Protocol asks for. (Columns counted
--- in 'Lines' are accepted for uniformity: any positive one is the end of the
--- line.)
+-- | /O(log n)/. Split at a zero-based line and column, with the column in
+-- the given unit. Negative coordinates clamp to zero. A column beyond the
+-- line's content clamps to before its @\\n@ or @\\r\\n@; a line beyond the
+-- document clamps to its end. Offsets inside code points round down.
+-- For 'Lines' columns, zero means the line start and any positive value
+-- means the end of its content.
 splitAtPosition :: Measure a => Unit -> Position -> Rope a -> (Rope a, Rope a)
 splitAtPosition u pos r = splitAt Bytes (bytes (metricsAtPosition u pos r)) r
 {-# INLINE splitAtPosition #-}
@@ -2530,14 +2458,10 @@ splitAtPosition u pos r = splitAt Bytes (bytes (metricsAtPosition u pos r)) r
 metricsAtPosition :: Unit -> Position -> Rope a -> Metrics
 metricsAtPosition u pos (Rope root) = metricsAtPositionNode u pos root
 
--- | /O(log n)/. Where the line of a position starts, and 'metricsAtPosition':
--- @('metricsAt' 'Lines' line, 'metricsAtPosition' u position)@, out of one
--- descent where those are two.
---
--- The difference of the two is the column that was reached, in every unit
--- at once. That converts a column from one unit to another, and tells a
--- column that was clamped to the end of its line, or rounded down to the
--- start of a code point, from one that is where it was asked for:
+-- | /O(log n)/. Return prefix metrics for the line start and the position,
+-- sharing their lookup. Clamps coordinates as in 'metricsAtPosition'.
+-- Subtract corresponding counts to get the reached column in any unit.
+-- Comparing it with the requested column detects clamping or rounding:
 --
 -- >>> let (line, at) = metricsAtLineAndPosition Utf16 (Position 1 3) "a😀\nb😀c"
 -- >>> (utf16Units at - utf16Units line, chars at - chars line, bytes at)
@@ -2548,12 +2472,15 @@ metricsAtLineAndPosition u pos (Rope root) = case linePositionNode True u pos ro
 {-# INLINE metricsAtLineAndPosition #-}
 
 -- | /O(log n)/. The position, with its column in the given unit, of a
--- location obtained from 'metricsAt', 'metricsAtPosition' or 'metricsWhere'.
+-- location obtained from 'metricsAt', 'metricsAtPosition', or 'metricsWhere'
+-- on the same rope. Does not clamp or validate the supplied metrics.
 metricsToPosition :: Unit -> Metrics -> Rope a -> Position
 metricsToPosition u m (Rope root) = positionOfMetrics u m root
 
 -- | /O(log n)/. @offsetToPosition from to@ turns an offset in unit @from@
 -- into a position with its column in unit @to@.
+-- An offset inside a line terminator remains there; converting the result
+-- back with 'positionToOffset' clamps it to the end of the line's content.
 --
 -- >>> offsetToPosition Bytes Utf16 11 "a😀\nb😀c"
 -- Position {posLine = 1, posColumn = 3}
@@ -2562,6 +2489,7 @@ offsetToPosition from to k (Rope root) = positionAtNode from to k root
 
 -- | /O(log n)/. @positionToOffset from to@ turns a position with its column
 -- in unit @from@ into an offset in unit @to@.
+-- Coordinates are clamped as in 'splitAtPosition'.
 --
 -- >>> positionToOffset Utf16 Bytes (Position 1 3) "a😀\nb😀c"
 -- 11
@@ -2572,18 +2500,19 @@ positionToOffset from to pos = count to . metricsAtPosition from pos
 ------------------------------------------------------------------------------
 -- Custom measures
 
--- | /O(log n)/. Split where a predicate on the measurements of the prefix
--- turns true: the first half is the longest prefix (of whole code points)
--- for which the predicate is false. The predicate has to be monotone, that
--- is stay true once it is true.
+-- | /O(log n)/ for constant-time measure combination and predicates.
+-- Split after the longest code-point-aligned prefix for which the predicate
+-- is false. The predicate receives both built-in metrics and the custom
+-- measure, and must stay true once it becomes true as the prefix grows.
 --
--- For example, with a measure of display width, the part of a line that fits
--- into 80 columns is @fst . splitWhere (\\_ w -> w > 80)@.
+-- If true for the empty prefix, split at the start; if never true, split
+-- at the end. See "Data.Text.NanoRope.Measured" for a tab-count example.
 splitWhere :: Measure a => (Metrics -> a -> Bool) -> Rope a -> (Rope a, Rope a)
 splitWhere p r = splitAt Bytes (bytes (metricsWhere p r)) r
 {-# INLINE splitWhere #-}
 
--- | /O(log n)/. The location where 'splitWhere' splits.
+-- | Prefix metrics at the split point chosen by 'splitWhere', without
+-- constructing either half. Has the same search cost as 'splitWhere'.
 metricsWhere :: Measure a => (Metrics -> a -> Bool) -> Rope a -> Metrics
 metricsWhere p (Rope root) = metricsWhereNode p root
 {-# INLINABLE metricsWhere #-}
@@ -2607,8 +2536,8 @@ remeasure (Rope root) = Rope (go root)
 ------------------------------------------------------------------------------
 -- Debugging
 
--- | Violated invariants of the tree; empty for every rope you can build
--- through the public interface with a lawful 'Measure'.
+-- | List violated tree invariants. Returns @[]@ for ropes built through
+-- the public API with a lawful 'Measure'.
 invariants :: (Measure a, Eq a) => Rope a -> [String]
 invariants rope = case rope of
   Settled root _ _ _ -> go True root
@@ -2632,7 +2561,7 @@ invariants rope = case rope of
               ++ [ "leaf caches a wrong annotation" | a /= measureChunk (chunkText arr) ]
       Inner m h a cs ->
         let n = sizeofChildren cs
-            -- In boxes: there is no list of what is unlifted.
+            -- Lists require lifted elements, so wrap each unlifted node.
             kids = [Lazy (indexChildren cs i) | i <- [0 .. n - 1]]
             total = mconcat [nodeMetrics c | Lazy c <- kids]
          in [ "inner node with " ++ show n ++ " children is too large" | n > maxChildren ]

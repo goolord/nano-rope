@@ -1,7 +1,5 @@
--- | Draws the results of the benchmarks as an SVG chart: the time and the
--- allocation of every workload, library against library, and the heap each
--- library needs to hold the document. The numbers come back from the CSV
--- file that tasty-bench writes.
+-- | Render benchmark timings, allocation, and retained heap as an SVG chart.
+-- Timings and allocation come from tasty-bench's CSV output.
 module Chart
   ( Chart (..)
   , Group (..)
@@ -26,16 +24,15 @@ data Sample = Sample
   -- ^ Bytes allocated per run, when the RTS keeps statistics.
   }
 
--- | The live heap a library needs to hold the document in some state.
+-- | Retained heap for a document in a given state.
 data Footprint = Footprint
   { footprintState :: String
   , footprintLibrary :: String
   , footprintBytes :: Double
   }
 
--- | A line of the chart: one task, run on the rope in one or more states.
--- Each run is the name of a state, which goes unsaid for a single run, and
--- the workload that measures it.
+-- | One chart row with a label and (state, workload) pairs. State labels
+-- are hidden when the row has only one run.
 data Row = Row String [(String, String)]
 
 data Group = Group String [Row]
@@ -45,13 +42,13 @@ data Chart = Chart
   , chartSubtitle :: String
   , chartNotes :: [String]
   , chartLibraries :: [String]
-  -- ^ Every library the benchmarks know, the subject first. A library keeps
-  -- its colour and shape whether or not the others ran.
+  -- ^ All known libraries, with the subject first. Order keeps colours and
+  -- shapes consistent even when only some libraries run.
   , chartGroups :: [Group]
-  -- ^ Workloads left out of these are drawn in a group of their own.
+  -- ^ Workload groups. Ungrouped results appear in an additional section.
   , chartSamples :: [Sample]
   , chartSkipped :: [(String, String)]
-  -- ^ Workloads a library is left out of for being too slow.
+  -- ^ Workload/library pairs omitted because of run time.
   , chartTextHeap :: Maybe Double
   -- ^ The live heap of the document as one plain 'Data.Text.Text'.
   , chartFootprints :: [Footprint]
@@ -98,7 +95,7 @@ csvRows s = let (row, rest) = fields s in row : csvRows rest
 ------------------------------------------------------------------------------
 -- Layout
 
--- | Columns: the labels, the plots, and the factor nano-rope wins or loses by.
+-- | Column positions for labels, plots, and relative performance factors.
 width, margin, stateX, timeX0, timeX1, allocX0, allocX1, factorX :: Double
 width = 900
 margin = 20
@@ -114,7 +111,7 @@ runH, rowPad :: Double
 runH = 24
 rowPad = 6
 
--- | Something of a given height that draws itself below a given top.
+-- | A block's height and a renderer taking its top coordinate.
 type Block = (Double, Double -> [String])
 
 stack :: Double -> [Block] -> (Double, [String])
@@ -137,9 +134,8 @@ render c =
     (bottom, body) = stack 0 (header c : timePanel c ++ memoryPanel c ++ [notes c])
     height = bottom + 16
 
--- | The palette's first slot and the three that stay apart from it and from
--- each other in both modes and under colour blindness. Any two can sit side
--- by side in a row, so every pair counts, and the shapes carry identity too.
+-- | Light and dark palettes. Distinct marker shapes provide an additional
+-- way to identify libraries without relying on colour alone.
 style :: String
 style =
   concat
@@ -174,7 +170,7 @@ style =
     , ".hit{fill:transparent}.run:hover .hit{fill:var(--hover)}"
     ]
 
--- | The libraries that took part, with their slot.
+-- | Libraries present in the results, paired with their stable palette slot.
 present :: Chart -> [(Int, String)]
 present c =
   [ (i, l)
@@ -219,7 +215,7 @@ groupHeading title = (38, \y -> [text margin (y + 27) [("class", "gh")] title])
 ------------------------------------------------------------------------------
 -- Time and allocation
 
--- | Every group, and one more for the workloads none of them takes.
+-- | Configured groups followed by any ungrouped workloads.
 groups :: Chart -> [Group]
 groups c = chartGroups c ++ [Group "Other" [Row w [("", w)] | w <- rest] | not (null rest)]
   where
@@ -288,12 +284,13 @@ timeRow c times bytes (Row label runs) =
         tip =
           unlines $
             (label ++ (if null state then "" else ", " ++ state))
-              : [ l ++ ": " ++ maybe (if (w, l) `elem` chartSkipped c then "too slow to run" else "cannot do this") describe s                | (_, l, s) <- cells
+              : [ l ++ ": " ++ maybe (if (w, l) `elem` chartSkipped c then "omitted: run time" else "not benchmarked") describe s
+                | (_, l, s) <- cells
                 ]
         describe s = showSeconds (sampleSeconds s) ++ maybe "" (\a -> ", " ++ showBytes a ++ " allocated") (sampleAllocated s)
 
--- | Decade gridlines, labelled at the top and again at the bottom where a
--- long panel ends, no closer than a label needs.
+-- | Logarithmic gridlines with labels above and below the panel, spaced
+-- to avoid overlapping text.
 logAxis :: (Int, Int) -> (Int -> String) -> (Double, Double) -> Double -> Double -> Double -> Double -> [String]
 logAxis scale@(lo, hi) label (x0, x1) topLabelY top bottom bottomLabelY =
   line x0 top x1 top "a"
@@ -404,8 +401,8 @@ niceStep v = case [s | s <- map (* 10 ^^ p) [1, 2, 2.5, 5], v / s <= 6] of
 ------------------------------------------------------------------------------
 -- Marks
 
--- | The marks of a run, joined by a line from the least to the greatest, the
--- subject's drawn last.
+-- | Connect a run's smallest and largest values, then draw its markers.
+-- Draw the subject last so it remains visible when markers overlap.
 dots :: Double -> [(Int, Double)] -> [String]
 dots _ [] = []
 dots cy ms =
@@ -428,8 +425,8 @@ mark' cls0 i x y = case i `mod` 4 of
     cls = ("class", cls0 ++ " s" ++ show i)
     polygon ps = tag "polygon" [cls, ("points", unwords [num px ++ "," ++ num py | (px, py) <- ps])] []
 
--- | How the subject compares to the best of the others, as a factor: the
--- smaller value wins.
+-- | Ratio to the lowest comparison value, with differences below 5%
+-- labelled as approximately equal.
 factor :: Double -> String -> String -> [(Double, [Double])] -> [String]
 factor cy better worse cmp = case cmp of
   [(mine, others@(_ : _))] ->
@@ -441,7 +438,7 @@ factor cy better worse cmp = case cmp of
      in [ text factorX (cy + 5) [("class", cls), ("text-anchor", "end")] n
         , text (factorX + 6) (cy + 4) [("class", "qw")] s
         ]
-  [(_, [])] -> [text factorX (cy + 4) [("class", "qw"), ("text-anchor", "end")] "no other can"]
+  [(_, [])] -> [text factorX (cy + 4) [("class", "qw"), ("text-anchor", "end")] "no comparison"]
   _ -> []
   where
     times x
@@ -451,7 +448,7 @@ factor cy better worse cmp = case cmp of
 hit :: Double -> Double -> String
 hit y h = tag "rect" [("class", "hit"), ("x", num (margin - 8)), ("y", num y), ("width", num (width - 2 * margin + 16)), ("height", num h), ("rx", "4")] []
 
--- | Words into lines of at most so many characters.
+-- | Wrap at word boundaries. A single word longer than the limit stays intact.
 wrapAt :: Int -> String -> [String]
 wrapAt n = go . words
   where
@@ -491,12 +488,12 @@ num v = let s = showFFloat (Just 1) v "" in if drop (length s - 2) s == ".0" the
 sig :: Double -> String
 sig v = showFFloat (Just (if v >= 100 then 0 else if v >= 10 then 1 else 2)) v ""
 
--- | A quantity in the largest unit that leaves a digit in front of the
--- point, of those a thousand apart from the given power of ten up.
+-- | Format a quantity in the largest supplied unit with a value of at
+-- least one, falling back to the smallest unit. Units are powers of 1000.
 scaled :: Int -> [String] -> (Double -> String) -> Double -> String
 scaled e0 units shown v = last [shown (scale e) ++ u | (e, u) <- zip [e0, e0 + 3 ..] units, e == e0 || v >= 10 ^^ e]
   where
-    -- By a whole number either way, which is exact where its inverse is not.
+    -- Multiply or divide by an integer scale to avoid reciprocal rounding.
     scale e = if e < 0 then v * 10 ^^ negate e else v / 10 ^^ e
 
 seconds :: (Double -> String) -> Double -> String

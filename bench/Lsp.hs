@@ -1,28 +1,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | What a language server does with the rope, spelled the way @lsp@ and
--- @haskell-language-server@ spell it: every function here is the rope's side
--- of one of theirs, call for call, so that a descent saved or added there
--- shows here.
+-- | Rope workloads modelled on @lsp@ and @haskell-language-server@.
+-- These isolate document operations rather than running a full server.
 --
 -- * @applyChange@ of @Language.LSP.VFS@: two UTF-16 positions to byte
 --   offsets, each checked for landing inside a code point, and a 'replace'.
--- * @getCompletionPrefix@ of ghcide: the line under the cursor, after every
---   keystroke.
+-- * @getCompletionPrefix@ of ghcide: read the line after each keystroke.
 -- * The tokenizer of the semantic tokens: where every token of the module
 --   starts and ends, its text, and its columns in UTF-16.
--- * @positionToCodePointPosition@ and back, as the positions of GHC and
---   those of the client are told apart.
--- * @rangeLinesFromVfs@ and @takeLineRange@: a few lines around somewhere,
---   as code actions read them.
+-- * @positionToCodePointPosition@ and back: convert between GHC's code point
+--   columns and the client's UTF-16 columns.
+-- * @rangeLinesFromVfs@ and @takeLineRange@: read nearby lines for code actions.
 --
--- The document is source code that is nearly all ASCII, as source code is.
+-- The generated document is mostly ASCII with occasional non-ASCII comments.
 --
--- Most of these ask where a position is and where its line starts. That is
--- one descent with 'Rope.metricsAtLineAndPosition' and was two or three
--- before there was such a thing, which is how @lsp@ and HLS asked at first:
--- those are kept, as the workloads "in two descents", to tell what the rope
--- gained from what its callers did.
+-- Compare the combined 'Rope.metricsAtLineAndPosition' lookup with separate
+-- line-start and position lookups, labelled "in two descents". This measures
+-- the effect of using the combined API as well as the underlying rope.
 module Lsp
   ( LspEnv (..)
   , mkLspEnv
@@ -61,8 +55,7 @@ moduleText n = T.concat (zipWith line [0 :: Int ..] (L.take n (rands 5)))
         , "\n"
         ]
 
--- | A change as a client sends it: a range of UTF-16 positions and what
--- replaces it.
+-- | A client change: a UTF-16 range and its replacement text.
 data Change = Change !Position !Position !Text
 
 -- | A change, and where it leaves the cursor.
@@ -91,10 +84,9 @@ width16 c = if ord c > 0xFFFF then 2 else 1
 utf16Length :: Text -> Int
 utf16Length = T.foldl' (\n c -> n + width16 c) 0
 
--- | Typing: go to the end of some line and type a snippet there, a keystroke
--- at a time, mistyping and erasing a letter now and then.
--- Comes with the document the steps leave behind, which the replay of the
--- session builds on the way and nobody need fold again.
+-- | Generate typing at line ends, including occasional typos and backspaces.
+-- Return both the changes and the resulting document to avoid replaying
+-- them during environment setup.
 typing :: Int -> Rope -> ([Step], Rope)
 typing bursts rope0 = go bursts (rands 7) rope0
   where
@@ -120,8 +112,7 @@ typing bursts rope0 = go bursts (rands 7) rope0
           let col' = col + width16 c
            in Step (Change (Position line col) (Position line col) (T.singleton c)) (Position line col') : keys cs (i + 1) line col'
 
--- | The edits of renaming something used all over, in one notification, last
--- one first.
+-- | Generate a batch of rename-like edits in reverse document order.
 renaming :: Int -> Text -> [Change]
 renaming edits text =
   [ Change (Position l 2) (Position l 6) "renamedIdentifier"
@@ -130,8 +121,7 @@ renaming edits text =
   where
     candidates = [l | (l, line) <- zip [0 ..] (T.lines text), T.length line >= 8, T.all (< '\x80') line]
 
--- | A word of the document: its line, its columns in code points as GHC
--- counts them, and its start in UTF-16 code units as a client does.
+-- | A token's line, start and end code point columns, and UTF-16 start column.
 data Token = Token !Int !Int !Int !Int
 
 instance NFData Token where
@@ -153,7 +143,7 @@ tokens text = concat (zipWith (\l -> go l 0 0) [0 ..] (T.lines text))
 ------------------------------------------------------------------------------
 -- Language.LSP.VFS
 
--- | How a position and the start of its line are asked for.
+-- | Combined or separate lookups for a position and its line start.
 data Asking
   = -- | 'Rope.metricsAtLineAndPosition'.
     OneDescent
@@ -197,11 +187,9 @@ lineBounds rope l
   | l < Rope.lineCount rope = Just (Rope.metricsAt Lines l rope, Rope.metricsAt Lines (l + 1) rope)
   | otherwise = Nothing
 
--- | @codePointPositionToPosition@ and @positionToCodePointPosition@: a
--- position with its column in one unit as one with it in another, or
--- 'Nothing' if there is no such column, or it lies within a code point. A
--- column on the line is there in one descent; one in its terminator, or
--- beyond, takes the bounds of the line to tell.
+-- | Convert column units, returning 'Nothing' for an invalid column or one
+-- inside a code point. Content positions use the combined lookup; positions
+-- at line endings need an additional bounds check.
 convertPosition :: Unit -> Unit -> Asking -> Rope -> Position -> Maybe Position
 convertPosition from to OneDescent text pos@(Position l c)
   | (line, loc) <- Rope.metricsAtLineAndPosition from pos text
@@ -228,7 +216,7 @@ takeLineRange from to rope
   | to < from = []
   | otherwise = Rope.lines (Rope.slice Lines from (to + 1) rope)
 
--- | A line, if there is one: there is none after a final line terminator.
+-- | Read a line, excluding an empty final line after a trailing terminator.
 lineAt :: Asking -> Int -> Rope -> Maybe Text
 lineAt OneDescent line rope
   | line < lastLine || line == lastLine && not (T.null text) = Just text
@@ -241,15 +229,13 @@ lineAt TwoDescents line rope
   | otherwise = Nothing
 {-# INLINE lineAt #-}
 
--- | What the completions read after a keystroke.
+-- | Read the identifier prefix used for completion after a keystroke.
 completionPrefix :: Asking -> Rope -> Position -> Int
 completionPrefix asking rope (Position l c) = case lineAt asking l rope of
   Nothing -> 0
   Just curLine -> T.length (T.takeWhileEnd (\x -> isAlphaNum x || x == '.' || x == '_' || x == '\'') (T.take c curLine))
 
--- | The tokenizer of the semantic tokens: where a code point position is,
--- and its column in UTF-16, given that there is such a line and that it is
--- that long.
+-- | Locate a valid code point position and its UTF-16 column for token lookup.
 locate :: Asking -> Position -> Rope -> Maybe (Metrics, Int)
 locate asking pos@(Position l c) rpe =
   let (lineStart, at) = lineAndPosition asking Chars pos rpe
@@ -269,7 +255,7 @@ focusToken asking rope (Token l from to _) =
 ------------------------------------------------------------------------------
 -- Workloads
 
--- | Replay a session, reading the document after every change.
+-- | Replay changes and run the supplied observer after each one.
 replay :: Asking -> (Rope -> Position -> Int) -> Rope -> [Step] -> Int
 replay asking observe = go 0
   where
@@ -307,13 +293,13 @@ rename asking rope changes = T.length (Rope.toText (L.foldl' (applyChange asking
 data LspEnv = LspEnv
   { lspOpened :: !Rope
   , lspEdited :: !Rope
-  -- ^ After the typing.
+  -- ^ Document after the generated typing session.
   , lspTyping :: ![Step]
   , lspRenaming :: ![Change]
   , lspTokens :: ![Token]
-  -- ^ Of the edited document.
+  -- ^ Tokens from the edited document.
   , lspPositions :: ![Position]
-  -- ^ Where every fourth of those tokens starts.
+  -- ^ UTF-16 start positions of every fourth token.
   }
 
 instance NFData LspEnv where
