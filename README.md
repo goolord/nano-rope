@@ -181,7 +181,7 @@ The same runs, by what they allocate, and the heap that stays live holding the
 | allocated by `splitAt`, both halves * | 26.6 MB | 107 MB | 185 MB | 160 MB |
 | allocated by `fromText` (once) | 4.55 MB | 11.7 MB | 2.71 MB | 55 B |
 | live heap, fresh rope | 4.55 MB | 5.08 MB | 4.56 MB | 4.03 MB |
-| live heap after 10,000 random inserts | 4.60 MB | 11.6 MB | 7.90 MB | 4.62 MB |
+| live heap after 10,000 random inserts | 4.60 MB | 11.6 MB | 7.90 MB | 5.02 MB |
 
 An edit allocates the new chunk, a node and an array of pointers for each level
 of the tree, and nothing else: about 1.3 kB per insert here. That is also what

@@ -33,7 +33,10 @@ footprint make n build deep = do
   input <- fresh make n
   let a = build input
   _ <- evaluate (deep a)
-  keep <- newStablePtr a
+  -- With what built it, which is alive before: were that to die meanwhile,
+  -- as the edits of the last library to be measured do, it would be taken
+  -- off what the structure weighs.
+  keep <- newStablePtr (a, build)
   after <- liveBytes
   freeStablePtr keep
   pure (after - before)
