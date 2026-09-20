@@ -10,11 +10,10 @@
 -- the heap each library needs to hold the document.
 module Main (main) where
 
-import Chart (Chart (..), Footprint (..), Group (..), Row (..), Sample (..), readSamples, render, showBytes)
+import Chart (Chart (..), Footprint (..), Group (..), Row (..), Sample (..), commas, readSamples, render, showBytes)
 import Control.DeepSeq (NFData (..))
 import Control.Exception (throwIO, try)
 import Control.Monad (forM_, unless)
-import Data.Bits (shiftR)
 import qualified Data.List as L
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -22,10 +21,10 @@ import Data.Text.NanoRope (Position (..), Unit (..))
 import qualified Data.Text.NanoRope as Nano
 import Data.Text.NanoRope.Internal (kernels, kernelsName)
 import Data.Version (showVersion)
-import Data.Word (Word64)
 import GHC.Stats (getRTSStatsEnabled)
 import Lsp (lspBenchmarks, mkLspEnv)
 import Memory (footprint, fresh)
+import Rand (rands)
 import System.Environment (getArgs, withArgs)
 import System.Exit (ExitCode (..))
 import System.IO (IOMode (..), hGetContents', hPutStr, hSetEncoding, utf8, withFile)
@@ -48,12 +47,6 @@ import qualified Core.Text.Rope as CT
 
 ------------------------------------------------------------------------------
 -- Data
-
--- | Deterministic pseudo-random numbers.
-rands :: Word64 -> [Int]
-rands = map (\x -> fromIntegral (x `shiftR` 33)) . drop 1 . iterate step
-  where
-    step x = x * 6364136223846793005 + 1442695040888963407
 
 -- | Something like source code: short lines, mostly ASCII, the odd accent,
 -- CJK and emoji.
@@ -79,13 +72,20 @@ sourceText n = T.concat (zipWith line [0 :: Int ..] (L.take n (rands 1)))
 minified :: Text -> Text
 minified = T.filter (/= '\n')
 
+-- | A document as a library holds it: freshly loaded, as one enormous line,
+-- and after 10k random inserts, the shape a rope has in the middle of a
+-- session.
+data Ropes r = Ropes {ropeFresh :: !r, ropeOneLine :: !r, ropeEdited :: !r}
+  deriving (Foldable)
+
+ropes :: (Text -> r) -> ([Int] -> r -> r) -> Text -> [Int] -> Ropes r
+ropes load edit text offsets = Ropes r (load (minified text)) (edit offsets r)
+  where
+    r = load text
+
 data Env = Env
   { envText :: !Text
-  , envOneLine :: !Text
-  , envNano :: !Nano.Rope
-  , envNanoOneLine :: !Nano.Rope
-  , envNanoEdited :: !Nano.Rope
-  -- ^ After 10k random inserts: the shape a rope has in the middle of a session.
+  , envNano :: !(Ropes Nano.Rope)
   , envChars :: ![Int]
   -- ^ Random character offsets.
   , envBursts :: ![(Int, Int)]
@@ -94,20 +94,14 @@ data Env = Env
   -- ^ Random positions with their column in UTF-16 code units.
   , envByteOffsets :: ![Int]
 #ifdef COMPARE_TEXT_ROPE
-  , envTR :: !TR.Rope
-  , envTROneLine :: !TR.Rope
+  , envTR :: !(Ropes TR.Rope)
   , envTR16 :: !TR16.Rope
-  , envTREdited :: !TR.Rope
 #endif
 #ifdef COMPARE_YI_ROPE
-  , envYi :: !Yi.YiString
-  , envYiOneLine :: !Yi.YiString
-  , envYiEdited :: !Yi.YiString
+  , envYi :: !(Ropes Yi.YiString)
 #endif
 #ifdef COMPARE_CORE_TEXT
-  , envCT :: !CT.Rope
-  , envCTOneLine :: !CT.Rope
-  , envCTEdited :: !CT.Rope
+  , envCT :: !(Ropes CT.Rope)
 #endif
   }
 
@@ -120,49 +114,35 @@ instance NFData Env where
       `seq` rnf (envPositions e)
       `seq` rnf (envByteOffsets e)
 #ifdef COMPARE_YI_ROPE
-      `seq` forceYi (envYi e)
-      `seq` forceYi (envYiOneLine e)
-      `seq` forceYi (envYiEdited e)
+      `seq` foldr (seq . forceYi) () (envYi e)
 #endif
 #ifdef COMPARE_CORE_TEXT
-      `seq` rnf (envCT e)
-      `seq` rnf (envCTOneLine e)
-      `seq` rnf (envCTEdited e)
+      `seq` foldr (seq . rnf) () (envCT e)
 #endif
 
 mkEnv :: Int -> Int -> Env
 mkEnv nLines nOps =
   Env
     { envText = text
-    , envOneLine = oneLine
     , envNano = nano
-    , envNanoOneLine = Nano.fromText oneLine
-    , envNanoEdited = nanoEdited offsets nano
     , envChars = offsets
-    , envBursts = [(i, Nano.convert Chars Lines i nano) | i <- L.take 100 offsets]
+    , envBursts = [(i, Nano.convert Chars Lines i (ropeFresh nano)) | i <- L.take 100 offsets]
     , envPositions = [Position (r `mod` nLines) (r `mod` 40) | r <- L.take nOps (rands 3)]
-    , envByteOffsets = [r `mod` (Nano.length Bytes nano + 1) | r <- L.take nOps (rands 4)]
+    , envByteOffsets = [r `mod` (Nano.length Bytes (ropeFresh nano) + 1) | r <- L.take nOps (rands 4)]
 #ifdef COMPARE_TEXT_ROPE
-    , envTR = TR.fromText text
-    , envTROneLine = TR.fromText oneLine
+    , envTR = ropes TR.fromText (edits trOps) text offsets
     , envTR16 = TR16.fromText text
-    , envTREdited = trEdited offsets (TR.fromText text)
 #endif
 #ifdef COMPARE_YI_ROPE
-    , envYi = Yi.fromText text
-    , envYiOneLine = Yi.fromText oneLine
-    , envYiEdited = yiEdited offsets (Yi.fromText text)
+    , envYi = ropes Yi.fromText (edits yiOps) text offsets
 #endif
 #ifdef COMPARE_CORE_TEXT
-    , envCT = ctFromText text
-    , envCTOneLine = ctFromText oneLine
-    , envCTEdited = ctEdited offsets (ctFromText text)
+    , envCT = ropes ctFromText (edits ctOps) text offsets
 #endif
     }
   where
     text = sourceText nLines
-    oneLine = minified text
-    nano = Nano.fromText text
+    nano = ropes Nano.fromText (edits nanoOps) text offsets
     offsets = editOffsets nOps text
 
 -- | Where the random edits go.
@@ -174,106 +154,137 @@ editOffsets nOps text = [r `mod` (chars + 1) | r <- L.take nOps (rands 2)]
 ------------------------------------------------------------------------------
 -- Workloads
 
--- | The length of a rope that has been read, so that the keystrokes typed
--- last are in the tree like everything else and not left waiting.
-built :: Nano.Rope -> Int
-built r = if T.null (Nano.chunkAt Bytes 0 r) then 0 else Nano.length Chars r
+-- | What a library is measured by, by name: the workloads it has the means
+-- for, which are not all of them.
+type Workloads = [(String, Benchmarkable)]
+
+-- | A freshly loaded text-rope is a single chunk and a freshly loaded
+-- core-text a single piece, which the read-only workloads keep hitting. So
+-- they also run on a rope that has been through 10k edits and is in the
+-- shape it has mid-session.
+afterEdits :: String -> String
+afterEdits w = "after 10k edits, " ++ w
+
+-- | What the workloads ask of a library and its rope. They are inlined into
+-- those of each library, where these are calls of known functions.
+data Ops r = Ops
+  { opLoad :: Text -> Benchmarkable
+  , opToText :: r -> Text
+  , opInsert :: Int -> r -> r
+  -- ^ An @x@ at a character offset.
+  , opDelete :: Int -> r -> r
+  -- ^ The character at an offset.
+  , opSize :: r -> Int
+  -- ^ Of a rope that has been edited, which is then built.
+  , opSplit :: Int -> r -> Int
+  -- ^ Split at a character offset, and look at both halves.
+  , opGetLine :: Maybe (Int -> r -> Text)
+  -- ^ A line without its terminator, for those who know of lines.
+  }
 
 -- | Insert a character at each of the given offsets.
-nanoEdited :: [Int] -> Nano.Rope -> Nano.Rope
-nanoEdited offsets r0 = L.foldl' (\r i -> Nano.insert Chars i "x" r) r0 offsets
-
-nanoInserts :: [Int] -> Nano.Rope -> Int
-nanoInserts offsets r0 = built (nanoEdited offsets r0)
+edits :: Ops r -> [Int] -> r -> r
+edits ops offsets = \r0 -> L.foldl' (flip (opInsert ops)) r0 offsets
+{-# INLINE edits #-}
 
 -- | Type a run of characters starting at each of the given offsets.
-nanoTyping :: Int -> [Int] -> Nano.Rope -> Int
-nanoTyping n offsets r0 = built (L.foldl' burst r0 offsets)
+typing :: Ops r -> Int -> [Int] -> r -> Int
+typing ops n offsets = \r0 -> opSize ops (L.foldl' burst r0 offsets)
   where
-    burst r i = L.foldl' (\acc k -> Nano.insert Chars (i + k) "x" acc) r [0 .. n - 1]
+    burst r i = L.foldl' (\acc k -> opInsert ops (i + k) acc) r [0 .. n - 1]
+{-# INLINE typing #-}
 
 -- | The same, looking at the line after every keystroke like an editor that
 -- redraws it.
-nanoTypingRead :: [(Int, Int)] -> Nano.Rope -> Int
-nanoTypingRead bursts r0 = snd (L.foldl' burst (r0, 0) bursts)
-  where
-    burst acc (i, l) = L.foldl' (key i l) acc [0 .. 99]
-    key i l (r, n) k =
-      let r' = Nano.insert Chars (i + k) "x" r
-          !n' = n + T.length (Nano.getLine l r')
-       in (r', n')
-
--- | Delete a character at each of the given offsets.
-nanoDeletes :: [Int] -> Nano.Rope -> Int
-nanoDeletes offsets r0 = built (L.foldl' (\r i -> Nano.delete Chars i (i + 1) r) r0 offsets)
-
-nanoSplits :: [Int] -> Nano.Rope -> Int
-nanoSplits offsets r = L.foldl' (\n i -> let (a, b) = Nano.splitAt Chars i r in n + Nano.length Lines a + Nano.length Lines b) 0 offsets
-
--- | What a language server does with an incoming change: find a UTF-16
--- position and edit there.
-nanoLspEdits :: [Position] -> Nano.Rope -> Int
-nanoLspEdits positions r0 = built (L.foldl' edit r0 positions)
-  where
-    edit r pos =
-      let i = Nano.positionToOffset Utf16 Bytes pos r
-       in Nano.insert Bytes i "x" r
-
--- | What a language server does with the result of a byte-based tool: turn
--- byte offsets into UTF-16 positions.
-nanoByteToPosition :: [Int] -> Nano.Rope -> Int
-nanoByteToPosition offsets r = L.foldl' (\n i -> n + posColumn (Nano.offsetToPosition Bytes Utf16 i r)) 0 offsets
-
-nanoGetLines :: [Position] -> Nano.Rope -> Int
-nanoGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (Nano.getLine l r)) 0 positions
-
-#ifdef COMPARE_TEXT_ROPE
-trEdited :: [Int] -> TR.Rope -> TR.Rope
-trEdited offsets r0 = L.foldl' ins r0 offsets
-  where
-    ins r i = let (a, b) = TR.splitAt (fromIntegral i) r in a <> "x" <> b
-
-trInserts :: [Int] -> TR.Rope -> Int
-trInserts offsets r0 = fromIntegral (TR.length (trEdited offsets r0))
-
-trTyping :: Int -> [Int] -> TR.Rope -> Int
-trTyping n offsets r0 = fromIntegral (TR.length (L.foldl' burst r0 offsets))
-  where
-    burst r i = L.foldl' (\acc k -> let (a, b) = TR.splitAt (fromIntegral (i + k)) acc in a <> "x" <> b) r [0 .. n - 1]
-
-trTypingRead :: [(Int, Int)] -> TR.Rope -> Int
-trTypingRead bursts r0 = snd (L.foldl' burst (r0, 0) bursts)
+typingRead :: Ops r -> (Int -> r -> Text) -> [(Int, Int)] -> r -> Int
+typingRead ops lineOf bursts = \r0 -> snd (L.foldl' burst (r0, 0) bursts)
   where
     burst acc (i, l) = L.foldl' (key i l) acc [0 .. 99 :: Int]
     key i l (r, n) k =
-      let (a, b) = TR.splitAt (fromIntegral (i + k)) r
-          r' = a <> "x" <> b
-          !n' = n + T.length (TR.toText (TR.getLine (fromIntegral l) r'))
+      let r' = opInsert ops (i + k) r
+          !n' = n + T.length (lineOf l r')
        in (r', n')
+{-# INLINE typingRead #-}
 
-trDeletes :: [Int] -> TR.Rope -> Int
-trDeletes offsets r0 = fromIntegral (TR.length (L.foldl' del r0 offsets))
+-- | The workloads every library has, as far as it has them: not the ones it
+-- is too slow for.
+workloads :: Ops r -> [String] -> Ropes r -> Env -> Workloads
+workloads ops tooSlow rs e =
+  filter ((`notElem` tooSlow) . fst) . concat $
+    [ [("fromText", opLoad ops (envText e))]
+    , both "toText" (whnf (opToText ops))
+    , both "10k random inserts" (whnf (opSize ops . edits ops (envChars e)))
+    , both "100 bursts of 100 keystrokes" (whnf (typing ops 100 (L.take 100 (envChars e))))
+    , both "10k keystrokes in one spot" (whnf (typing ops 10000 (L.take 1 (envChars e))))
+    , [("10k random deletes", whnf (\r0 -> opSize ops (L.foldl' (flip (opDelete ops)) r0 (envChars e))) (ropeFresh rs))]
+    , both "10k random splits" (whnf (\r -> L.foldl' (\n i -> n + opSplit ops i r) 0 (envChars e)))
+    , [("one long line, 10k random inserts", whnf (opSize ops . edits ops (envChars e)) (ropeOneLine rs))]
+    , concat
+        [ ("100 bursts of 100 keystrokes, reading the line after each", whnf (typingRead ops lineOf (envBursts e)) (ropeFresh rs))
+            : both "10k getLine" (whnf (\r -> L.foldl' (\n (Position l _) -> n + T.length (lineOf l r)) 0 (envPositions e)))
+        | Just lineOf <- [opGetLine ops]
+        ]
+    ]
   where
-    del r i =
-      let (a, b) = TR.splitAt (fromIntegral i) r
-          (_, c) = TR.splitAt 1 b
-       in a <> c
+    -- On the fresh rope and on the edited one.
+    both w run = [(w, run (ropeFresh rs)), (afterEdits w, run (ropeEdited rs))]
+{-# INLINE workloads #-}
 
-trSplits :: [Int] -> TR.Rope -> Int
-trSplits offsets r = L.foldl' (\n i -> let (a, b) = TR.splitAt (fromIntegral i) r in n + lineBreaks a + lineBreaks b) 0 offsets
+nanoOps :: Ops Nano.Rope
+nanoOps =
+  Ops
+    { opLoad = whnf Nano.fromText
+    , opToText = Nano.toText
+    , opInsert = \i -> Nano.insert Chars i "x"
+    , opDelete = \i -> Nano.delete Chars i (i + 1)
+    , -- Read, so that the keystrokes typed last are in the tree like
+      -- everything else and not left waiting.
+      opSize = \r -> if T.null (Nano.chunkAt Bytes 0 r) then 0 else Nano.length Chars r
+    , opSplit = \i r -> let (a, b) = Nano.splitAt Chars i r in Nano.length Lines a + Nano.length Lines b
+    , opGetLine = Just Nano.getLine
+    }
+
+nanoWorkloads :: Env -> Workloads
+nanoWorkloads e =
+  workloads nanoOps [] (envNano e) e
+    ++ [ ("10k edits at UTF-16 positions", whnf (opSize nanoOps . lspEdits) rope)
+       , ("10k byte offsets to UTF-16 positions", whnf byteToPosition rope)
+       ]
+  where
+    rope = ropeFresh (envNano e)
+    -- What a language server does with an incoming change: find a UTF-16
+    -- position and edit there.
+    lspEdits r0 = L.foldl' (\r pos -> Nano.insert Bytes (Nano.positionToOffset Utf16 Bytes pos r) "x" r) r0 (envPositions e)
+    -- And with the result of a byte-based tool: turn byte offsets into
+    -- UTF-16 positions.
+    byteToPosition r = L.foldl' (\n i -> n + posColumn (Nano.offsetToPosition Bytes Utf16 i r)) 0 (envByteOffsets e)
+
+#ifdef COMPARE_TEXT_ROPE
+trOps :: Ops TR.Rope
+trOps =
+  Ops
+    { opLoad = whnf TR.fromText
+    , opToText = TR.toText
+    , opInsert = \i r -> let (a, b) = TR.splitAt (fromIntegral i) r in a <> "x" <> b
+    , opDelete = \i r ->
+        let (a, b) = TR.splitAt (fromIntegral i) r
+            (_, c) = TR.splitAt 1 b
+         in a <> c
+    , opSize = fromIntegral . TR.length
+    , opSplit = \i r -> let (a, b) = TR.splitAt (fromIntegral i) r in lineBreaks a + lineBreaks b
+    , opGetLine = Just (\l -> TR.toText . TR.getLine (fromIntegral l))
+    }
   where
     lineBreaks = fromIntegral . TR.posLine . TR.lengthAsPosition
 
-trLspEdits :: [Position] -> TR16.Rope -> Int
-trLspEdits positions r0 = fromIntegral (TR16.length (L.foldl' edit r0 positions))
+trWorkloads :: Env -> Workloads
+trWorkloads e = workloads trOps [] (envTR e) e ++ [("10k edits at UTF-16 positions", whnf lspEdits (envTR16 e))]
   where
+    lspEdits r0 = fromIntegral (TR16.length (L.foldl' edit r0 (envPositions e))) :: Int
     edit r (Position l c) =
       case TR16.splitAtPosition (TR16.Position (fromIntegral l) (fromIntegral c)) r of
         Just (a, b) -> a <> "x" <> b
         Nothing -> r
-
-trGetLines :: [Position] -> TR.Rope -> Int
-trGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (TR.toText (TR.getLine (fromIntegral l) r))) 0 positions
 #endif
 
 #ifdef COMPARE_YI_ROPE
@@ -286,44 +297,19 @@ forceYi r = Yi.countNewLines r `seq` rnf r
 yiFromText :: Text -> Yi.YiString
 yiFromText t = let r = Yi.fromText t in Yi.countNewLines r `seq` r
 
--- | There is no insertion as such: split and append, which is what Yi does.
-yiInsert :: Int -> Yi.YiString -> Yi.YiString
-yiInsert i r = let (a, b) = Yi.splitAt i r in a <> "x" <> b
-
-yiEdited :: [Int] -> Yi.YiString -> Yi.YiString
-yiEdited offsets r0 = L.foldl' (flip yiInsert) r0 offsets
-
-yiInserts :: [Int] -> Yi.YiString -> Int
-yiInserts offsets r0 = Yi.length (yiEdited offsets r0)
-
-yiTyping :: Int -> [Int] -> Yi.YiString -> Int
-yiTyping n offsets r0 = Yi.length (L.foldl' burst r0 offsets)
-  where
-    burst r i = L.foldl' (\acc k -> yiInsert (i + k) acc) r [0 .. n - 1]
-
--- | A line without its line feed, like 'Nano.getLine'.
-yiGetLine :: Int -> Yi.YiString -> Text
-yiGetLine l = Yi.toText . Yi.takeWhile (/= '\n') . snd . Yi.splitAtLine l
-
-yiTypingRead :: [(Int, Int)] -> Yi.YiString -> Int
-yiTypingRead bursts r0 = snd (L.foldl' burst (r0, 0) bursts)
-  where
-    burst acc (i, l) = L.foldl' (key i l) acc [0 .. 99 :: Int]
-    key i l (r, n) k =
-      let r' = yiInsert (i + k) r
-          !n' = n + T.length (yiGetLine l r')
-       in (r', n')
-
-yiDeletes :: [Int] -> Yi.YiString -> Int
-yiDeletes offsets r0 = Yi.length (L.foldl' del r0 offsets)
-  where
-    del r i = let (a, b) = Yi.splitAt i r in a <> Yi.drop 1 b
-
-yiSplits :: [Int] -> Yi.YiString -> Int
-yiSplits offsets r = L.foldl' (\n i -> let (a, b) = Yi.splitAt i r in n + Yi.countNewLines a + Yi.countNewLines b) 0 offsets
-
-yiGetLines :: [Position] -> Yi.YiString -> Int
-yiGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (yiGetLine l r)) 0 positions
+-- | @yi-rope@ knows nothing of UTF-16.
+yiOps :: Ops Yi.YiString
+yiOps =
+  Ops
+    { opLoad = whnf yiFromText
+    , opToText = Yi.toText
+    , -- There is no insertion as such: split and append, which is what Yi does.
+      opInsert = \i r -> let (a, b) = Yi.splitAt i r in a <> "x" <> b
+    , opDelete = \i r -> let (a, b) = Yi.splitAt i r in a <> Yi.drop 1 b
+    , opSize = Yi.length
+    , opSplit = \i r -> let (a, b) = Yi.splitAt i r in Yi.countNewLines a + Yi.countNewLines b
+    , opGetLine = Just (\l -> Yi.toText . Yi.takeWhile (/= '\n') . snd . Yi.splitAtLine l)
+    }
 #endif
 
 #ifdef COMPARE_CORE_TEXT
@@ -332,31 +318,27 @@ yiGetLines positions r = L.foldl' (\n (Position l _) -> n + T.length (yiGetLine 
 ctFromText :: Text -> CT.Rope
 ctFromText = CT.intoRope
 
-ctToText :: CT.Rope -> Text
-ctToText = CT.fromRope
+-- | @core-text@ knows nothing of UTF-16, nor of lines: the halves of a split
+-- are forced by their width.
+ctOps :: Ops CT.Rope
+ctOps =
+  Ops
+    { opLoad = nf ctFromText
+    , opToText = CT.fromRope
+    , opInsert = \i -> CT.insertRope i "x"
+    , opDelete = \i r ->
+        let (a, b) = CT.splitRope i r
+            (_, c) = CT.splitRope 1 b
+         in a <> c
+    , opSize = CT.widthRope
+    , opSplit = \i r -> let (a, b) = CT.splitRope i r in CT.widthRope a + CT.widthRope b
+    , opGetLine = Nothing
+    }
 
-ctEdited :: [Int] -> CT.Rope -> CT.Rope
-ctEdited offsets r0 = L.foldl' (\r i -> CT.insertRope i "x" r) r0 offsets
-
-ctInserts :: [Int] -> CT.Rope -> Int
-ctInserts offsets r0 = CT.widthRope (ctEdited offsets r0)
-
-ctTyping :: Int -> [Int] -> CT.Rope -> Int
-ctTyping n offsets r0 = CT.widthRope (L.foldl' burst r0 offsets)
-  where
-    burst r i = L.foldl' (\acc k -> CT.insertRope (i + k) "x" acc) r [0 .. n - 1]
-
-ctDeletes :: [Int] -> CT.Rope -> Int
-ctDeletes offsets r0 = CT.widthRope (L.foldl' del r0 offsets)
-  where
-    del r i =
-      let (a, b) = CT.splitRope i r
-          (_, c) = CT.splitRope 1 b
-       in a <> c
-
--- | There are no lines to count: the halves are forced by their width.
-ctSplits :: [Int] -> CT.Rope -> Int
-ctSplits offsets r = L.foldl' (\n i -> let (a, b) = CT.splitRope i r in n + CT.widthRope a + CT.widthRope b) 0 offsets
+-- | A freshly loaded rope is one piece, which it measures again at every
+-- keystroke next to it and every split of it. These take 45 s a run.
+ctTooSlow :: [String]
+ctTooSlow = ["10k keystrokes in one spot", "10k random splits"]
 #endif
 
 ------------------------------------------------------------------------------
@@ -370,222 +352,33 @@ workloadOps = 10000
 lspLines :: Int
 lspLines = 8000
 
+-- | A library: its name, its workloads, and how it loads and edits the
+-- document whose heap is measured.
+data Library = Library String (Env -> Workloads) ([Int] -> IO [Footprint])
+
+libraries :: [Library]
+libraries =
+  [ Library "nano-rope" nanoWorkloads (measure "nano-rope" Nano.fromText (edits nanoOps) rnf)
+#ifdef COMPARE_TEXT_ROPE
+  , Library "text-rope" trWorkloads (measure "text-rope" TR.fromText (edits trOps) rnf)
+#endif
+#ifdef COMPARE_YI_ROPE
+  , Library "yi-rope" (\e -> workloads yiOps [] (envYi e) e) (measure "yi-rope" yiFromText (edits yiOps) forceYi)
+#endif
+#ifdef COMPARE_CORE_TEXT
+  , Library "core-text" (\e -> workloads ctOps ctTooSlow (envCT e) e) (measure "core-text" ctFromText (edits ctOps) rnf)
+#endif
+  ]
+
 benchmarks :: [Benchmark]
 benchmarks =
     [ env (pure (mkEnv documentLines workloadOps)) $ \e ->
         bgroup
           "100k lines"
-          [ bgroup
-              "fromText"
-              [ bench "nano-rope" $ whnf Nano.fromText (envText e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf TR.fromText (envText e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf yiFromText (envText e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ nf ctFromText (envText e)
-#endif
-              ]
-          , bgroup
-              "toText"
-              [ bench "nano-rope" $ whnf Nano.toText (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf TR.toText (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf Yi.toText (envYi e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf ctToText (envCT e)
-#endif
-              ]
-          , bgroup
-              "10k random inserts"
-              [ bench "nano-rope" $ whnf (nanoInserts (envChars e)) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trInserts (envChars e)) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiInserts (envChars e)) (envYi e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctInserts (envChars e)) (envCT e)
-#endif
-              ]
-          , bgroup
-              "100 bursts of 100 keystrokes"
-              [ bench "nano-rope" $ whnf (nanoTyping 100 (L.take 100 (envChars e))) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trTyping 100 (L.take 100 (envChars e))) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiTyping 100 (L.take 100 (envChars e))) (envYi e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctTyping 100 (L.take 100 (envChars e))) (envCT e)
-#endif
-              ]
-          , bgroup
-              "100 bursts of 100 keystrokes, reading the line after each"
-              [ bench "nano-rope" $ whnf (nanoTypingRead (envBursts e)) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trTypingRead (envBursts e)) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiTypingRead (envBursts e)) (envYi e)
-#endif
-              ]
-          , bgroup
-              "10k keystrokes in one spot"
-              [ bench "nano-rope" $ whnf (nanoTyping 10000 (L.take 1 (envChars e))) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trTyping 10000 (L.take 1 (envChars e))) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiTyping 10000 (L.take 1 (envChars e))) (envYi e)
-#endif
-              -- Not core-text: a freshly loaded rope is one piece, which it
-              -- measures again at every keystroke next to it and every split
-              -- of it. This and the splits below take 45 s a run.
-              ]
-          , bgroup
-              "10k random deletes"
-              [ bench "nano-rope" $ whnf (nanoDeletes (envChars e)) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trDeletes (envChars e)) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiDeletes (envChars e)) (envYi e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctDeletes (envChars e)) (envCT e)
-#endif
-              ]
-          , bgroup
-              "10k random splits"
-              [ bench "nano-rope" $ whnf (nanoSplits (envChars e)) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trSplits (envChars e)) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiSplits (envChars e)) (envYi e)
-#endif
-              ]
-          , bgroup
-              "10k edits at UTF-16 positions"
-              [ bench "nano-rope" $ whnf (nanoLspEdits (envPositions e)) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trLspEdits (envPositions e)) (envTR16 e)
-#endif
-              ]
-          , bgroup
-              "10k byte offsets to UTF-16 positions"
-              [ bench "nano-rope" $ whnf (nanoByteToPosition (envByteOffsets e)) (envNano e)
-              ]
-          , bgroup
-              "10k getLine"
-              [ bench "nano-rope" $ whnf (nanoGetLines (envPositions e)) (envNano e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trGetLines (envPositions e)) (envTR e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiGetLines (envPositions e)) (envYi e)
-#endif
-              ]
-          , bgroup
-              "one long line, 10k random inserts"
-              [ bench "nano-rope" $ whnf (nanoInserts (envChars e)) (envNanoOneLine e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trInserts (envChars e)) (envTROneLine e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiInserts (envChars e)) (envYiOneLine e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctInserts (envChars e)) (envCTOneLine e)
-#endif
-              ]
-            -- A freshly loaded text-rope is a single chunk and a freshly loaded
-            -- core-text a single piece, which the read-only workloads above
-            -- keep hitting. These run on ropes that have been through 10k edits
-            -- and are in the shape they have mid-session.
-          , bgroup
-              "after 10k edits, 10k random splits"
-              [ bench "nano-rope" $ whnf (nanoSplits (envChars e)) (envNanoEdited e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trSplits (envChars e)) (envTREdited e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiSplits (envChars e)) (envYiEdited e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctSplits (envChars e)) (envCTEdited e)
-#endif
-              ]
-          , bgroup
-              "after 10k edits, 10k getLine"
-              [ bench "nano-rope" $ whnf (nanoGetLines (envPositions e)) (envNanoEdited e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trGetLines (envPositions e)) (envTREdited e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiGetLines (envPositions e)) (envYiEdited e)
-#endif
-              ]
-          , bgroup
-              "after 10k edits, 10k random inserts"
-              [ bench "nano-rope" $ whnf (nanoInserts (envChars e)) (envNanoEdited e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trInserts (envChars e)) (envTREdited e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiInserts (envChars e)) (envYiEdited e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctInserts (envChars e)) (envCTEdited e)
-#endif
-              ]
-          , bgroup
-              "after 10k edits, 100 bursts of 100 keystrokes"
-              [ bench "nano-rope" $ whnf (nanoTyping 100 (L.take 100 (envChars e))) (envNanoEdited e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trTyping 100 (L.take 100 (envChars e))) (envTREdited e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiTyping 100 (L.take 100 (envChars e))) (envYiEdited e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctTyping 100 (L.take 100 (envChars e))) (envCTEdited e)
-#endif
-              ]
-          , bgroup
-              "after 10k edits, 10k keystrokes in one spot"
-              [ bench "nano-rope" $ whnf (nanoTyping 10000 (L.take 1 (envChars e))) (envNanoEdited e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf (trTyping 10000 (L.take 1 (envChars e))) (envTREdited e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf (yiTyping 10000 (L.take 1 (envChars e))) (envYiEdited e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf (ctTyping 10000 (L.take 1 (envChars e))) (envCTEdited e)
-#endif
-              ]
-          , bgroup
-              "after 10k edits, toText"
-              [ bench "nano-rope" $ whnf Nano.toText (envNanoEdited e)
-#ifdef COMPARE_TEXT_ROPE
-              , bench "text-rope" $ whnf TR.toText (envTREdited e)
-#endif
-#ifdef COMPARE_YI_ROPE
-              , bench "yi-rope" $ whnf Yi.toText (envYiEdited e)
-#endif
-#ifdef COMPARE_CORE_TEXT
-              , bench "core-text" $ whnf ctToText (envCTEdited e)
-#endif
-              ]
+          -- Every workload there is, which are those of nano-rope, on every
+          -- library that has it.
+          [ bgroup w [bench name run | Library name have _ <- libraries, Just run <- [lookup w (have e)]]
+          | (w, _) <- nanoWorkloads e
           ]
     , -- A module the size of a large one of GHC's, and the rope's side of what
       -- lsp and haskell-language-server do with it: see "Lsp".
@@ -618,10 +411,10 @@ main = do
           Right () -> pure ()
       -- The workloads of a language server are nano-rope's alone and are not
       -- drawn: the chart is of what the libraries can be compared by.
-      samples <- filter ((`elem` libraries) . sampleLibrary) . readSamples <$> withFile csv ReadMode hGetContents'
+      samples <- filter ((`elem` libraryNames) . sampleLibrary) . readSamples <$> withFile csv ReadMode hGetContents'
       bytes <- Nano.length Bytes . Nano.fromText <$> fresh sourceText documentLines
       let ran = map sampleLibrary samples ++ map footprintLibrary fps
-          others = filter (`elem` ran) (drop 1 libraries)
+          others = filter (`elem` ran) (drop 1 libraryNames)
       withFile svg WriteMode $ \h -> do
         hSetEncoding h utf8
         hPutStr h . render $
@@ -642,7 +435,7 @@ main = do
                 , "No mark: the library cannot do this (yi-rope has no UTF-16, core-text neither UTF-16 nor lines). A hollow mark at the right: left out, a run takes minutes."
                 , "Live heap: what stays reachable after a major collection once the Text the document came from is dropped. A rope that shares that Text keeps it alive."
                 ]
-            , chartLibraries = libraries
+            , chartLibraries = libraryNames
             , chartGroups = chartRows
             , chartSamples = samples
             , chartSkipped = skipped
@@ -651,14 +444,14 @@ main = do
             }
       putStrLn ("Chart: " ++ svg)
   where
-    libraries = ["nano-rope", "text-rope", "yi-rope", "core-text"]
+    libraryNames = ["nano-rope", "text-rope", "yi-rope", "core-text"]
     andList [x] = x
     andList [x, y] = x ++ " and " ++ y
     andList (x : xs) = x ++ ", " ++ andList xs
     andList [] = ""
     skipped =
 #ifdef COMPARE_CORE_TEXT
-      [(w, "core-text") | w <- ["10k keystrokes in one spot", "10k random splits"]]
+      [(w, "core-text") | w <- ctTooSlow]
 #else
       []
 #endif
@@ -670,30 +463,30 @@ chartRows =
   [ Group
       "Loading and saving"
       [ Row "fromText" [("", "fromText")]
-      , both "toText" "toText"
+      , inBoth "toText" "toText"
       ]
   , Group
       "Editing"
-      [ both "Random inserts" "10k random inserts"
+      [ inBoth "Random inserts" "10k random inserts"
       , Row "Random deletes" [("", "10k random deletes")]
       , Row "Random inserts, one long line" [("", "one long line, 10k random inserts")]
       , Row "Edits at UTF-16 positions" [("", "10k edits at UTF-16 positions")]
       ]
   , Group
       "Typing"
-      [ both "100 bursts of 100 keystrokes" "100 bursts of 100 keystrokes"
+      [ inBoth "100 bursts of 100 keystrokes" "100 bursts of 100 keystrokes"
       , Row "The same, reading the line" [("", "100 bursts of 100 keystrokes, reading the line after each")]
-      , both "10,000 keystrokes in one spot" "10k keystrokes in one spot"
+      , inBoth "10,000 keystrokes in one spot" "10k keystrokes in one spot"
       ]
   , Group
       "Reading"
-      [ both "Random splits" "10k random splits"
-      , both "getLine" "10k getLine"
+      [ inBoth "Random splits" "10k random splits"
+      , inBoth "getLine" "10k getLine"
       , Row "Byte offsets to UTF-16 positions" [("", "10k byte offsets to UTF-16 positions")]
       ]
   ]
   where
-    both label w = Row label [(freshState, w), (editedState, "after 10k edits, " ++ w)]
+    inBoth label w = Row label [(freshState, w), (editedState, afterEdits w)]
 
 freshState, editedState :: String
 freshState = "fresh"
@@ -714,9 +507,6 @@ chartArgs args = case break (== "--chart") (filter (/= "--redraw") args) of
     redraw = "--redraw" `elem` args
     dropSvg f = maybe f reverse (L.stripPrefix "gvs." (reverse f))
 
-commas :: Int -> String
-commas = reverse . L.intercalate "," . L.unfoldr (\s -> if null s then Nothing else Just (L.splitAt 3 s)) . reverse . show
-
 ------------------------------------------------------------------------------
 -- Memory
 
@@ -726,26 +516,15 @@ footprints :: IO (Maybe Double, [Footprint])
 footprints = do
   offsets <- fresh (\n -> let o = editOffsets workloadOps (sourceText n) in rnf o `seq` o) documentLines
   text <- footprint sourceText documentLines id rnf
-  fps <-
-    sequence
-      [ measure "nano-rope" Nano.fromText (nanoEdited offsets) rnf
-#ifdef COMPARE_TEXT_ROPE
-      , measure "text-rope" TR.fromText (trEdited offsets) rnf
-#endif
-#ifdef COMPARE_YI_ROPE
-      , measure "yi-rope" yiFromText (yiEdited offsets) forceYi
-#endif
-#ifdef COMPARE_CORE_TEXT
-      , measure "core-text" ctFromText (ctEdited offsets) rnf
-#endif
-      ]
+  fps <- sequence [heap offsets | Library _ _ heap <- libraries]
   pure (Just text, concat fps)
-  where
-    measure :: String -> (Text -> a) -> (a -> a) -> (a -> ()) -> IO [Footprint]
-    measure library load edit deep = do
-      loaded <- footprint sourceText documentLines load deep
-      edited <- footprint sourceText documentLines (edit . load) deep
-      pure
-        [ Footprint freshState library loaded
-        , Footprint editedState library edited
-        ]
+
+-- | The heap of a library holding the document, fresh and edited.
+measure :: String -> (Text -> a) -> ([Int] -> a -> a) -> (a -> ()) -> [Int] -> IO [Footprint]
+measure library load edit deep offsets = do
+  loaded <- footprint sourceText documentLines load deep
+  edited <- footprint sourceText documentLines (edit offsets . load) deep
+  pure
+    [ Footprint freshState library loaded
+    , Footprint editedState library edited
+    ]

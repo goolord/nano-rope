@@ -153,6 +153,7 @@ benchmark nano-rope-bench
         Chart
         Lsp
         Memory
+        Rand
 
     -- -T: statistics, for the bytes allocated and the heap in use.
     ghc-options:      -O2 -rtsopts "-with-rtsopts=-A32m -T"

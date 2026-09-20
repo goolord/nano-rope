@@ -11,9 +11,10 @@ module Chart
   , readSamples
   , render
   , showBytes
+  , commas
   ) where
 
-import Data.List (find, nub)
+import Data.List (find, intercalate, nub, unfoldr)
 import Numeric (showFFloat)
 
 -- | One benchmark: a workload run on a library.
@@ -323,26 +324,9 @@ decades vs = (lo, max (lo + 1) (ceiling (logBase 10 (maximum vs))))
 logX :: (Int, Int) -> (Double, Double) -> Double -> Double
 logX (lo, hi) (x0, x1) v = x0 + (logBase 10 v - fromIntegral lo) / fromIntegral (hi - lo) * (x1 - x0)
 
-timeTick :: Int -> String
-timeTick k = num (10 ^^ (k - e)) ++ unit
-  where
-    e = max (-9) (min 0 (3 * (k `div` 3)))
-    unit = case e of
-      -9 -> " ns"
-      -6 -> " µs"
-      -3 -> " ms"
-      _ -> " s"
-
-byteTick :: Int -> String
-byteTick k = num (10 ^^ (k - e)) ++ unit
-  where
-    e = max 0 (min 12 (3 * (k `div` 3)))
-    unit = case e of
-      0 -> " B"
-      3 -> " kB"
-      6 -> " MB"
-      9 -> " GB"
-      _ -> " TB"
+timeTick, byteTick :: Int -> String
+timeTick k = seconds num (10 ^^ k)
+byteTick k = trimBytes (10 ^^ k)
 
 ------------------------------------------------------------------------------
 -- Memory
@@ -461,12 +445,8 @@ factor cy better worse cmp = case cmp of
   _ -> []
   where
     times x
-      | x >= 10 = grouped (round x :: Integer) ++ "×"
+      | x >= 10 = commas (round x) ++ "×"
       | otherwise = showFFloat (Just 1) x "×"
-    grouped = reverse . go . reverse . show
-      where
-        go (a : b : d : rest@(_ : _)) = a : b : d : ',' : go rest
-        go ds = ds
 
 hit :: Double -> Double -> String
 hit y h = tag "rect" [("class", "hit"), ("x", num (margin - 8)), ("y", num y), ("width", num (width - 2 * margin + 16)), ("height", num h), ("rx", "4")] []
@@ -511,24 +491,23 @@ num v = let s = showFFloat (Just 1) v "" in if drop (length s - 2) s == ".0" the
 sig :: Double -> String
 sig v = showFFloat (Just (if v >= 100 then 0 else if v >= 10 then 1 else 2)) v ""
 
-showSeconds :: Double -> String
-showSeconds s
-  | s >= 1 = sig s ++ " s"
-  | s >= 1e-3 = sig (s * 1e3) ++ " ms"
-  | s >= 1e-6 = sig (s * 1e6) ++ " µs"
-  | otherwise = sig (s * 1e9) ++ " ns"
+-- | A quantity in the largest unit that leaves a digit in front of the
+-- point, of those a thousand apart from the given power of ten up.
+scaled :: Int -> [String] -> (Double -> String) -> Double -> String
+scaled e0 units shown v = last [shown (scale e) ++ u | (e, u) <- zip [e0, e0 + 3 ..] units, e == e0 || v >= 10 ^^ e]
+  where
+    -- By a whole number either way, which is exact where its inverse is not.
+    scale e = if e < 0 then v * 10 ^^ negate e else v / 10 ^^ e
 
-showBytes :: Double -> String
-showBytes b
-  | b >= 1e9 = sig (b / 1e9) ++ " GB"
-  | b >= 1e6 = sig (b / 1e6) ++ " MB"
-  | b >= 1e3 = sig (b / 1e3) ++ " kB"
-  | otherwise = sig b ++ " B"
+seconds :: (Double -> String) -> Double -> String
+seconds = scaled (-9) [" ns", " µs", " ms", " s"]
 
--- | A round number of bytes, without trailing zeros.
-trimBytes :: Double -> String
-trimBytes b
-  | b >= 1e9 = num (b / 1e9) ++ " GB"
-  | b >= 1e6 = num (b / 1e6) ++ " MB"
-  | b >= 1e3 = num (b / 1e3) ++ " kB"
-  | otherwise = num b ++ " B"
+showSeconds, showBytes, trimBytes :: Double -> String
+showSeconds = seconds sig
+showBytes = scaled 0 [" B", " kB", " MB", " GB", " TB"] sig
+-- A round number of bytes, without trailing zeros.
+trimBytes = scaled 0 [" B", " kB", " MB", " GB", " TB"] num
+
+-- | With a comma every three digits.
+commas :: Int -> String
+commas = reverse . intercalate "," . unfoldr (\s -> if null s then Nothing else Just (splitAt 3 s)) . reverse . show

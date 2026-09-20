@@ -30,23 +30,17 @@ module Lsp
   ) where
 
 import Control.DeepSeq (NFData (..))
-import Data.Bits (shiftR)
 import Data.Char (isAlpha, isAlphaNum, ord)
 import qualified Data.List as L
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.NanoRope (Metrics (..), Position (..), Rope, Unit (..))
 import qualified Data.Text.NanoRope as Rope
-import Data.Word (Word64)
+import Rand (rands)
 import Test.Tasty.Bench
 
 ------------------------------------------------------------------------------
 -- The document and the session
-
-rands :: Word64 -> [Int]
-rands = map (\x -> fromIntegral (x `shiftR` 33)) . drop 1 . iterate step
-  where
-    step x = x * 6364136223846793005 + 1442695040888963407
 
 -- | A module: short lines, an accent or an emoji in a comment now and then.
 moduleText :: Int -> Text
@@ -99,18 +93,21 @@ utf16Length = T.foldl' (\n c -> n + width16 c) 0
 
 -- | Typing: go to the end of some line and type a snippet there, a keystroke
 -- at a time, mistyping and erasing a letter now and then.
-typing :: Int -> Rope -> [Step]
+-- Comes with the document the steps leave behind, which the replay of the
+-- session builds on the way and nobody need fold again.
+typing :: Int -> Rope -> ([Step], Rope)
 typing bursts rope0 = go bursts (rands 7) rope0
   where
-    go :: Int -> [Int] -> Rope -> [Step]
-    go 0 _ _ = []
-    go n (r1 : r2 : rs) rope =
-      let line = r1 `mod` Rope.lineCount rope
-          col = utf16Length (Rope.getLine line rope)
-          steps = keys (T.unpack (snippets !! (r2 `mod` L.length snippets))) (1 :: Int) line col
-          rope' = L.foldl' (\r (Step c _) -> applyChange TwoDescents r c) rope steps
-       in steps ++ go (n - 1) rs rope'
-    go _ _ _ = []
+    go :: Int -> [Int] -> Rope -> ([Step], Rope)
+    go n (r1 : r2 : rs) rope
+      | n > 0 =
+          let line = r1 `mod` Rope.lineCount rope
+              col = utf16Length (Rope.getLine line rope)
+              steps = keys (T.unpack (snippets !! (r2 `mod` L.length snippets))) (1 :: Int) line col
+              rope' = L.foldl' (\r (Step c _) -> applyChange TwoDescents r c) rope steps
+              (rest, final) = go (n - 1) rs rope'
+           in (steps ++ rest, final)
+    go _ _ rope = ([], rope)
 
     keys [] _ _ _ = []
     keys (c : cs) i line col
@@ -135,7 +132,7 @@ renaming edits text =
 
 -- | A word of the document: its line, its columns in code points as GHC
 -- counts them, and its start in UTF-16 code units as a client does.
-data Token = Token !Int !Int !Int !Position
+data Token = Token !Int !Int !Int !Int
 
 instance NFData Token where
   rnf !_ = ()
@@ -151,7 +148,7 @@ tokens text = concat (zipWith (\l -> go l 0 0) [0 ..] (T.lines text))
           to = from + T.length word
        in if T.null word
             then []
-            else Token l from to (Position l from16) : go l to (from16 + utf16Length word) rest'
+            else Token l from to from16 : go l to (from16 + utf16Length word) rest'
 
 ------------------------------------------------------------------------------
 -- Language.LSP.VFS
@@ -200,41 +197,25 @@ lineBounds rope l
   | l < Rope.lineCount rope = Just (Rope.metricsAt Lines l rope, Rope.metricsAt Lines (l + 1) rope)
   | otherwise = Nothing
 
--- | A position in code points to one in UTF-16 code units. A column on the
--- line is there in one descent; one in its terminator, or beyond, takes the
--- bounds of the line to tell.
-codePointPositionToPosition :: Asking -> Rope -> Position -> Maybe Position
-codePointPositionToPosition OneDescent text pos@(Position l c)
-  | (line, loc) <- Rope.metricsAtLineAndPosition Chars pos text
+-- | @codePointPositionToPosition@ and @positionToCodePointPosition@: a
+-- position with its column in one unit as one with it in another, or
+-- 'Nothing' if there is no such column, or it lies within a code point. A
+-- column on the line is there in one descent; one in its terminator, or
+-- beyond, takes the bounds of the line to tell.
+convertPosition :: Unit -> Unit -> Asking -> Rope -> Position -> Maybe Position
+convertPosition from to OneDescent text pos@(Position l c)
+  | (line, loc) <- Rope.metricsAtLineAndPosition from pos text
   , newlines line == l
-  , chars loc - chars line == c =
-      Just (Position l (utf16Units loc - utf16Units line))
-codePointPositionToPosition _ text (Position l c) = do
+  , Rope.count from loc - Rope.count from line == c =
+      Just (Position l (Rope.count to loc - Rope.count to line))
+convertPosition from to _ text (Position l c) = do
   (lineStart, lineEnd) <- lineBounds text l
-  let target = chars lineStart + c
-  if target <= chars lineEnd
-    then
-      let loc = Rope.metricsAt Chars target text
-       in Just (Position l (utf16Units loc - utf16Units lineStart))
+  let target = Rope.count from lineStart + c
+      loc = Rope.metricsAt from target text
+  if target <= Rope.count from lineEnd && Rope.count from loc == target
+    then Just (Position l (Rope.count to loc - Rope.count to lineStart))
     else Nothing
-{-# INLINE codePointPositionToPosition #-}
-
--- | A position in UTF-16 code units to one in code points.
-positionToCodePointPosition :: Asking -> Rope -> Position -> Maybe Position
-positionToCodePointPosition OneDescent text pos@(Position l c)
-  | (line, loc) <- Rope.metricsAtLineAndPosition Utf16 pos text
-  , newlines line == l
-  , utf16Units loc - utf16Units line == c =
-      Just (Position l (chars loc - chars line))
-positionToCodePointPosition _ text (Position l c) = do
-  (lineStart, lineEnd) <- lineBounds text l
-  let target = utf16Units lineStart + c
-  if target <= utf16Units lineEnd
-    then
-      let loc = Rope.metricsAt Utf16 target text
-       in if utf16Units loc == target then Just (Position l (chars loc - chars lineStart)) else Nothing
-    else Nothing
-{-# INLINE positionToCodePointPosition #-}
+{-# INLINE convertPosition #-}
 
 rangeLines :: Rope -> Int -> Int -> Text
 rangeLines rope lf lt = Rope.sliceText Lines lf lt rope
@@ -308,8 +289,8 @@ semanticTokens asking rope = L.foldl' (\n t -> n + focusToken asking rope t) 0
 convertPositions :: Asking -> Rope -> [Position] -> Int
 convertPositions asking rope = L.foldl' step 0
   where
-    step n p = case positionToCodePointPosition asking rope p of
-      Just cp | Just (Position l c) <- codePointPositionToPosition asking rope cp -> n + l + c
+    step n p = case convertPosition Utf16 Chars asking rope p of
+      Just cp | Just (Position l c) <- convertPosition Chars Utf16 asking rope cp -> n + l + c
       _ -> n - 1
 {-# INLINE convertPositions #-}
 
@@ -346,13 +327,12 @@ mkLspEnv nLines =
     , lspTyping = steps
     , lspRenaming = renaming 200 text
     , lspTokens = toks
-    , lspPositions = every 4 [p | Token _ _ _ p <- toks]
+    , lspPositions = every 4 [Position l c | Token l _ _ c <- toks]
     }
   where
     text = moduleText nLines
     opened = Rope.fromText text
-    steps = typing 100 opened
-    edited = L.foldl' (\r (Step c _) -> applyChange TwoDescents r c) opened steps
+    (steps, edited) = typing 100 opened
     toks = tokens (Rope.toText edited)
     every n xs = case xs of
       [] -> []
@@ -360,18 +340,17 @@ mkLspEnv nLines =
 
 lspBenchmarks :: LspEnv -> [Benchmark]
 lspBenchmarks e =
-  [ bench "typing, the edits alone" $ whnf (replay OneDescent observeNothing (lspOpened e)) (lspTyping e)
-  , bench "typing, completion prefix after each key" $ whnf (replay OneDescent (completionPrefix OneDescent) (lspOpened e)) (lspTyping e)
-  , bench "rename, 200 edits at once" $ whnf (rename OneDescent (lspOpened e)) (lspRenaming e)
-  , bench "semantic tokens" $ whnf (semanticTokens OneDescent (lspEdited e)) (lspTokens e)
-  , bench "position conversions" $ whnf (convertPositions OneDescent (lspEdited e)) (lspPositions e)
-  , bench "reading lines" $ whnf (readLines (lspEdited e)) (lspPositions e)
-  , bgroup
-      "in two descents"
-      [ bench "typing, the edits alone" $ whnf (replay TwoDescents observeNothing (lspOpened e)) (lspTyping e)
-      , bench "typing, completion prefix after each key" $ whnf (replay TwoDescents (completionPrefix TwoDescents) (lspOpened e)) (lspTyping e)
-      , bench "rename, 200 edits at once" $ whnf (rename TwoDescents (lspOpened e)) (lspRenaming e)
-      , bench "semantic tokens" $ whnf (semanticTokens TwoDescents (lspEdited e)) (lspTokens e)
-      , bench "position conversions" $ whnf (convertPositions TwoDescents (lspEdited e)) (lspPositions e)
+  asked OneDescent
+    ++ [ bench "reading lines" $ whnf (readLines (lspEdited e)) (lspPositions e)
+       , bgroup "in two descents" (asked TwoDescents)
+       ]
+  where
+    -- Inlined, so that each workload is compiled for the one way of asking.
+    asked asking =
+      [ bench "typing, the edits alone" $ whnf (replay asking observeNothing (lspOpened e)) (lspTyping e)
+      , bench "typing, completion prefix after each key" $ whnf (replay asking (completionPrefix asking) (lspOpened e)) (lspTyping e)
+      , bench "rename, 200 edits at once" $ whnf (rename asking (lspOpened e)) (lspRenaming e)
+      , bench "semantic tokens" $ whnf (semanticTokens asking (lspEdited e)) (lspTokens e)
+      , bench "position conversions" $ whnf (convertPositions asking (lspEdited e)) (lspPositions e)
       ]
-  ]
+    {-# INLINE asked #-}
