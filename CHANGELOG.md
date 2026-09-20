@@ -11,7 +11,9 @@
 * Typing is buffered: keystrokes that continue each other wait next to the
   tree and are inserted at once when the rope is next read, and erasing what
   was just typed takes them back. `length` and `metrics` stay `O(1)`.
-* `splitAt` finds both halves in one descent.
+* `splitAt` finds both halves in one descent. `slice` and `sliceText` follow
+  both ends of the range down together: a range within one chunk is a single
+  descent, and nothing above the lowest node holding all of it is rebuilt.
 * `metricsAtLineAndPosition` finds a position and the start of its line in
   one descent. Their difference is the column that was reached in every unit,
   which is what a language server converts columns with, and how it tells a

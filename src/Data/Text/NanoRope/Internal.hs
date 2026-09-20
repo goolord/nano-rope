@@ -2288,28 +2288,69 @@ drop :: Measure a => Unit -> Int -> Rope a -> Rope a
 drop u k (Rope root) = Rope (dropRoot u k root)
 {-# INLINABLE drop #-}
 
--- | Both offsets as bytes. Offsets of the original rope rather than of some
--- intermediate result, so that they round the same way as everywhere else.
-byteRange :: Unit -> Int -> Int -> Node a -> (Int, Int)
-byteRange u i j root = (bi, if j <= i then bi else byteOffsetAtNode u j root)
-  where
-    bi = byteOffsetAtNode u i root
-{-# INLINE byteRange #-}
-
 -- | /O(log n)/. @slice u i j@ is the text from offset @i@ up to offset @j@.
+--
+-- Nothing above the lowest node that holds all of the range is looked at
+-- twice or rebuilt, and a range within a single chunk is one descent and a
+-- copy of those bytes.
 slice :: Measure a => Unit -> Int -> Int -> Rope a -> Rope a
-slice u i j (Rope root) = Rope (dropRoot Bytes bi (takeRoot Bytes bj root))
-  where
-    (bi, bj) = byteRange u i j root
+slice u i j (Rope root)
+  | j <= i || j <= 0 = empty
+  | beyondEnd u j (nodeMetrics root) = Rope (dropRoot u i root)
+  | otherwise = Rope (sliceNode u (max 0 i) j root)
 {-# INLINABLE slice #-}
+
+-- | The text from offset @i@ up to offset @j@ of a node, for @0 <= i < j@
+-- and @j@ not beyond its end.
+--
+-- Both offsets are followed down as long as they lead into the same child.
+-- Where they part they become bytes. They are offsets of the original rope
+-- all along rather than of some intermediate result, so that they round the
+-- same way as everywhere else.
+sliceNode :: Measure a => Unit -> Int -> Int -> Node a -> Node a
+sliceNode !u !i !j node = case node of
+  Leaf m _ arr ->
+    let !bi = leafOffset u i m arr
+        !bj = leafOffset u j m arr
+     in if bi <= 0 && bj >= sizeofByteArray arr
+          then node
+          else
+            if bj <= bi
+              then emptyNode
+              else mkLeafWith (leafSliceMetrics m arr bi (bj - bi)) (cloneByteArray arr bi (bj - bi))
+  Inner _ _ _ cs -> case seekUnit u i cs of
+    Sought c i'
+      | j' <= count u (nodeMetrics child) -> sliceNode u i' j' child
+      | otherwise -> dropRoot Bytes (byteOffsetAtNode u i node) (takeRoot Bytes (byteOffsetAtNode u j node) node)
+      where
+        child = indexChildren cs c
+        j' = j - (i - i')
+{-# INLINABLE sliceNode #-}
+{-# SPECIALIZE sliceNode :: Unit -> Int -> Int -> Node () -> Node () #-}
 
 -- | /O(log n + length of the result)/. Like 'slice', but straight to 'Text'
 -- without building a rope in between. A range within a single chunk is
--- returned as a zero-copy view of that chunk.
+-- found in one descent and returned as a zero-copy view of that chunk.
 sliceText :: Unit -> Int -> Int -> Rope a -> Text
-sliceText u i j (Rope root) = sliceToText bi bj root
-  where
-    (bi, bj) = byteRange u i j root
+sliceText u i j (Rope root)
+  | j <= i || j <= 0 = T.empty
+  | beyondEnd u j (nodeMetrics root) = sliceToText (byteOffsetAtNode u i root) (nodeBytes root) root
+  | otherwise = sliceTextNode u (max 0 i) j root
+
+-- | 'sliceNode' as a 'Text'.
+sliceTextNode :: Unit -> Int -> Int -> Node a -> Text
+sliceTextNode !u !i !j node = case node of
+  Leaf m _ arr ->
+    let !bi = leafOffset u i m arr
+        !bj = leafOffset u j m arr
+     in viewSlice arr bi (bj - bi)
+  Inner _ _ _ cs -> case seekUnit u i cs of
+    Sought c i'
+      | j' <= count u (nodeMetrics child) -> sliceTextNode u i' j' child
+      | otherwise -> sliceToText (byteOffsetAtNode u i node) (byteOffsetAtNode u j node) node
+      where
+        child = indexChildren cs c
+        j' = j - (i - i')
 
 ------------------------------------------------------------------------------
 -- Editing
