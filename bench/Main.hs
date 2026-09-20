@@ -24,6 +24,7 @@ import Data.Text.NanoRope.Internal (kernels, kernelsName)
 import Data.Version (showVersion)
 import Data.Word (Word64)
 import GHC.Stats (getRTSStatsEnabled)
+import Lsp (lspBenchmarks, mkLspEnv)
 import Memory (footprint, fresh)
 import System.Environment (getArgs, withArgs)
 import System.Exit (ExitCode (..))
@@ -365,6 +366,10 @@ documentLines, workloadOps :: Int
 documentLines = 100000
 workloadOps = 10000
 
+-- | The size of the module of the language server workloads: some 300 kB.
+lspLines :: Int
+lspLines = 8000
+
 benchmarks :: [Benchmark]
 benchmarks =
     [ env (pure (mkEnv documentLines workloadOps)) $ \e ->
@@ -582,6 +587,10 @@ benchmarks =
 #endif
               ]
           ]
+    , -- A module the size of a large one of GHC's, and the rope's side of what
+      -- lsp and haskell-language-server do with it: see "Lsp".
+      env (pure (mkLspEnv lspLines)) $ \e ->
+        bgroup "language server, 8k lines" (lspBenchmarks e)
     ]
 
 ------------------------------------------------------------------------------
@@ -607,7 +616,9 @@ main = do
           Left ExitSuccess -> pure ()
           Left failure -> throwIO failure
           Right () -> pure ()
-      samples <- readSamples <$> withFile csv ReadMode hGetContents'
+      -- The workloads of a language server are nano-rope's alone and are not
+      -- drawn: the chart is of what the libraries can be compared by.
+      samples <- filter ((`elem` libraries) . sampleLibrary) . readSamples <$> withFile csv ReadMode hGetContents'
       bytes <- Nano.length Bytes . Nano.fromText <$> fresh sourceText documentLines
       let ran = map sampleLibrary samples ++ map footprintLibrary fps
           others = filter (`elem` ran) (drop 1 libraries)
