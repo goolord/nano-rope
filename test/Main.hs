@@ -145,6 +145,7 @@ main =
           , testProperty "the next line feed" prop_scanNext
           , testProperty "the previous line feed" prop_scanPrevious
           , testProperty "the k-th line feed" prop_scanNth
+          , testProperty "the k-th line" prop_scanLine
           , testProperty "code points and UTF-16 code units" prop_scanUnits
           ]
       ]
@@ -1050,6 +1051,19 @@ prop_scanNth (Scanned t) = forAll (choose (1, L.length lfs + 2)) $ \n ->
   allKernels (\k -> kernelNthNewline k n arr) (case L.drop (n - 1) lfs of i : _ -> i + 1; [] -> sizeofByteArray arr)
   where
     arr = bytesOfText t
+    lfs = lineFeeds arr
+
+-- | Where a line starts and where the line feed that ends it is, for the
+-- lines there are, the one after the last and the ones before the first.
+prop_scanLine :: Scanned -> Property
+prop_scanLine (Scanned t) = forAll (choose (-1, L.length lfs + 2)) $ \n ->
+  let from
+        | n <= 0 = 0
+        | otherwise = case L.drop (n - 1) lfs of i : _ -> i + 1; [] -> size
+   in allKernels (\k -> kernelLineSpan k n arr) (from, fromMaybe size (L.find (>= from) lfs))
+  where
+    arr = bytesOfText t
+    size = sizeofByteArray arr
     lfs = lineFeeds arr
 
 -- | Between two code point boundaries: the end of the longest run of whole

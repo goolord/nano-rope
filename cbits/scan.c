@@ -161,6 +161,24 @@ static inline uint32_t nth_bit(uint32_t m, HsInt k)
   attr static inline HsInt units_##level(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)      \
   {                                                                                                     \
     return (HsInt)popcount_##level(lanes & ~conts) + (wide ? (HsInt)popcount_##level(lanes & fours) : 0); \
+  }                                                                                                     \
+  /* The lane of the first code point that does not fit into k units, with u <= k of them counted      \
+   * already, in a vector whose `lanes` hold more than the rest. Read off the bits: where every unit   \
+   * is a code point it is the leader after those that fit. */                                         \
+  attr static inline uint32_t units_stop_##level(uint32_t lanes, uint32_t conts, uint32_t fours, HsInt k, \
+                                                 HsInt u, int wide)                                     \
+  {                                                                                                     \
+    uint32_t leaders = lanes & ~conts;                                                                  \
+    if (!wide || (fours & lanes) == 0)                                                                  \
+      return nth_bit(leaders, k - u + 1);                                                               \
+    for (;;) {                                                                                          \
+      uint32_t lane = (uint32_t)__builtin_ctz(leaders);                                                 \
+      HsInt w = (fours >> lane) & 1 ? 2 : 1;                                                            \
+      if (u + w > k)                                                                                    \
+        return lane;                                                                                    \
+      u += w;                                                                                           \
+      leaders &= leaders - 1;                                                                           \
+    }                                                                                                   \
   }
 
 MASK_HELPERS(sse2, )
@@ -317,16 +335,18 @@ static HsInt scan_units_sse2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int
     return scan_units_c(s, i, to, k, u, wide);
   for (; to - i >= 16; i += 16) {
     __m128i x = _mm_loadu_si128((const __m128i *)(s + i));
-    HsInt c = units_sse2(0xFFFF, bits128(conts128(x)), bits128(fours128(x)), wide);
+    uint32_t conts = bits128(conts128(x)), fours = bits128(fours128(x));
+    HsInt c = units_sse2(0xFFFF, conts, fours, wide);
     if (u + c > k)
-      return scan_units_c(s, i, to, k, u, wide);
+      return (HsInt)(i + units_stop_sse2(0xFFFF, conts, fours, k, u, wide));
     u += c;
   }
   if (i < to) {
     __m128i x = _mm_loadu_si128((const __m128i *)(s + to - 16));
+    uint32_t conts = bits128(conts128(x)), fours = bits128(fours128(x));
     uint32_t lanes = 0xFFFFu & ~((1u << (16 - (to - i))) - 1);
-    if (u + units_sse2(lanes, bits128(conts128(x)), bits128(fours128(x)), wide) > k)
-      return scan_units_c(s, i, to, k, u, wide);
+    if (u + units_sse2(lanes, conts, fours, wide) > k)
+      return (HsInt)(to - 16 + units_stop_sse2(lanes, conts, fours, k, u, wide));
   }
   return (HsInt)to;
 }
@@ -480,16 +500,18 @@ AVX2 static HsInt scan_units_avx2(bytes s, size_t i, size_t to, HsInt k, HsInt u
     return scan_units_sse2(s, i, to, k, u, wide);
   for (; to - i >= 32; i += 32) {
     __m256i x = _mm256_loadu_si256((const __m256i *)(s + i));
-    HsInt c = units_avx2(0xFFFFFFFFu, bits256(conts256(x)), bits256(fours256(x)), wide);
+    uint32_t conts = bits256(conts256(x)), fours = bits256(fours256(x));
+    HsInt c = units_avx2(0xFFFFFFFFu, conts, fours, wide);
     if (u + c > k)
-      return scan_units_c(s, i, to, k, u, wide);
+      return (HsInt)(i + units_stop_avx2(0xFFFFFFFFu, conts, fours, k, u, wide));
     u += c;
   }
   if (i < to) {
     __m256i x = _mm256_loadu_si256((const __m256i *)(s + to - 32));
+    uint32_t conts = bits256(conts256(x)), fours = bits256(fours256(x));
     uint32_t lanes = ~((1u << (32 - (to - i))) - 1);
-    if (u + units_avx2(lanes, bits256(conts256(x)), bits256(fours256(x)), wide) > k)
-      return scan_units_c(s, i, to, k, u, wide);
+    if (u + units_avx2(lanes, conts, fours, wide) > k)
+      return (HsInt)(to - 32 + units_stop_avx2(lanes, conts, fours, k, u, wide));
   }
   return (HsInt)to;
 }
@@ -583,10 +605,24 @@ HsInt nano_rope_nth_newline(HsInt level, bytes s, HsInt n, HsInt k)
   DISPATCH(level, nth_newline, s, 0, (size_t)n, k)
 }
 
+/* A line of s[0 .. n): the offset just after the k-th '\n', or 0 for k <= 0,
+ * and that of the first '\n' at or after it, or n. The former in the low 32
+ * bits, the latter in the high ones. Whoever wants a line wants both, and
+ * here they are one call. */
+HsWord64 nano_rope_line_span(HsInt level, bytes s, HsInt n, HsInt k)
+{
+  HsInt from = k <= 0 ? 0 : nano_rope_nth_newline(level, s, n, k);
+  HsInt lf = nano_rope_find_newline(level, s, from, n);
+  return (HsWord64)from | (HsWord64)lf << 32;
+}
+
 /* Walking over the code points of s[from .. to) from the boundary `from`,
  * the offset in front of the first one that does not fit into k units, or
  * `to`. Units are code points, or UTF-16 code units if wide. */
 HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, HsInt wide)
 {
+  /* Nothing fits into no units, and the vector loops count on k >= 0. */
+  if (k <= 0)
+    return from < to ? from : to;
   DISPATCH(level, scan_units, s, (size_t)from, (size_t)to, k, 0, (int)wide)
 }
