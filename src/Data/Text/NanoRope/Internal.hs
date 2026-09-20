@@ -153,6 +153,7 @@ module Data.Text.NanoRope.Internal
   , sliceMetrics
   , offsetInChunk
   , chunkText
+  , ChunkLine (..)
   , Kernels (..)
   , kernels
   ) where
@@ -954,10 +955,8 @@ leafPrefixMetrics m arr b
 -- that is all there is to know, and nothing is scanned.
 leafPrefixWithLines :: Metrics -> ByteArray -> Int -> Int -> Metrics
 leafPrefixWithLines m arr b nls
-  | b <= 0 = mempty
-  | b >= bytes m = m
-  | isAscii m = Metrics b b b nls
-  | otherwise = leafCutMetrics m arr b
+  | isAscii m && 0 < b && b < bytes m = Metrics b b b nls
+  | otherwise = leafPrefixMetrics m arr b
 {-# INLINE leafPrefixWithLines #-}
 
 -- | 'leafPrefixMetrics' of a cut inside the leaf. Apart from the above
@@ -1067,6 +1066,7 @@ swarScanLines !k !arr = goWord 0 0
 -- | Where a line of a chunk starts, and where the @\\n@ that ends it is, or
 -- the size of the chunk.
 data ChunkLine = ChunkLine {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+  deriving (Eq, Show)
 
 -- | Line @k@ of a chunk, which starts just after its @k@-th @\\n@, or at 0
 -- for the first. 'scanLines' and 'findNewline' in one go, which is one foreign
@@ -1097,22 +1097,18 @@ data Kernels = Kernels
   -- ^ The first line feed at or after an offset, or the size.
   , kernelFindNewlineBack :: ByteArray -> Int -> Int
   -- ^ The last line feed before an offset, or -1.
-  , kernelNthNewline :: Int -> ByteArray -> Int
-  -- ^ Just after the @k@-th line feed, for @k >= 1@, or the size.
   , kernelScanUnits :: Bool -> Int -> ByteArray -> Int -> Int -> Int
   -- ^ @kernelScanUnits wide k arr from to@: from a code point boundary, the
   -- offset in front of the first code point that does not fit into @k@ code
   -- points (UTF-16 code units if @wide@), or @to@.
-  , kernelLineSpan :: Int -> ByteArray -> (Int, Int)
+  , kernelLineSpan :: Int -> ByteArray -> ChunkLine
   -- ^ Just after the @k@-th line feed, or 0 for @k <= 0@, and the first line
   -- feed at or after that, or the size.
   }
 
 -- | The scans in Haskell, 8 bytes at a time.
 swarKernels :: Kernels
-swarKernels =
-  Kernels "Haskell" swarMetrics swarNewlines swarFindNewline swarFindNewlineBack swarScanLines swarScanUnits $ \k arr ->
-    case swarLineSpan k arr of ChunkLine from lf -> (from, lf)
+swarKernels = Kernels "Haskell" swarMetrics swarNewlines swarFindNewline swarFindNewlineBack swarScanUnits swarLineSpan
 
 -- | Every implementation this machine runs: the Haskell one, then those in C
 -- by level of SIMD support. The last one is used on long slices.
@@ -1140,9 +1136,8 @@ simdKernels level =
     (cNewlines level)
     (cFindNewline level)
     (cFindNewlineBack level)
-    (cNthNewline level)
     (cScanUnits level)
-    (\k arr -> case cLineSpan level k arr of ChunkLine from lf -> (from, lf))
+    (cLineSpan level)
 
 -- The scans of a t'Kernels' in C, given the level of SIMD support.
 cMetrics :: Int -> ByteArray -> Int -> Int -> Metrics
@@ -1632,11 +1627,11 @@ metricsAtNode u k root
   | otherwise = go mempty k root
   where
     go !acc !j node = case node of
-      Leaf m _ arr
-        -- Just after the j-th line feed of this leaf, which it has: there
-        -- are j of them before that.
-        | u == Lines -> acc <> leafPrefixWithLines m arr (scanLines j arr) j
-        | otherwise -> acc <> leafPrefixMetrics m arr (leafOffset u j m arr)
+      Leaf m _ arr ->
+        let !b = leafOffset u j m arr
+         in -- Sought by lines, the offset is just after the j-th line feed
+            -- of this leaf, which it has: there are j of them before it.
+            acc <> if u == Lines then leafPrefixWithLines m arr b j else leafPrefixMetrics m arr b
       Inner total _ _ cs -> case seekChild u j total cs of
         Seek i before -> go (acc <> before) (j - count u before) (indexChildren cs i)
 
@@ -2360,31 +2355,43 @@ slice u i j (Rope root)
   | otherwise = Rope (sliceNode u (max 0 i) j root)
 {-# INLINABLE slice #-}
 
+-- | The lowest node holding all of offsets @i@ up to @j@, with both rebased
+-- on it.
+data Sliced a = Sliced !(Node a) {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+
+-- | Follow both ends of a range down as long as they lead into the same
+-- child, for @0 <= i < j@ and @j@ not beyond the end.
+--
+-- The one place 'slice' and 'sliceText' part ways: they take the range to
+-- the same node by the same steps, and only what they make of it there
+-- differs. The offsets are of the original rope all along rather than of
+-- some intermediate result, so that they round the same way as each other
+-- and as everywhere else.
+sliceDescend :: Unit -> Int -> Int -> Node a -> Sliced a
+sliceDescend !u !i !j node = case node of
+  Leaf{} -> Sliced node i j
+  Inner total _ _ cs -> case seekUnit u i (count u total) cs of
+    Sought c i'
+      | j' <= count u (nodeMetrics child) -> sliceDescend u i' j' child
+      | otherwise -> Sliced node i j
+      where
+        child = indexChildren cs c
+        j' = j - (i - i')
+
 -- | The text from offset @i@ up to offset @j@ of a node, for @0 <= i < j@
 -- and @j@ not beyond its end.
---
--- Both offsets are followed down as long as they lead into the same child.
--- Where they part they become bytes. They are offsets of the original rope
--- all along rather than of some intermediate result, so that they round the
--- same way as everywhere else.
 sliceNode :: Measure a => Unit -> Int -> Int -> Node a -> Node a
-sliceNode !u !i !j node = case node of
-  Leaf m _ arr ->
-    let !bi = leafOffset u i m arr
-        !bj = leafOffset u j m arr
+sliceNode u i j root = case sliceDescend u i j root of
+  Sliced node@(Leaf m _ arr) i' j' ->
+    let !bi = leafOffset u i' m arr
+        !bj = leafOffset u j' m arr
      in if bi <= 0 && bj >= sizeofByteArray arr
           then node
           else
             if bj <= bi
               then emptyNode
               else mkLeafWith (leafSliceMetrics m arr bi (bj - bi)) (cloneByteArray arr bi (bj - bi))
-  Inner total _ _ cs -> case seekUnit u i (count u total) cs of
-    Sought c i'
-      | j' <= count u (nodeMetrics child) -> sliceNode u i' j' child
-      | otherwise -> dropRoot Bytes (byteOffsetAtNode u i node) (takeRoot Bytes (byteOffsetAtNode u j node) node)
-      where
-        child = indexChildren cs c
-        j' = j - (i - i')
+  Sliced node i' j' -> dropRoot Bytes (byteOffsetAtNode u i' node) (takeRoot Bytes (byteOffsetAtNode u j' node) node)
 {-# INLINABLE sliceNode #-}
 {-# SPECIALIZE sliceNode :: Unit -> Int -> Int -> Node () -> Node () #-}
 
@@ -2399,18 +2406,12 @@ sliceText u i j (Rope root)
 
 -- | 'sliceNode' as a 'Text'.
 sliceTextNode :: Unit -> Int -> Int -> Node a -> Text
-sliceTextNode !u !i !j node = case node of
-  Leaf m _ arr ->
-    let !bi = leafOffset u i m arr
-        !bj = leafOffset u j m arr
+sliceTextNode u i j root = case sliceDescend u i j root of
+  Sliced (Leaf m _ arr) i' j' ->
+    let !bi = leafOffset u i' m arr
+        !bj = leafOffset u j' m arr
      in viewSlice arr bi (bj - bi)
-  Inner total _ _ cs -> case seekUnit u i (count u total) cs of
-    Sought c i'
-      | j' <= count u (nodeMetrics child) -> sliceTextNode u i' j' child
-      | otherwise -> sliceToText (byteOffsetAtNode u i node) (byteOffsetAtNode u j node) node
-      where
-        child = indexChildren cs c
-        j' = j - (i - i')
+  Sliced node i' j' -> sliceToText (byteOffsetAtNode u i' node) (byteOffsetAtNode u j' node) node
 
 ------------------------------------------------------------------------------
 -- Editing

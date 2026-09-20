@@ -25,7 +25,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Internal as TI
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.NanoRope as Plain
-import Data.Text.NanoRope.Internal (Kernels (..), height, invariants, kernels, maxChunk)
+import Data.Text.NanoRope.Internal (ChunkLine (..), Kernels (..), height, invariants, kernels, maxChunk)
 import Data.Text.NanoRope.Measured (Measure (..), Metrics (..), Position (..), Rope, Unit (..))
 import qualified Data.Text.NanoRope.Measured as Rope
 import Data.Text.Unsafe (dropWord8, takeWord8)
@@ -71,8 +71,7 @@ main =
           "units"
           [ testProperty "metricsAt" prop_metricsAt
           , testProperty "convert" prop_convert
-          , testProperty "metricsAtPosition / splitAtPosition" prop_position
-          , testProperty "metricsAtLineAndPosition" prop_linePosition
+          , testProperty "metricsAtPosition / metricsAtLineAndPosition / splitAtPosition" prop_position
           , testProperty "metricsToPosition" prop_toPosition
           , testProperty "position round trip" prop_positionRoundtrip
           ]
@@ -98,36 +97,21 @@ main =
           [ testProperty "the ropes they are tried on" prop_lawRopes
           , -- Enough for three ropes picked independently to be equal now and then.
             adjustOption (\(QuickCheckTests n) -> QuickCheckTests (max 500 n)) $
-              lawsOf
-                "Rope"
-                [ eqLaws ropes
-                , ordLaws ropes
-                , eqOrdLaws ropes
-                , semigroupLaws ropes
-                , monoidLaws ropes
-                , semigroupMonoidLaws ropes
-                , homomorphismLaws
-                , showLaws ropes
-                , isStringLaws
-                ]
-          , lawsOf
-              "Metrics"
-              [ semigroupLaws metrics
-              , monoidLaws metrics
-              , commutativeMonoidLaws metrics
-              , semigroupMonoidLaws metrics
-              ]
+              lawsOf "Rope" $
+                map ($ Proxy @R) [eqLaws, ordLaws, eqOrdLaws, semigroupLaws, monoidLaws, semigroupMonoidLaws, showLaws]
+                  ++ [homomorphismLaws, isStringLaws]
+          , lawsOf "Metrics" $ map ($ Proxy @Metrics) [semigroupLaws, monoidLaws, commutativeMonoidLaws, semigroupMonoidLaws]
           , testGroup
               "Measure"
-              [ lawsOf "()" [measureLaws (Proxy :: Proxy ())]
-              , lawsOf "pairs" [measureLaws (Proxy :: Proxy (Breaks, Width))]
-              , lawsOf "triples" [measureLaws (Proxy :: Proxy ((), Width, Breaks))]
+              [ lawsOf "()" [measureLaws (Proxy @())]
+              , lawsOf "pairs" [measureLaws (Proxy @(Breaks, Width))]
+              , lawsOf "triples" [measureLaws (Proxy @((), Width, Breaks))]
               ]
           , -- The measures of this file, which the rest of it relies on.
             testGroup
               "test measures"
-              [ lawsOf "Breaks" [semigroupLaws breaks, monoidLaws breaks, semigroupMonoidLaws breaks, measureLaws breaks]
-              , lawsOf "Width" [semigroupLaws widths, monoidLaws widths, semigroupMonoidLaws widths, measureLaws widths]
+              [ lawsOf "Breaks" $ map ($ Proxy @Breaks) [semigroupLaws, monoidLaws, semigroupMonoidLaws, measureLaws]
+              , lawsOf "Width" $ map ($ Proxy @Width) [semigroupLaws, monoidLaws, semigroupMonoidLaws, measureLaws]
               ]
           ]
       , testGroup
@@ -144,7 +128,6 @@ main =
           , testProperty "line feeds" prop_scanNewlines
           , testProperty "the next line feed" prop_scanNext
           , testProperty "the previous line feed" prop_scanPrevious
-          , testProperty "the k-th line feed" prop_scanNth
           , testProperty "the k-th line" prop_scanLine
           , testProperty "code points and UTF-16 code units" prop_scanUnits
           ]
@@ -708,18 +691,14 @@ prop_position :: Edited -> Unit -> Property
 prop_position (Edited r t) u = forAll (genPosition t) $ \pos ->
   let n = charsAtPosition u pos t
       (a, b) = Rope.splitAtPosition u pos r
+      -- The position again, with the start of its line.
+      (line, at) = Rope.metricsAtLineAndPosition u pos r
    in Rope.metricsAtPosition u pos r === naiveMetrics (T.take n t)
+        .&&. at === naiveMetrics (T.take n t)
+        .&&. line === naiveMetrics (T.take (charsAt Lines (posLine pos) t) t)
         .&&. Rope.toText a === T.take n t
         .&&. Rope.toText b === T.drop n t
         .&&. Rope.positionToOffset u Chars pos r === n
-
--- | The start of the line and the position, each as if asked for alone.
-prop_linePosition :: Edited -> Unit -> Property
-prop_linePosition (Edited r t) u = forAll (genPosition t) $ \pos ->
-  let (line, at) = Rope.metricsAtLineAndPosition u pos r
-   in line === naiveMetrics (T.take (charsAt Lines (posLine pos) t) t)
-        .&&. at === naiveMetrics (T.take (charsAtPosition u pos t) t)
-        .&&. (line, at) === (Rope.metricsAt Lines (posLine pos) r, Rope.metricsAtPosition u pos r)
 
 prop_toPosition :: Edited -> Unit -> Unit -> Offset -> Property
 prop_toPosition (Edited r t) from to i =
@@ -809,18 +788,6 @@ prop_show (Edited r t) = show r === show t
 lawsOf :: String -> [Laws] -> TestTree
 lawsOf name sets =
   testGroup name [testGroup cls [testProperty law p | (law, p) <- properties] | Laws cls properties <- sets]
-
-ropes :: Proxy R
-ropes = Proxy
-
-metrics :: Proxy Metrics
-metrics = Proxy
-
-breaks :: Proxy Breaks
-breaks = Proxy
-
-widths :: Proxy Width
-widths = Proxy
 
 -- | The laws speak of ropes that are equal, or that differ late, and two
 -- documents picked at random are neither. These are a few texts over a
@@ -1046,21 +1013,15 @@ prop_scanPrevious (Scanned t) = forAll (choose (0, sizeofByteArray arr)) $ \to -
   where
     arr = bytesOfText t
 
-prop_scanNth :: Scanned -> Property
-prop_scanNth (Scanned t) = forAll (choose (1, L.length lfs + 2)) $ \n ->
-  allKernels (\k -> kernelNthNewline k n arr) (case L.drop (n - 1) lfs of i : _ -> i + 1; [] -> sizeofByteArray arr)
-  where
-    arr = bytesOfText t
-    lfs = lineFeeds arr
-
--- | Where a line starts and where the line feed that ends it is, for the
--- lines there are, the one after the last and the ones before the first.
+-- | Where a line starts, which is just after the k-th line feed, and where
+-- the line feed that ends it is: for the lines there are, the one after the
+-- last and the ones before the first.
 prop_scanLine :: Scanned -> Property
 prop_scanLine (Scanned t) = forAll (choose (-1, L.length lfs + 2)) $ \n ->
   let from
         | n <= 0 = 0
         | otherwise = case L.drop (n - 1) lfs of i : _ -> i + 1; [] -> size
-   in allKernels (\k -> kernelLineSpan k n arr) (from, fromMaybe size (L.find (>= from) lfs))
+   in allKernels (\k -> kernelLineSpan k n arr) (ChunkLine from (fromMaybe size (L.find (>= from) lfs)))
   where
     arr = bytesOfText t
     size = sizeofByteArray arr
