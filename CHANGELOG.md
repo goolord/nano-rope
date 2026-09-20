@@ -22,7 +22,10 @@
   `foldrChunks`, `toChunks` and `toLazyText`. `toText` costs a `memcpy` of the
   document.
 * Chunks are scanned with SIMD instructions through C (SSE2, AVX2 when the
-  CPU supports it, picked at run time); the `simd` flag turns this off.
+  CPU supports it, picked at run time); the `simd` flag turns this off. The
+  C asks the CPU what it supports with `CPUID` itself and counts bits without
+  the compiler's runtime, so that it links wherever GHC's own linker has to
+  load it: Template Haskell on Windows, for one.
 * `Data.Text.NanoRope.Measured`: the same rope carrying a custom monoidal
   `Measure`, searchable with `splitWhere`.
 * `Data.Text.NanoRope.Internal`: the representation and an invariant checker,

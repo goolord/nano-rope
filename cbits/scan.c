@@ -32,6 +32,7 @@
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define NR_X86 1
+#include <cpuid.h>
 #include <immintrin.h>
 #else
 #define NR_X86 0
@@ -117,7 +118,20 @@ static HsInt scan_units_c(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wi
  * the wide sums at least every 255 vectors. */
 #define FLUSH 255
 
-static inline uint32_t popcount32(uint32_t m)
+/* Bits set, without the POPCNT instruction, which not every x86-64 has.
+ * Spelled out: left to __builtin_popcount this is a call into the runtime of
+ * the compiler, one more symbol for a linker to go looking for. */
+static inline uint32_t popcount_sse2(uint32_t m)
+{
+  m = m - ((m >> 1) & 0x55555555u);
+  m = (m & 0x33333333u) + ((m >> 2) & 0x33333333u);
+  return (((m + (m >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+}
+
+/* Bits set, with the instruction, which every CPU with AVX2 has. */
+#define AVX2 __attribute__((target("avx2,popcnt")))
+
+AVX2 static inline uint32_t popcount_avx2(uint32_t m)
 {
   return (uint32_t)__builtin_popcount(m);
 }
@@ -130,20 +144,27 @@ static inline uint32_t nth_bit(uint32_t m, HsInt k)
   return (uint32_t)__builtin_ctz(m);
 }
 
-/* The counts of a metrics scan in the last t lanes of a vector of the given
- * width, out of its movemask bits. */
-static inline HsWord64 pack_tail(uint32_t conts, uint32_t fours, uint32_t nls, int width, size_t t)
-{
-  int shift = width - (int)t;
-  return PACK(popcount32(conts >> shift), popcount32(fours >> shift), popcount32(nls >> shift));
-}
+/* What both levels make of the movemask bits of a vector, each with its own
+ * way of counting them.
+ *
+ * pack_tail: the counts of a metrics scan in the last t lanes of a vector of
+ * the given width. units: units in the lanes set in `lanes`, out of the
+ * continuation and 4-byte leader bits of a vector. */
+#define MASK_HELPERS(level, attr)                                                                       \
+  attr static inline HsWord64 pack_tail_##level(uint32_t conts, uint32_t fours, uint32_t nls, int width, \
+                                                size_t t)                                               \
+  {                                                                                                     \
+    int shift = width - (int)t;                                                                         \
+    return PACK(popcount_##level(conts >> shift), popcount_##level(fours >> shift),                     \
+                popcount_##level(nls >> shift));                                                        \
+  }                                                                                                     \
+  attr static inline HsInt units_##level(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)      \
+  {                                                                                                     \
+    return (HsInt)popcount_##level(lanes & ~conts) + (wide ? (HsInt)popcount_##level(lanes & fours) : 0); \
+  }
 
-/* Units in the lanes set in `lanes`, out of the continuation and 4-byte
- * leader bits of a vector. */
-static inline HsInt units(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)
-{
-  return (HsInt)popcount32(lanes & ~conts) + (wide ? (HsInt)popcount32(lanes & fours) : 0);
-}
+MASK_HELPERS(sse2, )
+MASK_HELPERS(avx2, AVX2)
 
 /* ------------------------------------------------------------------------
  * Level 1: SSE2.
@@ -203,7 +224,7 @@ static HsWord64 metrics_sse2(bytes s, size_t n)
   HsWord64 packed = sum128(sum);
   if (i < n) {
     __m128i x = _mm_loadu_si128((const __m128i *)(s + n - 16));
-    packed += pack_tail(bits128(conts128(x)), bits128(fours128(x)), bits128(newlines128(x)), 16, n - i);
+    packed += pack_tail_sse2(bits128(conts128(x)), bits128(fours128(x)), bits128(newlines128(x)), 16, n - i);
   }
   return packed;
 }
@@ -227,7 +248,7 @@ static HsInt newlines_sse2(bytes s, size_t n)
   HsInt nls = (HsInt)sum128(sn);
   if (i < n) {
     __m128i x = _mm_loadu_si128((const __m128i *)(s + n - 16));
-    nls += popcount32(bits128(newlines128(x)) >> (16 - (n - i)));
+    nls += popcount_sse2(bits128(newlines128(x)) >> (16 - (n - i)));
   }
   return nls;
 }
@@ -277,14 +298,14 @@ static HsInt nth_newline_sse2(bytes s, size_t i, size_t n, HsInt k)
     return nth_newline_c(s, i, n, k);
   for (; n - i >= 16; i += 16) {
     uint32_t m = newline_mask128(s + i);
-    HsInt c = popcount32(m);
+    HsInt c = popcount_sse2(m);
     if (c >= k)
       return (HsInt)(i + nth_bit(m, k) + 1);
     k -= c;
   }
   if (i < n) {
     uint32_t m = newline_mask128(s + n - 16) >> (16 - (n - i));
-    if (popcount32(m) >= k)
+    if (popcount_sse2(m) >= k)
       return (HsInt)(i + nth_bit(m, k) + 1);
   }
   return (HsInt)n;
@@ -296,7 +317,7 @@ static HsInt scan_units_sse2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int
     return scan_units_c(s, i, to, k, u, wide);
   for (; to - i >= 16; i += 16) {
     __m128i x = _mm_loadu_si128((const __m128i *)(s + i));
-    HsInt c = units(0xFFFF, bits128(conts128(x)), bits128(fours128(x)), wide);
+    HsInt c = units_sse2(0xFFFF, bits128(conts128(x)), bits128(fours128(x)), wide);
     if (u + c > k)
       return scan_units_c(s, i, to, k, u, wide);
     u += c;
@@ -304,7 +325,7 @@ static HsInt scan_units_sse2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int
   if (i < to) {
     __m128i x = _mm_loadu_si128((const __m128i *)(s + to - 16));
     uint32_t lanes = 0xFFFFu & ~((1u << (16 - (to - i))) - 1);
-    if (u + units(lanes, bits128(conts128(x)), bits128(fours128(x)), wide) > k)
+    if (u + units_sse2(lanes, bits128(conts128(x)), bits128(fours128(x)), wide) > k)
       return scan_units_c(s, i, to, k, u, wide);
   }
   return (HsInt)to;
@@ -314,8 +335,6 @@ static HsInt scan_units_sse2(bytes s, size_t i, size_t to, HsInt k, HsInt u, int
  * Level 2: AVX2. The same as SSE2, twice as wide; whatever is shorter than
  * a vector goes to SSE2.
  */
-
-#define AVX2 __attribute__((target("avx2,popcnt")))
 
 AVX2 static inline __m256i conts256(__m256i x)
 {
@@ -368,7 +387,7 @@ AVX2 static HsWord64 metrics_avx2(bytes s, size_t n)
   HsWord64 packed = sum256(sum);
   if (i < n) {
     __m256i x = _mm256_loadu_si256((const __m256i *)(s + n - 32));
-    packed += pack_tail(bits256(conts256(x)), bits256(fours256(x)), bits256(newlines256(x)), 32, n - i);
+    packed += pack_tail_avx2(bits256(conts256(x)), bits256(fours256(x)), bits256(newlines256(x)), 32, n - i);
   }
   return packed;
 }
@@ -392,7 +411,7 @@ AVX2 static HsInt newlines_avx2(bytes s, size_t n)
   HsInt nls = (HsInt)sum256(sn);
   if (i < n) {
     __m256i x = _mm256_loadu_si256((const __m256i *)(s + n - 32));
-    nls += popcount32(bits256(newlines256(x)) >> (32 - (n - i)));
+    nls += popcount_avx2(bits256(newlines256(x)) >> (32 - (n - i)));
   }
   return nls;
 }
@@ -442,14 +461,14 @@ AVX2 static HsInt nth_newline_avx2(bytes s, size_t i, size_t n, HsInt k)
     return nth_newline_sse2(s, i, n, k);
   for (; n - i >= 32; i += 32) {
     uint32_t m = newline_mask256(s + i);
-    HsInt c = popcount32(m);
+    HsInt c = popcount_avx2(m);
     if (c >= k)
       return (HsInt)(i + nth_bit(m, k) + 1);
     k -= c;
   }
   if (i < n) {
     uint32_t m = newline_mask256(s + n - 32) >> (32 - (n - i));
-    if (popcount32(m) >= k)
+    if (popcount_avx2(m) >= k)
       return (HsInt)(i + nth_bit(m, k) + 1);
   }
   return (HsInt)n;
@@ -461,7 +480,7 @@ AVX2 static HsInt scan_units_avx2(bytes s, size_t i, size_t to, HsInt k, HsInt u
     return scan_units_sse2(s, i, to, k, u, wide);
   for (; to - i >= 32; i += 32) {
     __m256i x = _mm256_loadu_si256((const __m256i *)(s + i));
-    HsInt c = units(0xFFFFFFFFu, bits256(conts256(x)), bits256(fours256(x)), wide);
+    HsInt c = units_avx2(0xFFFFFFFFu, bits256(conts256(x)), bits256(fours256(x)), wide);
     if (u + c > k)
       return scan_units_c(s, i, to, k, u, wide);
     u += c;
@@ -469,7 +488,7 @@ AVX2 static HsInt scan_units_avx2(bytes s, size_t i, size_t to, HsInt k, HsInt u
   if (i < to) {
     __m256i x = _mm256_loadu_si256((const __m256i *)(s + to - 32));
     uint32_t lanes = ~((1u << (32 - (to - i))) - 1);
-    if (u + units(lanes, bits256(conts256(x)), bits256(fours256(x)), wide) > k)
+    if (u + units_avx2(lanes, bits256(conts256(x)), bits256(fours256(x)), wide) > k)
       return scan_units_c(s, i, to, k, u, wide);
   }
   return (HsInt)to;
@@ -482,12 +501,37 @@ AVX2 static HsInt scan_units_avx2(bytes s, size_t i, size_t to, HsInt k, HsInt u
  * nano_rope_simd_level(): Haskell asks for that once and passes it along.
  */
 
+#if NR_X86
+/* Does the CPU have AVX2, and does the OS save the registers it needs?
+ *
+ * Asked of the CPU itself. __builtin_cpu_supports("avx2") says the same, but
+ * reads what __cpu_indicator_init of the compiler's runtime leaves behind,
+ * and that is a symbol the linker of GHCi does not resolve on Windows: there
+ * went Template Haskell in everything that depends on this package. */
+static int has_avx2(void)
+{
+  unsigned int a, b, c, d;
+  if (__get_cpuid_max(0, NULL) < 7)
+    return 0;
+  __cpuid_count(1, 0, a, b, c, d);
+  /* OSXSAVE, so that XGETBV may be asked, and AVX. */
+  if ((c & (1u << 27)) == 0 || (c & (1u << 28)) == 0)
+    return 0;
+  /* XCR0: the state of the XMM and of the YMM registers is kept. */
+  unsigned int lo, hi;
+  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+  (void)hi;
+  if ((lo & 6) != 6)
+    return 0;
+  __cpuid_count(7, 0, a, b, c, d);
+  return (b & (1u << 5)) != 0;
+}
+#endif
+
 HsInt nano_rope_simd_level(void)
 {
 #if NR_X86
-  __builtin_cpu_init();
-  /* Checks that the OS saves the AVX registers, too. */
-  return __builtin_cpu_supports("avx2") ? 2 : 1;
+  return has_avx2() ? 2 : 1;
 #else
   return 0;
 #endif
