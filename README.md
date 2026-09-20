@@ -132,15 +132,15 @@ rope that has already had 10,000 random inserts.
 
 | workload | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
 | --- | ---: | ---: | ---: | ---: |
-| random inserts * | 4.5 ms | 23.5 ms | 107 ms | 183 ms |
-| edits at UTF-16 positions | 6.5 ms | 42.4 ms | — | — |
-| `getLine` * | 1.9 ms | 15.4 ms | 120 ms | — |
-| typing, 100 bursts of 100 | 0.4 ms | 3.8 ms | 63 ms | 4.5 s |
-| the same, reading the line after each key | 3.4 ms | 224 ms | 272 ms | — |
-| `splitAt`, both halves * | 7.8 ms | 19.4 ms | 101 ms | 80 ms |
-| `toText` (once) * | 0.24 ms | 0.45 ms | 1.9 ms | 3.0 ms |
-| `fromText` (once) | 0.61 ms | 2.7 ms | 4.4 ms | 10 ns |
-| `toText` (once), fresh rope | 0.25 ms | 39 ns | 1.1 ms | 75 ns |
+| random inserts * | 4.0 ms | 22.1 ms | 99 ms | 140 ms |
+| edits at UTF-16 positions | 5.8 ms | 45.1 ms | — | — |
+| `getLine` * | 1.5 ms | 16.1 ms | 102 ms | — |
+| typing, 100 bursts of 100 | 0.4 ms | 3.0 ms | 59 ms | 1.7 s |
+| the same, reading the line after each key | 2.6 ms | 146 ms | 227 ms | — |
+| `splitAt`, both halves * | 6.9 ms | 21.8 ms | 89 ms | 54 ms |
+| `toText` (once) * | 0.21 ms | 0.49 ms | 2.3 ms | 4.0 ms |
+| `fromText` (once) | 0.71 ms | 2.0 ms | 4.0 ms | 10 ns |
+| `toText` (once), fresh rope | 0.20 ms | 52 ns | 1.2 ms | 93 ns |
 
 yi-rope has no UTF-16, and core-text has neither UTF-16 nor lines.
 
@@ -148,8 +148,25 @@ nano-rope is far slower at loading and saving than core-text, and at saving
 a fresh rope than text-rope. A freshly loaded text-rope or core-text is one
 big chunk, and core-text is the `Text` it was loaded from, so they hand it
 back as it is. The cost comes later: their first reads and splits walk the
-whole text (10,000 `getLine`s on a fresh text-rope take 1.6 s), and core-text
-re-measures the chunk on every edit next to it, hence its 4.5 s of typing.
+whole text (10,000 `getLine`s on a fresh text-rope take 0.22 s), and core-text
+re-measures the chunk on every edit next to it, hence its 1.7 s of typing.
+
+### A language server
+
+What `lsp` and `haskell-language-server` do with the rope of an open
+document, call for call (`bench/Lsp.hs`): a module of 8,000 lines, 326 kB,
+nearly all of it ASCII as source code is. A position and the start of its
+line come out of one descent with `metricsAtLineAndPosition`; the last
+column is the same work asking for them one at a time.
+
+| workload | one descent | two |
+| --- | ---: | ---: |
+| typing, 5,130 keystrokes at UTF-16 positions | 1.4 ms | 2.3 ms |
+| the same, reading the line under the cursor after each key | 1.7 ms | 2.9 ms |
+| a rename, 199 edits at once, and `toText` | 0.11 ms | 0.13 ms |
+| where 47,761 tokens start and end, and their text | 10.0 ms | 15.1 ms |
+| 11,941 positions from UTF-16 to code points and back | 2.2 ms | 3.3 ms |
+| three lines around each of those, as `Text` and as `lines` of a `slice` | 4.9 ms | |
 
 ### Memory
 
@@ -158,9 +175,9 @@ The same runs, by what they allocate, and the heap that stays live holding the
 
 | | nano-rope | text-rope 0.3 | yi-rope 0.11 | core-text 0.3.8 |
 | --- | ---: | ---: | ---: | ---: |
-| allocated by random inserts * | 12.6 MB | 87.2 MB | 335 MB | 304 MB |
+| allocated by random inserts * | 12.6 MB | 87.3 MB | 336 MB | 304 MB |
 | allocated by edits at UTF-16 positions | 12.9 MB | 148 MB | — | — |
-| allocated by `getLine` * | 0.38 MB | 78.9 MB | 260 MB | — |
+| allocated by `getLine` * | 0.37 MB | 78.9 MB | 260 MB | — |
 | allocated by `splitAt`, both halves * | 26.6 MB | 107 MB | 185 MB | 160 MB |
 | allocated by `fromText` (once) | 4.55 MB | 11.7 MB | 2.71 MB | 55 B |
 | live heap, fresh rope | 4.55 MB | 5.08 MB | 4.56 MB | 4.03 MB |
