@@ -135,6 +135,7 @@ module Data.Text.NanoRope.Internal
     -- * Positions
   , splitAtPosition
   , metricsAtPosition
+  , metricsAtLineAndPosition
   , metricsToPosition
   , offsetToPosition
   , positionToOffset
@@ -918,6 +919,17 @@ leafPrefixMetrics m arr b
   | otherwise = leafCutMetrics m arr b
 {-# INLINE leafPrefixMetrics #-}
 
+-- | 'leafPrefixMetrics' for whoever knows the line feeds among those bytes
+-- already, having counted them to get there: in a leaf that is all ASCII,
+-- that is all there is to know, and nothing is scanned.
+leafPrefixWithLines :: Metrics -> ByteArray -> Int -> Int -> Metrics
+leafPrefixWithLines m arr b nls
+  | b <= 0 = mempty
+  | b >= bytes m = m
+  | isAscii m = Metrics b b b nls
+  | otherwise = leafCutMetrics m arr b
+{-# INLINE leafPrefixWithLines #-}
+
 -- | 'leafPrefixMetrics' of a cut inside the leaf. Apart from the above
 -- because it never returns the metrics it is given, which then reach it
 -- unboxed.
@@ -1557,7 +1569,11 @@ metricsAtNode u k root
   | otherwise = go mempty k root
   where
     go !acc !j node = case node of
-      Leaf m _ arr -> acc <> leafPrefixMetrics m arr (leafOffset u j m arr)
+      Leaf m _ arr
+        -- Just after the j-th line feed of this leaf, which it has: there
+        -- are j of them before that.
+        | u == Lines -> acc <> leafPrefixWithLines m arr (scanLines j arr) j
+        | otherwise -> acc <> leafPrefixMetrics m arr (leafOffset u j m arr)
       Inner _ _ _ cs -> case seekChild u j cs of
         Seek i before -> go (acc <> before) (j - count u before) (indexChildren cs i)
 
@@ -1723,7 +1739,14 @@ positionOfMetrics u m root =
 {-# INLINE positionOfMetrics #-}
 
 metricsAtPositionNode :: Unit -> Position -> Node a -> Metrics
-metricsAtPositionNode !u (Position l0 c) root
+metricsAtPositionNode u pos root = case linePositionNode False u pos root of
+  Span _ at -> at
+{-# INLINE metricsAtPositionNode #-}
+
+-- | Where the line of a position starts, and where the position is. The
+-- former only if asked for: it is not always free.
+linePositionNode :: Bool -> Unit -> Position -> Node a -> Span
+linePositionNode !wanted !u (Position l0 c) root
   | l > newlines (nodeMetrics root) = general
   | otherwise = go mempty l root
   where
@@ -1739,7 +1762,12 @@ metricsAtPositionNode !u (Position l0 c) root
               else
                 let !to = contentEnd arr from lf
                     !b = column m arr from to
-                 in acc <> leafPrefixMetrics m arr b
+                    -- The line starts after the j-th line feed of the leaf,
+                    -- and there is none between there and the column. The
+                    -- start of the line is the way back over the column,
+                    -- which is short, rather than another prefix to count.
+                    !at = acc <> leafPrefixWithLines m arr b j
+                 in Span (if wanted then at `subMetrics` sliceOfLine m arr from b else at) at
       Inner _ _ _ cs
         | j <= 0 -> go acc j (indexChildren cs 0)
         | otherwise -> case seekChild Lines j cs of
@@ -1757,11 +1785,20 @@ metricsAtPositionNode !u (Position l0 c) root
     -- The general case: a line across leaves, or no such line.
     general = case lineSpan l0 root of
       Span start end
-        | c <= 0 -> start
-        | u == Lines || bytes there > bytes end -> end
-        | otherwise -> there
+        | c <= 0 -> Span start start
+        | u == Lines || bytes there > bytes end -> Span start end
+        | otherwise -> Span start there
         where
           there = metricsAtNode u (count u start + min c (count u (nodeMetrics root))) root
+
+-- | Metrics of bytes @from .. to-1@ of a leaf with known metrics, which are
+-- on one line.
+sliceOfLine :: Metrics -> ByteArray -> Int -> Int -> Metrics
+sliceOfLine m arr from to
+  | to <= from = mempty
+  | isAscii m = let d = to - from in Metrics d d d 0
+  | otherwise = sliceMetrics arr from (to - from)
+{-# INLINE sliceOfLine #-}
 
 -- | Location of the end of the longest prefix not satisfying a monotone
 -- predicate.
@@ -2390,6 +2427,23 @@ splitAtPosition u pos r = splitAt Bytes (bytes (metricsAtPosition u pos r)) r
 -- 'splitAtPosition'.
 metricsAtPosition :: Unit -> Position -> Rope a -> Metrics
 metricsAtPosition u pos (Rope root) = metricsAtPositionNode u pos root
+
+-- | /O(log n)/. Where the line of a position starts, and 'metricsAtPosition':
+-- @('metricsAt' 'Lines' line, 'metricsAtPosition' u position)@, out of one
+-- descent where those are two.
+--
+-- The difference of the two is the column that was reached, in every unit
+-- at once. That converts a column from one unit to another, and tells a
+-- column that was clamped to the end of its line, or rounded down to the
+-- start of a code point, from one that is where it was asked for:
+--
+-- >>> let (line, at) = metricsAtLineAndPosition Utf16 (Position 1 3) "a😀\nb😀c"
+-- >>> (utf16Units at - utf16Units line, chars at - chars line, bytes at)
+-- (3,2,11)
+metricsAtLineAndPosition :: Unit -> Position -> Rope a -> (Metrics, Metrics)
+metricsAtLineAndPosition u pos (Rope root) = case linePositionNode True u pos root of
+  Span line at -> (line, at)
+{-# INLINE metricsAtLineAndPosition #-}
 
 -- | /O(log n)/. The position, with its column in the given unit, of a
 -- location obtained from 'metricsAt', 'metricsAtPosition' or 'metricsWhere'.

@@ -12,6 +12,10 @@
   tree and are inserted at once when the rope is next read, and erasing what
   was just typed takes them back. `length` and `metrics` stay `O(1)`.
 * `splitAt` finds both halves in one descent.
+* `metricsAtLineAndPosition` finds a position and the start of its line in
+  one descent. Their difference is the column that was reached in every unit,
+  which is what a language server converts columns with, and how it tells a
+  column that was clamped or rounded from one that was not.
 * Nodes are unlifted (`UnliftedDatatypes`), so that the compiler knows the
   children of a node for evaluated: seeking reads them out of their array
   without the evaluation, and the saving and restoring of registers around

@@ -62,6 +62,18 @@ A column past the end of a line clamps to before its `\n` or `\r\n`, as LSP
 expects. `Rope.chunkAt Bytes i rope` is a zero-copy view of the text at an
 offset, for parsers that read through a callback.
 
+`metricsAtLineAndPosition` also tells where the line starts, out of the same
+descent. The difference of the two is the column in every unit, so this is
+how a server turns a client's UTF-16 column into the code points GHC counts,
+and notices a column that does not exist:
+
+```haskell
+let (line, at) = Rope.metricsAtLineAndPosition Utf16 lspPosition rope
+    reached    = utf16Units at - utf16Units line   -- short of the column: it was clamped,
+                                                   -- or fell inside a surrogate pair
+    column     = chars at - chars line             -- the same column in code points
+```
+
 ## Getting the text out
 
 ```haskell

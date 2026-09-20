@@ -95,6 +95,7 @@ module Data.Text.NanoRope
   , Position (..)
   , splitAtPosition
   , metricsAtPosition
+  , metricsAtLineAndPosition
   , metricsToPosition
   , offsetToPosition
   , positionToOffset
@@ -325,6 +326,22 @@ splitAtPosition = M.splitAtPosition
 -- 'splitAtPosition'.
 metricsAtPosition :: Unit -> Position -> Rope -> Metrics
 metricsAtPosition = M.metricsAtPosition
+
+-- | /O(log n)/. Where the line of a position starts, and 'metricsAtPosition':
+-- @('metricsAt' 'Lines' line, 'metricsAtPosition' u position)@, out of one
+-- descent where those are two.
+--
+-- The difference of the two is the column that was reached, in every unit
+-- at once. That converts a column from one unit to another, and tells a
+-- column that was clamped to the end of its line, or rounded down to the
+-- start of a code point, from one that is where it was asked for:
+--
+-- >>> let (line, at) = metricsAtLineAndPosition Utf16 (Position 1 3) "a😀\nb😀c"
+-- >>> (utf16Units at - utf16Units line, chars at - chars line, bytes at)
+-- (3,2,11)
+metricsAtLineAndPosition :: Unit -> Position -> Rope -> (Metrics, Metrics)
+metricsAtLineAndPosition = M.metricsAtLineAndPosition
+{-# INLINE metricsAtLineAndPosition #-}
 
 -- | /O(log n)/. The position, with its column in the given unit, of a
 -- location obtained from 'metricsAt', 'metricsAtPosition' or 'metricsWhere'.

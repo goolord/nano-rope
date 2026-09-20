@@ -90,6 +90,7 @@ module Data.Text.NanoRope.Measured
   , Position (..)
   , splitAtPosition
   , metricsAtPosition
+  , metricsAtLineAndPosition
   , metricsToPosition
   , offsetToPosition
   , positionToOffset

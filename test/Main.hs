@@ -72,6 +72,7 @@ main =
           [ testProperty "metricsAt" prop_metricsAt
           , testProperty "convert" prop_convert
           , testProperty "metricsAtPosition / splitAtPosition" prop_position
+          , testProperty "metricsAtLineAndPosition" prop_linePosition
           , testProperty "metricsToPosition" prop_toPosition
           , testProperty "position round trip" prop_positionRoundtrip
           ]
@@ -289,10 +290,29 @@ genPiece =
     , (2, pure <$> elements "\128512\119070\127881") -- four bytes, surrogate pairs
     ]
 
+-- | Source code is ASCII, give or take a comment: whole chunks of it, which
+-- take ways of their own through the rope that a chunk with one accent in it
+-- does not.
+genAsciiPiece :: Gen String
+genAsciiPiece =
+  frequency
+    [ (12, pure <$> elements "abcxyz ")
+    , (3, pure "\n")
+    , (1, pure "\r\n")
+    ]
+
+-- | Text of any script, of ASCII alone, or of ASCII with something else now
+-- and then, so that chunks of both kinds end up in one tree.
 genText :: Int -> Gen Text
 genText n = do
   oneLine <- frequency [(4, pure False), (1, pure True)]
-  t <- T.pack . concat <$> vectorOf n genPiece
+  piece <-
+    frequency
+      [ (3, pure genPiece)
+      , (2, pure genAsciiPiece)
+      , (1, pure (frequency [(40 * sizeFactor, genAsciiPiece), (1, genPiece)]))
+      ]
+  t <- T.pack . concat <$> vectorOf n piece
   pure (if oneLine then T.filter (/= '\n') t else t)
 
 -- | Every candidate is strictly shorter, or shrinking would never end.
@@ -691,6 +711,14 @@ prop_position (Edited r t) u = forAll (genPosition t) $ \pos ->
         .&&. Rope.toText a === T.take n t
         .&&. Rope.toText b === T.drop n t
         .&&. Rope.positionToOffset u Chars pos r === n
+
+-- | The start of the line and the position, each as if asked for alone.
+prop_linePosition :: Edited -> Unit -> Property
+prop_linePosition (Edited r t) u = forAll (genPosition t) $ \pos ->
+  let (line, at) = Rope.metricsAtLineAndPosition u pos r
+   in line === naiveMetrics (T.take (charsAt Lines (posLine pos) t) t)
+        .&&. at === naiveMetrics (T.take (charsAtPosition u pos t) t)
+        .&&. (line, at) === (Rope.metricsAt Lines (posLine pos) r, Rope.metricsAtPosition u pos r)
 
 prop_toPosition :: Edited -> Unit -> Unit -> Offset -> Property
 prop_toPosition (Edited r t) from to i =
