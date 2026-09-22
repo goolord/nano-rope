@@ -127,251 +127,163 @@ type Rope = M.Rope ()
 -- Prefix t'Metrics' (from 'metricsAt', 'metricsAtPosition' or 'metricsWhere')
 -- locate a point in all four units at once; read any of them with 'count'.
 
--- | The empty rope.
+-- | See 'Data.Text.NanoRope.Measured.empty'.
 empty :: Rope
 empty = M.empty
 
--- | A rope of one character.
+-- | See 'Data.Text.NanoRope.Measured.singleton'.
 singleton :: Char -> Rope
 singleton = M.singleton
 
--- | /O(n)/. Build a rope from strict text. Copies the text into chunks,
--- unless it is at most 512 bytes and occupies its entire backing buffer.
+-- | See 'Data.Text.NanoRope.Measured.fromText'.
 fromText :: Text -> Rope
 fromText = M.fromText
 
--- | Build a rope by appending the chunks of a lazy 'TL.Text'.
+-- | See 'Data.Text.NanoRope.Measured.fromLazyText'.
 fromLazyText :: TL.Text -> Rope
 fromLazyText = M.fromLazyText
 
--- | /O(n)/. Flatten the rope to strict text. A single chunk is shared
--- without copying; multiple chunks are copied into one buffer.
+-- | See 'Data.Text.NanoRope.Measured.toText'.
 toText :: Rope -> Text
 toText = M.toText
 
--- | /O(n)/. Convert to lazy text, sharing the chunk buffers.
+-- | See 'Data.Text.NanoRope.Measured.toLazyText'.
 toLazyText :: Rope -> TL.Text
 toLazyText = M.toLazyText
 
--- | /O(n)/. Decode the rope to a 'String'.
+-- | See 'Data.Text.NanoRope.Measured.toString'.
 toString :: Rope -> String
 toString = M.toString
 
--- | The chunks of the rope as zero-copy views, in order. They are non-empty,
--- at most 512 bytes long and produced lazily.
+-- | See 'Data.Text.NanoRope.Measured.toChunks'.
 toChunks :: Rope -> [Text]
 toChunks = M.toChunks
 
--- | Lazy right fold over non-empty chunks in document order, without
--- building the list returned by 'toChunks'.
+-- | See 'Data.Text.NanoRope.Measured.foldrChunks'.
 foldrChunks :: (Text -> b -> b) -> b -> Rope -> b
 foldrChunks = M.foldrChunks
 
--- | Strict left fold over non-empty chunks in document order. Walks the
--- tree directly, sharing text buffers and avoiding an intermediate list.
--- Useful for consumers such as hashes and parsers.
+-- | See 'Data.Text.NanoRope.Measured.foldlChunks''.
 foldlChunks' :: (b -> Text -> b) -> b -> Rope -> b
 foldlChunks' = M.foldlChunks'
 
--- | /O(log n)/. Zero-copy view of the rest of the chunk containing an
--- offset (clamped and rounded as at 'Unit'); empty at the end. For a parser
--- read callback, ask for a byte offset and advance by the result's length.
+-- | See 'Data.Text.NanoRope.Measured.chunkAt'.
 chunkAt :: Unit -> Int -> Rope -> Text
 chunkAt = M.chunkAt
 
--- | /O(n)/. Write UTF-8 to a handle through a 32 KiB buffer, without
--- constructing a 'Text' for the whole document.
---
--- Like 'System.IO.hPutBuf', this bypasses the handle's encoding and newline
--- translation, preserving the rope's bytes on every platform. To use the
--- handle's text encoding instead, pass 'toLazyText' to text I/O.
+-- | See 'Data.Text.NanoRope.Measured.hPutUtf8'.
 hPutUtf8 :: Handle -> Rope -> IO ()
 hPutUtf8 = M.hPutUtf8
 
--- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents. Forces
--- the tree (and pending input) before opening the file, so a failure there
--- leaves the file untouched. The write is not atomic.
+-- | See 'Data.Text.NanoRope.Measured.writeFileUtf8'.
 writeFileUtf8 :: FilePath -> Rope -> IO ()
 writeFileUtf8 = M.writeFileUtf8
 
--- | /O(1)/. Whether the rope is empty, including pending input.
+-- | See 'Data.Text.NanoRope.Measured.null'.
 null :: Rope -> Bool
 null = M.null
 
--- | /O(1)/. Length in any unit; for 'Lines' this is the number of @\\n@.
---
--- >>> map (`length` "a😀\nb") [Bytes, Chars, Utf16, Lines]
--- [7,4,5,1]
+-- | See 'Data.Text.NanoRope.Measured.length'.
 length :: Unit -> Rope -> Int
 length = M.length
 
--- | /O(1)/. Number of @\\n@ characters plus one. An empty rope has one line;
--- a trailing @\\n@ adds an empty final line. Valid indices range from zero
--- to @lineCount rope - 1@. See 'lines' for a list that omits that final empty line.
+-- | See 'Data.Text.NanoRope.Measured.lineCount'.
 lineCount :: Rope -> Int
 lineCount = M.lineCount
 
--- | /O(1)/. All built-in measurements, including pending input.
+-- | See 'Data.Text.NanoRope.Measured.metrics'.
 metrics :: Rope -> Metrics
 metrics = M.metrics
 
--- | /O(log n)/. Concatenate two ropes, sharing unaffected subtrees.
--- Equivalent to '<>'. The traversal follows the difference in tree heights.
+-- | See 'Data.Text.NanoRope.Measured.append'.
 append :: Rope -> Rope -> Rope
 append = M.append
 
--- | /O(log n)/. Split at an offset, clamped to the rope and rounded down to
--- a code point boundary (see 'Unit'). Finds both halves in one descent.
--- Use 'take' or 'drop' if you need only one half.
---
--- >>> splitAt Lines 1 "fst\nsnd\n"
--- ("fst\n","snd\n")
+-- | See 'Data.Text.NanoRope.Measured.splitAt'.
 splitAt :: Unit -> Int -> Rope -> (Rope, Rope)
 splitAt = M.splitAt
 
--- | /O(log n)/. The prefix before an offset, clamped and rounded as in 'splitAt'.
+-- | See 'Data.Text.NanoRope.Measured.take'.
 take :: Unit -> Int -> Rope -> Rope
 take = M.take
 
--- | /O(log n)/. The suffix from an offset, clamped and rounded as in 'splitAt'.
+-- | See 'Data.Text.NanoRope.Measured.drop'.
 drop :: Unit -> Int -> Rope -> Rope
 drop = M.drop
 
--- | /O(log n)/. Extract the half-open range @[i, j)@. Both offsets are
--- clamped and rounded in the original rope. Returns empty when @j <= i@.
+-- | See 'Data.Text.NanoRope.Measured.slice'.
 slice :: Unit -> Int -> Int -> Rope -> Rope
 slice = M.slice
 
--- | /O(log n + result bytes)/. Like 'slice', but returns 'Text' directly.
--- A range within one chunk is a zero-copy view; a range spanning chunks
--- is copied into one buffer.
+-- | See 'Data.Text.NanoRope.Measured.sliceText'.
 sliceText :: Unit -> Int -> Int -> Rope -> Text
 sliceText = M.sliceText
 
--- | /O(log n + inserted bytes)/. Insert text at a clamped, code-point-aligned
--- offset; empty input is a no-op. Copies only the target chunk and its path.
---
--- Consecutive insertions in the same unit ('Bytes', 'Chars' or 'Utf16') are
--- buffered in /O(1)/, up to 128 bytes and the chunk's free space. A tree
--- read, an edit elsewhere or a full buffer applies it; 'length' and 'metrics'
--- do not, and WHNF may leave it pending.
+-- | See 'Data.Text.NanoRope.Measured.insert'.
 insert :: Unit -> Int -> Text -> Rope -> Rope
 insert = M.insert
 
--- | /O(log n)/. Remove the half-open range @[i, j)@, clamping and rounding
--- both offsets in the original rope. Does nothing when @j <= i@.
--- Deleting a suffix of buffered 'Chars' input can take /O(1)/; see 'insert'.
+-- | See 'Data.Text.NanoRope.Measured.delete'.
 delete :: Unit -> Int -> Int -> Rope -> Rope
 delete = M.delete
 
--- | /O(log n + inserted bytes)/. Replace the half-open range @[i, j)@ with
--- text, clamping and rounding both offsets in the original rope. When
--- @j <= i@, insert at @i@ instead.
---
--- An edit that stays within one chunk and keeps it within its size bounds
--- copies only that chunk and the path to it.
+-- | See 'Data.Text.NanoRope.Measured.replace'.
 replace :: Unit -> Int -> Int -> Text -> Rope -> Rope
 replace = M.replace
 
--- | /O(log n + length of the line)/. The content of a line by 0-based index,
--- without its terminating @\\n@ or @\\r\\n@; empty if there is no such line.
--- A line within a single chunk is returned as a zero-copy view.
+-- | See 'Data.Text.NanoRope.Measured.getLine'.
 getLine :: Int -> Rope -> Text
 getLine = M.getLine
 
--- | /O(n)/. Lines without their @\\n@ or @\\r\\n@ terminators, produced
--- lazily. Returns @[]@ for an empty rope and omits the empty line after a
--- trailing @\\n@. A lone @\\r@ is preserved. Lines within one chunk share
--- its buffer.
+-- | See 'Data.Text.NanoRope.Measured.lines'.
 lines :: Rope -> [Text]
 lines = M.lines
 
--- | /O(log n)/. Measure the prefix ending at an offset to express that
--- location in all four units. The offset is clamped and rounded as in 'splitAt'.
---
--- >>> metricsAt Chars 3 "a😀\nb"
--- Metrics {bytes = 6, chars = 3, utf16Units = 4, newlines = 1}
+-- | See 'Data.Text.NanoRope.Measured.metricsAt'.
 metricsAt :: Unit -> Int -> Rope -> Metrics
 metricsAt = M.metricsAt
 
--- | /O(log n)/. @convert from to@ re-expresses an offset in another unit.
--- Converting to 'Lines' gives the index of the line containing the offset,
--- converting from 'Lines' the offset of the start of a line.
---
--- >>> convert Bytes Utf16 5 "a😀\nb"
--- 3
+-- | See 'Data.Text.NanoRope.Measured.convert'.
 convert :: Unit -> Unit -> Int -> Rope -> Int
 convert = M.convert
 
--- | /O(log n)/. Split at a zero-based line and column, with the column in
--- the given unit. Negative coordinates clamp to zero. A column beyond the
--- line's content clamps to before its @\\n@ or @\\r\\n@; a line beyond the
--- document clamps to its end. Offsets inside code points round down.
--- For 'Lines' columns, zero means the line start and any positive value
--- means the end of its content.
+-- | See 'Data.Text.NanoRope.Measured.splitAtPosition'.
 splitAtPosition :: Unit -> Position -> Rope -> (Rope, Rope)
 splitAtPosition = M.splitAtPosition
 
--- | /O(log n)/. The location of a position in every unit, clamped like
--- 'splitAtPosition'.
+-- | See 'Data.Text.NanoRope.Measured.metricsAtPosition'.
 metricsAtPosition :: Unit -> Position -> Rope -> Metrics
 metricsAtPosition = M.metricsAtPosition
 
--- | /O(log n)/. Return prefix metrics for the line start and the position,
--- sharing their lookup. Clamps coordinates as in 'metricsAtPosition'.
--- Subtract corresponding counts to get the reached column in any unit.
--- Comparing it with the requested column detects clamping or rounding:
---
--- >>> let (line, at) = metricsAtLineAndPosition Utf16 (Position 1 3) "a😀\nb😀c"
--- >>> (utf16Units at - utf16Units line, chars at - chars line, bytes at)
--- (3,2,11)
+-- | See 'Data.Text.NanoRope.Measured.metricsAtLineAndPosition'.
 metricsAtLineAndPosition :: Unit -> Position -> Rope -> (Metrics, Metrics)
 metricsAtLineAndPosition = M.metricsAtLineAndPosition
 {-# INLINE metricsAtLineAndPosition #-}
 
--- | /O(log n)/. The position, with its column in the given unit, of a
--- location obtained from 'metricsAt', 'metricsAtPosition', or 'metricsWhere'
--- on the same rope. Does not clamp or validate the supplied metrics.
+-- | See 'Data.Text.NanoRope.Measured.metricsToPosition'.
 metricsToPosition :: Unit -> Metrics -> Rope -> Position
 metricsToPosition = M.metricsToPosition
 
--- | /O(log n)/. @offsetToPosition from to@ turns an offset in unit @from@
--- into a position with its column in unit @to@.
--- An offset inside a line terminator remains there; converting the result
--- back with 'positionToOffset' clamps it to the end of the line's content.
---
--- >>> offsetToPosition Bytes Utf16 11 "a😀\nb😀c"
--- Position {posLine = 1, posColumn = 3}
+-- | See 'Data.Text.NanoRope.Measured.offsetToPosition'.
 offsetToPosition :: Unit -> Unit -> Int -> Rope -> Position
 offsetToPosition = M.offsetToPosition
 
--- | /O(log n)/. @positionToOffset from to@ turns a position with its column
--- in unit @from@ into an offset in unit @to@.
--- Coordinates are clamped as in 'splitAtPosition'.
---
--- >>> positionToOffset Utf16 Bytes (Position 1 3) "a😀\nb😀c"
--- 11
+-- | See 'Data.Text.NanoRope.Measured.positionToOffset'.
 positionToOffset :: Unit -> Unit -> Position -> Rope -> Int
 positionToOffset = M.positionToOffset
 
--- | /O(log n)/ for a constant-time predicate. Split after the longest
--- code-point-aligned prefix for which the predicate is false. The predicate
--- must be monotone: once true, it must stay true as the prefix grows.
--- If true for the empty prefix, split at the start; if never true, split
--- at the end.
+-- | 'Data.Text.NanoRope.Measured.splitWhere' on the built-in metrics.
 splitWhere :: (Metrics -> Bool) -> Rope -> (Rope, Rope)
 splitWhere p = M.splitWhere (\m _ -> p m)
 
--- | /O(log n)/ for a constant-time predicate. Prefix metrics at the split
--- point chosen by 'splitWhere', without constructing either half.
+-- | 'Data.Text.NanoRope.Measured.metricsWhere' on the built-in metrics.
 metricsWhere :: (Metrics -> Bool) -> Rope -> Metrics
 metricsWhere p = M.metricsWhere (\m _ -> p m)
 
--- | /O(n)/. Annotate the text with a custom measure for use with
--- "Data.Text.NanoRope.Measured". The text itself is shared, not copied.
+-- | /O(n)/. Add a custom measure, sharing the text.
 measured :: Measure a => Rope -> M.Rope a
 measured = M.remeasure
 
--- | /O(n)/. Forget a custom measure. The text itself is shared, not copied.
+-- | /O(n)/. Forget a custom measure, sharing the text.
 unmeasured :: M.Rope a -> Rope
 unmeasured = M.remeasure
