@@ -18,6 +18,7 @@ import qualified Data.Text as T
 import Data.Text.NanoRope (Position (..), Unit (..))
 import qualified Data.Text.NanoRope as Nano
 import Data.Text.NanoRope.Internal (kernels, kernelsName)
+import Data.Text.Unsafe (lengthWord8)
 import Data.Version (showVersion)
 import GHC.Stats (getRTSStatsEnabled)
 import Lsp (lspBenchmarks, mkLspEnv)
@@ -66,17 +67,13 @@ sourceText n = T.concat (zipWith line [0 :: Int ..] (L.take n (rands 1)))
         , "\n"
         ]
 
--- | Remove line feeds to model a single-line document such as minified output.
-minified :: Text -> Text
-minified = T.filter (/= '\n')
-
--- | Three input states: freshly loaded, without line feeds, and after
--- 10,000 random inserts.
+-- | Three input states: freshly loaded, without line feeds (like minified
+-- output), and after 10,000 random inserts.
 data Ropes r = Ropes {ropeFresh :: !r, ropeOneLine :: !r, ropeEdited :: !r}
   deriving (Foldable)
 
 ropes :: (Text -> r) -> ([Int] -> r -> r) -> Text -> [Int] -> Ropes r
-ropes load edit text offsets = Ropes r (load (minified text)) (edit offsets r)
+ropes load edit text offsets = Ropes r (load (T.filter (/= '\n') text)) (edit offsets r)
   where
     r = load text
 
@@ -134,7 +131,7 @@ mkEnv nLines nOps =
     , envYi = ropes Yi.fromText (edits yiOps) text offsets
 #endif
 #ifdef COMPARE_CORE_TEXT
-    , envCT = ropes ctFromText (edits ctOps) text offsets
+    , envCT = ropes CT.intoRope (edits ctOps) text offsets
 #endif
     }
   where
@@ -302,17 +299,12 @@ yiOps =
 #endif
 
 #ifdef COMPARE_CORE_TEXT
--- | Wrap the input text in a rope. Benchmark to normal form to account for
--- lazy tree construction.
-ctFromText :: Text -> CT.Rope
-ctFromText = CT.intoRope
-
 -- | Code point operations for the core-text adapter. Force split results
 -- through their widths; this adapter has no line lookup.
 ctOps :: Ops CT.Rope
 ctOps =
   Ops
-    { opLoad = nf ctFromText
+    { opLoad = nf CT.intoRope -- nf: tree construction is lazy
     , opToText = CT.fromRope
     , opInsert = \i -> CT.insertRope i "x"
     , opDelete = \i r ->
@@ -354,7 +346,7 @@ libraries =
   , Library "yi-rope" (\e -> workloads yiOps [] (envYi e) e) (measure "yi-rope" yiFromText (edits yiOps) forceYi)
 #endif
 #ifdef COMPARE_CORE_TEXT
-  , Library "core-text" (\e -> workloads ctOps ctTooSlow (envCT e) e) (measure "core-text" ctFromText (edits ctOps) rnf)
+  , Library "core-text" (\e -> workloads ctOps ctTooSlow (envCT e) e) (measure "core-text" CT.intoRope (edits ctOps) rnf)
 #endif
   ]
 
@@ -398,8 +390,8 @@ main = do
       -- The comparison chart excludes nano-rope-only language-server runs.
       -- Their results remain in the CSV.
       samples <- filter ((`elem` libraryNames) . sampleLibrary) . readSamples <$> withFile csv ReadMode hGetContents'
-      bytes <- Nano.length Bytes . Nano.fromText <$> fresh sourceText documentLines
-      let ran = map sampleLibrary samples ++ map footprintLibrary fps
+      let bytes = lengthWord8 (sourceText documentLines)
+          ran = map sampleLibrary samples ++ map footprintLibrary fps
           others = filter (`elem` ran) (drop 1 libraryNames)
       withFile svg WriteMode $ \h -> do
         hSetEncoding h utf8

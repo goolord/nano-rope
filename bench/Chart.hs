@@ -179,9 +179,31 @@ present c =
   ]
 
 subject :: Chart -> String
-subject c = case chartLibraries c of
-  l : _ -> l
-  [] -> ""
+subject = concat . take 1 . chartLibraries
+
+-- | "<subject> against / the <best> other", right-aligned over the factors.
+factorHeading :: Chart -> Double -> String -> [String]
+factorHeading c y best =
+  [ text factorX y [("class", "ch"), ("text-anchor", "end")] (subject c ++ " against")
+  , text factorX (y + 14) [("class", "ch"), ("text-anchor", "end")] ("the " ++ best ++ " other")
+  ]
+
+-- | Runs drawn one below another from @y@.
+stackRuns :: Double -> (Double -> Int -> a -> [String]) -> [a] -> [String]
+stackRuns y draw xs = concat [draw (y + rowPad / 2 + runH * fromIntegral k) k x | (k, x) <- zip [0 ..] xs]
+
+-- | One run at @y@: tooltip and hover target, the row label on the first
+-- run, the state label if @shown@, then the marks.
+runFrame :: Double -> Int -> String -> String -> Bool -> String -> [String] -> [String]
+runFrame y k label state shown tip marks =
+  ["<g class=\"run\">", tag "title" [] [escape tip], hit]
+    ++ [text margin (cy + 4) [("class", "rl")] label | k == 0]
+    ++ [text stateX (cy + 4) [("class", "sl"), ("text-anchor", "end")] state | shown]
+    ++ marks
+    ++ ["</g>"]
+  where
+    cy = y + runH / 2
+    hit = tag "rect" [("class", "hit"), ("x", num (margin - 8)), ("y", num y), ("width", num (width - 2 * margin + 16)), ("height", num runH), ("rx", "4")] []
 
 header :: Chart -> Block
 header c =
@@ -243,17 +265,14 @@ timePanel c
     bytes = decades allocs
 
     draw y =
-      [ rule (y + 4)
-      , text timeX0 (y + 26) [("class", "ch")] "Time per run"
-      , text factorX (y + 26) [("class", "ch"), ("text-anchor", "end")] (subject c ++ " against")
-      , text factorX (y + 40) [("class", "ch"), ("text-anchor", "end")] "the fastest other"
-      ]
-        ++ logAxis times timeTick (timeX0, timeX1) (y + 46) (y + headH) bottom (bottom + 18)
+      [rule (y + 4), text timeX0 (y + 26) [("class", "ch")] "Time per run"]
+        ++ factorHeading c (y + 26) "fastest"
+        ++ logAxis times (seconds num . (10 ^^)) (timeX0, timeX1) (y + 46) (y + headH) bottom (bottom + 18)
         ++ ( if null allocs
                then []
                else
                  text allocX0 (y + 26) [("class", "ch")] "Allocated per run"
-                   : logAxis bytes byteTick (allocX0, allocX1) (y + 46) (y + headH) bottom (bottom + 18)
+                   : logAxis bytes (trimBytes . (10 ^^)) (allocX0, allocX1) (y + 46) (y + headH) bottom (bottom + 18)
            )
         ++ snd (stack (y + headH) items)
       where
@@ -261,21 +280,14 @@ timePanel c
 
 timeRow :: Chart -> (Int, Int) -> (Int, Int) -> Row -> Block
 timeRow c times bytes (Row label runs) =
-  (fromIntegral (length runs) * runH + rowPad, \y -> concat [drawRun (y + rowPad / 2 + runH * fromIntegral k) k r | (k, r) <- zip [0 ..] runs])
+  (fromIntegral (length runs) * runH + rowPad, \y -> stackRuns y drawRun runs)
   where
-    shown = length runs > 1
     drawRun y k (state, w) =
-      [ "<g class=\"run\">"
-      , tag "title" [] [escape tip]
-      , hit y runH
-      ]
-        ++ [text margin (cy + 4) [("class", "rl")] label | k == (0 :: Int)]
-        ++ [text stateX (cy + 4) [("class", "sl"), ("text-anchor", "end")] state | shown]
-        ++ dots cy [(i, logX times (timeX0, timeX1) (sampleSeconds s)) | (i, s) <- got]
-        ++ [mark' "m o" i (timeX1 - 1) cy | (i, l) <- present c, (w, l) `elem` chartSkipped c, i `notElem` map fst got]
-        ++ factor cy "faster" "slower" [(sampleSeconds s, others) | (0, s) <- got]
-        ++ dots cy [(i, logX bytes (allocX0, allocX1) a) | (i, s) <- got, Just a <- [sampleAllocated s], a > 0]
-        ++ ["</g>"]
+      runFrame y k label state (length runs > 1) tip $
+        dots cy [(i, logX times (timeX0, timeX1) (sampleSeconds s)) | (i, s) <- got]
+          ++ [mark' "m o" i (timeX1 - 1) cy | (i, l) <- present c, (w, l) `elem` chartSkipped c, i `notElem` map fst got]
+          ++ factor cy "faster" "slower" [(sampleSeconds s, others) | (0, s) <- got]
+          ++ dots cy [(i, logX bytes (allocX0, allocX1) a) | (i, s) <- got, Just a <- [sampleAllocated s], a > 0]
       where
         cy = y + runH / 2
         cells = [(i, l, find (\s -> sampleWorkload s == w && sampleLibrary s == l) (chartSamples c)) | (i, l) <- present c]
@@ -321,10 +333,6 @@ decades vs = (lo, max (lo + 1) (ceiling (logBase 10 (maximum vs))))
 logX :: (Int, Int) -> (Double, Double) -> Double -> Double
 logX (lo, hi) (x0, x1) v = x0 + (logBase 10 v - fromIntegral lo) / fromIntegral (hi - lo) * (x1 - x0)
 
-timeTick, byteTick :: Int -> String
-timeTick k = seconds num (10 ^^ k)
-byteTick k = trimBytes (10 ^^ k)
-
 ------------------------------------------------------------------------------
 -- Memory
 
@@ -345,11 +353,8 @@ memoryPanel c
     x v = x0 + v / top * (x1 - x0)
 
     draw y =
-      [ text factorX (y + 8) [("class", "ch"), ("text-anchor", "end")] (subject c ++ " against")
-      , text factorX (y + 22) [("class", "ch"), ("text-anchor", "end")] "the smallest other"
-      , line x0 (y + headH) x1 (y + headH) "a"
-      , line x0 bottom x1 bottom "a"
-      ]
+      factorHeading c (y + 8) "smallest"
+        ++ [line x0 (y + headH) x1 (y + headH) "a", line x0 bottom x1 bottom "a"]
         ++ concat
           [ [ line (x v) (y + headH) (x v) bottom "g"
             , text (x v) (y + headH - 8) [("class", "k"), ("text-anchor", "middle")] (trimBytes v)
@@ -357,7 +362,7 @@ memoryPanel c
           | v <- takeWhile (<= top * 1.0001) (iterate (+ step) 0)
           ]
         ++ reference
-        ++ concat [drawRun (y + headH + rowPad / 2 + runH * fromIntegral k) k st | (k, st) <- zip [0 ..] states]
+        ++ stackRuns (y + headH) drawRun states
       where
         bottom = y + headH + rowH
         reference = case chartTextHeap c of
@@ -368,15 +373,9 @@ memoryPanel c
             ]
 
     drawRun y k st =
-      [ "<g class=\"run\">"
-      , tag "title" [] [escape tip]
-      , hit y runH
-      ]
-        ++ [text margin (cy + 4) [("class", "rl")] "Live heap" | k == (0 :: Int)]
-        ++ [text stateX (cy + 4) [("class", "sl"), ("text-anchor", "end")] st | length states > 1]
-        ++ dots cy [(i, x b) | (i, b) <- got]
-        ++ factor cy "smaller" "larger" [(b, [o | (i, o) <- got, i /= 0]) | (0, b) <- got]
-        ++ ["</g>"]
+      runFrame y k "Live heap" st (length states > 1) tip $
+        dots cy [(i, x b) | (i, b) <- got]
+          ++ factor cy "smaller" "larger" [(b, [o | (i, o) <- got, i /= 0]) | (0, b) <- got]
       where
         cy = y + runH / 2
         cells = [(i, l, find (\f -> footprintState f == st && footprintLibrary f == l) fps) | (i, l) <- present c]
@@ -445,9 +444,6 @@ factor cy better worse cmp = case cmp of
       | x >= 10 = commas (round x) ++ "×"
       | otherwise = showFFloat (Just 1) x "×"
 
-hit :: Double -> Double -> String
-hit y h = tag "rect" [("class", "hit"), ("x", num (margin - 8)), ("y", num y), ("width", num (width - 2 * margin + 16)), ("height", num h), ("rx", "4")] []
-
 -- | Wrap at word boundaries. A single word longer than the limit stays intact.
 wrapAt :: Int -> String -> [String]
 wrapAt n = go . words
@@ -501,9 +497,12 @@ seconds = scaled (-9) [" ns", " µs", " ms", " s"]
 
 showSeconds, showBytes, trimBytes :: Double -> String
 showSeconds = seconds sig
-showBytes = scaled 0 [" B", " kB", " MB", " GB", " TB"] sig
+showBytes = scaled 0 byteUnits sig
 -- A round number of bytes, without trailing zeros.
-trimBytes = scaled 0 [" B", " kB", " MB", " GB", " TB"] num
+trimBytes = scaled 0 byteUnits num
+
+byteUnits :: [String]
+byteUnits = [" B", " kB", " MB", " GB", " TB"]
 
 -- | With a comma every three digits.
 commas :: Int -> String
