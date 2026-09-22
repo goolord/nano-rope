@@ -121,8 +121,5 @@ import Data.Text.NanoRope.Internal
 import Prelude ()
 
 -- $conversions
--- Prefix t'Metrics' describe a location in all four units. Obtain them with
--- 'metricsAt', 'metricsAtPosition', or 'metricsWhere', then use 'count' for
--- absolute offsets. Reusing the metrics avoids repeating the lookup for
--- each unit. 'metricsToPosition' also looks up the line start to calculate
--- a column; use metrics from the same rope.
+-- Prefix t'Metrics' (from 'metricsAt', 'metricsAtPosition' or 'metricsWhere')
+-- locate a point in all four units at once; read any of them with 'count'.

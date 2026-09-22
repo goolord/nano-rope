@@ -5,16 +5,11 @@
 --
 -- A persistent UTF-8 text rope for editors, language servers, and parsers.
 --
--- * __Multi-unit indexing.__ Cached metrics support /O(log n)/ lookups and
---   conversions in bytes, code points, UTF-16 code units, and lines.
--- * __Small edits.__ A B-tree of chunks up to 512 bytes shares unchanged
---   subtrees between versions. Consecutive keystrokes can be buffered; see
---   'insert'.
--- * __Bounded chunks.__ Chunk sizes depend on bytes, not line lengths.
--- * __Chunk-based I/O.__ Read chunk views or stream UTF-8 without flattening
---   the document.
--- * __Custom summaries.__ "Data.Text.NanoRope.Measured" adds cached monoidal
---   measures and searches over them.
+-- * /O(log n)/ indexing and conversion in bytes, code points, UTF-16 and lines.
+-- * Small edits: a B-tree of chunks of at most 512 bytes, whatever the line
+--   lengths, shares unchanged subtrees; keystrokes are buffered ('insert').
+-- * Chunk views and streamed UTF-8 output without flattening the document.
+-- * Custom cached measures in "Data.Text.NanoRope.Measured".
 --
 -- Import this module qualified:
 --
@@ -129,11 +124,8 @@ import Prelude hiding (drop, getLine, length, lines, null, splitAt, take)
 type Rope = M.Rope ()
 
 -- $conversions
--- Prefix t'Metrics' describe a location in all four units. Obtain them with
--- 'metricsAt', 'metricsAtPosition', or 'metricsWhere', then use 'count' for
--- absolute offsets. Reusing the metrics avoids repeating the lookup for
--- each unit. 'metricsToPosition' also looks up the line start to calculate
--- a column; use metrics from the same rope.
+-- Prefix t'Metrics' (from 'metricsAt', 'metricsAtPosition' or 'metricsWhere')
+-- locate a point in all four units at once; read any of them with 'count'.
 
 -- | The empty rope.
 empty :: Rope
@@ -181,12 +173,9 @@ foldrChunks = M.foldrChunks
 foldlChunks' :: (b -> Text -> b) -> b -> Rope -> b
 foldlChunks' = M.foldlChunks'
 
--- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
--- offset. Returns empty text when the clamped offset is at the end.
---
--- For a parser read callback, request a byte offset, consume the returned
--- text, then advance by its byte length. Offsets are clamped and rounded
--- as described at 'Unit'.
+-- | /O(log n)/. Zero-copy view of the rest of the chunk containing an
+-- offset (clamped and rounded as at 'Unit'); empty at the end. For a parser
+-- read callback, ask for a byte offset and advance by the result's length.
 chunkAt :: Unit -> Int -> Rope -> Text
 chunkAt = M.chunkAt
 
@@ -199,11 +188,9 @@ chunkAt = M.chunkAt
 hPutUtf8 :: Handle -> Rope -> IO ()
 hPutUtf8 = M.hPutUtf8
 
--- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents.
---
--- Evaluates the tree, including pending input, before opening the file.
--- An evaluation failure leaves an existing file untouched. The write itself
--- is not atomic.
+-- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents. Forces
+-- the tree (and pending input) before opening the file, so a failure there
+-- leaves the file untouched. The write is not atomic.
 writeFileUtf8 :: FilePath -> Rope -> IO ()
 writeFileUtf8 = M.writeFileUtf8
 
@@ -262,18 +249,12 @@ sliceText :: Unit -> Int -> Int -> Rope -> Text
 sliceText = M.sliceText
 
 -- | /O(log n + inserted bytes)/. Insert text at a clamped, code-point-aligned
--- offset. Empty input leaves the rope unchanged.
+-- offset; empty input is a no-op. Copies only the target chunk and its path.
 --
--- Small insertions copy the affected chunk and its path through the tree.
--- An overflowing chunk can split in two.
---
--- Consecutive insertions in the same unit ('Bytes', 'Chars', or 'Utf16')
--- can use a buffer of up to 128 bytes, limited by the target chunk's free
--- space. Updating that bounded buffer is /O(1)/ in document size. A tree
--- read, an edit elsewhere, or an insertion that exceeds the buffer's capacity
--- forces the pending insertion.
--- 'length' and 'metrics' include pending input without forcing it.
--- Evaluating a rope to weak head normal form may leave this insertion deferred.
+-- Consecutive insertions in the same unit ('Bytes', 'Chars' or 'Utf16') are
+-- buffered in /O(1)/, up to 128 bytes and the chunk's free space. A tree
+-- read, an edit elsewhere or a full buffer applies it; 'length' and 'metrics'
+-- do not, and WHNF may leave it pending.
 insert :: Unit -> Int -> Text -> Rope -> Rope
 insert = M.insert
 

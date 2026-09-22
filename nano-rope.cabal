@@ -61,10 +61,8 @@ flag compare-core-text
     default:     False
     manual:      True
 
-common extensions
+common defaults
     default-language: GHC2021
-
-common ghc-options
     ghc-options: -Wall -Widentities
 
 common rts-options
@@ -97,8 +95,7 @@ common test-depends
         text
 
 library
-    import:           extensions
-    import:           ghc-options
+    import:           defaults
     import:           library-depends
     import:           simd
     exposed-modules:
@@ -113,8 +110,7 @@ library
 
 -- Test the library with its default chunk and node sizes.
 test-suite nano-rope-test
-    import:           extensions
-    import:           ghc-options
+    import:           defaults
     import:           rts-options
     import:           test-depends
     type:             exitcode-stdio-1.0
@@ -125,8 +121,7 @@ test-suite nano-rope-test
 -- Run the same properties with small chunks and nodes, so short inputs
 -- exercise deep trees and frequent splits and merges.
 test-suite nano-rope-test-small
-    import:           extensions
-    import:           ghc-options
+    import:           defaults
     import:           rts-options
     import:           library-depends
     import:           test-depends
@@ -142,8 +137,7 @@ test-suite nano-rope-test-small
     cpp-options:      -DNANO_ROPE_SMALL
 
 benchmark nano-rope-bench
-    import:           extensions
-    import:           ghc-options
+    import:           defaults
     type:             exitcode-stdio-1.0
     hs-source-dirs:   bench
     main-is:          Main.hs

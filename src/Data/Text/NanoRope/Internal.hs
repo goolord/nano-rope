@@ -17,37 +17,28 @@
 -- Copyright   : (c) 2026 goolord
 -- License     : MIT
 --
--- B-tree representation, chunk scans, and invariant checks. These internals
--- are exposed for testing and benchmarking, with __no API stability guarantees__.
--- Use "Data.Text.NanoRope" or "Data.Text.NanoRope.Measured" in application code.
+-- B-tree internals, chunk scans and invariant checks, exposed for tests and
+-- benchmarks with __no API stability guarantees__. Applications should use
+-- "Data.Text.NanoRope" or "Data.Text.NanoRope.Measured".
 --
 -- = Representation
 --
--- Leaves hold exactly-sized, unpinned UTF-8 arrays of at most 'maxChunk'
--- bytes, split at code point boundaries. Inner nodes have up to 'maxChildren'
--- children. Each node caches its subtree's t'Metrics'; leaves pack these into
--- 64 bits. Seeking scans at most 'maxChildren' child headers per level.
+-- Leaves hold exact-size unpinned UTF-8 arrays of at most 'maxChunk' bytes,
+-- split at code point boundaries; inner nodes hold up to 'maxChildren'
+-- children. Every node caches its subtree's t'Metrics' (packed into 64 bits
+-- in leaves), so seeking reads at most 'maxChildren' headers per level and an
+-- edit copies one leaf and its path. Nodes are unlifted: reading a child
+-- never needs a thunk check.
 --
--- Parents store child pointers rather than duplicating each child's metrics.
--- A small edit copies the affected leaf and the nodes and pointer arrays on
--- its path, sharing the rest of the tree.
---
--- Nodes are unlifted, so GHC knows that reading a child cannot require
--- evaluating a thunk. This avoids evaluation checks and register spills
--- in traversal loops.
---
--- Allocation in the hot paths depends on GHC's strictness and inlining
--- decisions. Strict arguments, unpacked result records, and carefully placed
--- helpers keep offsets and metrics unboxed. See the seeking and scanning
--- notes, and check benchmark allocation after changing these paths.
+-- Hot paths stay allocation-free only through strict arguments, unpacked
+-- result records and careful helper placement: check benchmark allocation
+-- after changing them.
 --
 -- = Scanning
 --
--- Chunk scans measure text, find line feeds, and locate code point or UTF-16
--- offsets. In the default build, slices of at least 32 bytes use C: SSE2 or
--- AVX2 on supported x86-64 systems, portable C elsewhere. Shorter slices use
--- Haskell scans processing up to 8 bytes at a time. Build with @-f -simd@ to
--- use only Haskell scans. See 'kernels' for the available implementations.
+-- Slices of at least 32 bytes are scanned in C (SSE2/AVX2 on x86-64, portable
+-- C elsewhere), shorter ones in Haskell 8 bytes at a time. @-f -simd@ uses
+-- Haskell only. See 'kernels'.
 module Data.Text.NanoRope.Internal
   ( -- * Types
     Rope (.., Rope)
@@ -311,21 +302,16 @@ instance NFData Position where
 ------------------------------------------------------------------------------
 -- Custom measures
 
--- | A user-defined monoidal summary of text, cached at every node of the
--- tree alongside the built-in t'Metrics'.
---
--- Chunk boundaries are an implementation detail and can fall between any two
--- code points, so 'measureChunk' must be a monoid homomorphism:
+-- | A monoidal summary of text, cached at every node beside t'Metrics'.
+-- Chunk boundaries can fall between any two code points, so 'measureChunk'
+-- must be a monoid homomorphism:
 --
 -- > measureChunk (x <> y) == measureChunk x <> measureChunk y
 -- > measureChunk mempty   == mempty
 --
--- A context-sensitive measure may need boundary information. For example,
--- counting @\\r\\n@ as one break requires tracking whether each non-empty
--- piece starts with @\\n@ or ends with @\\r@, then adjusting the count in '<>'.
---
--- Annotations are kept in weak head normal form; give your measure strict
--- fields to avoid building up thunks.
+-- Context-sensitive measures track boundaries (e.g. counting @\\r\\n@ once
+-- means remembering a leading @\\n@ and trailing @\\r@). Annotations are kept
+-- in WHNF; use strict fields to avoid thunks.
 class Monoid a => Measure a where
   -- | Measure a piece of text. The argument is a zero-copy view of at most
   -- 'maxChunk' bytes.
@@ -347,31 +333,21 @@ instance (Measure a, Measure b, Measure c) => Measure (a, b, c) where
 ------------------------------------------------------------------------------
 -- The tree
 
--- | A rope of text annotated with a custom measure @a@. Use @()@ (or the
--- monomorphic interface in "Data.Text.NanoRope") when the built-in t'Metrics'
--- are all you need.
---
--- The v'Rope' pattern exposes the tree after applying pending input.
--- Editing and metric queries can inspect the buffer directly.
+-- | A rope annotated with a custom measure @a@ (@()@ for none). The v'Rope'
+-- pattern exposes the tree after applying pending input; edits and metric
+-- queries inspect the buffer directly.
 data Rope a
-  = -- | A tree, the unit and end offset of the last insertion, and the known
-    -- free space in its target leaf. A negative offset disables buffering
-    -- of a subsequent insertion.
+  = -- | Tree, unit and end offset of the last insertion (negative: do not
+    -- buffer the next one), and known free space in its leaf.
     Settled
       (Node a)
       !Unit
       {-# UNPACK #-} !Int
       {-# UNPACK #-} !Int
-  | -- | A tree with a pending insertion. Further keystrokes extend the
-    -- buffer without copying a tree path. The first field lazily applies
-    -- the whole insertion when a reader needs the tree.
-    --
-    -- Remaining fields: the base tree, insertion unit and offset, buffered
-    -- text (at most 'maxPending' bytes), its packed metrics, and remaining
-    -- buffer capacity.
-    --
-    -- To keep this constructor small, @typingNext@ and 'metrics' calculate
-    -- the next insertion offset and total metrics rather than storing them.
+  | -- | Pending insertion: the lazily applied result, base tree, unit,
+    -- offset, buffered text (<= 'maxPending' bytes), its packed metrics and
+    -- remaining capacity. The next offset and total metrics are derived
+    -- ('typingNext', 'metrics') to keep this small.
     Typing
       (Lazy a)
       (Node a)
@@ -399,19 +375,12 @@ rootOf (Settled root _ _ _) = root
 rootOf (Typing (Lazy root) _ _ _ _ _ _) = root
 {-# INLINE rootOf #-}
 
--- | An unlifted B-tree node. Nodes cannot be thunks;
--- custom annotations are evaluated only to weak head normal form.
---
--- Both constructors start with the metrics of their subtree, which is all
--- that seeking reads of a node it does not descend into.
+-- | An unlifted B-tree node (never a thunk; annotations in WHNF). Both
+-- constructors lead with metrics, all that seeking reads of skipped nodes.
 type Node :: Type -> UnliftedType
 data Node a
-  = -- | Metrics, annotation and UTF-8 payload, which is what the pattern
-    -- v'Leaf' matches and builds. The payload occupies the whole array:
-    -- there is no offset or length to chase.
-    --
-    -- All four metrics fit in 16 bits each (see 'PackedMetrics'), saving
-    -- three machine words per leaf on a 64-bit system.
+  = -- | Packed metrics (three words smaller), annotation, and a payload
+    -- filling its whole array. Match or build with v'Leaf'.
     PackedLeaf
       {-# UNPACK #-} !PackedMetrics
       !a
@@ -483,24 +452,20 @@ emptyNode = PackedLeaf 0 mempty emptyByteArray
 ------------------------------------------------------------------------------
 -- Arrays of nodes
 
--- | A small array of unlifted child nodes. The wrappers below provide the
--- subset of array operations needed by the tree.
+-- | A small array of unlifted child nodes.
 data Children a = Children (SmallArray# (Node a))
 
 data MutableChildren s a = MutableChildren (SmallMutableArray# s (Node a))
 
--- | How many children there are.
 sizeofChildren :: Children a -> Int
 sizeofChildren (Children cs) = I# (sizeofSmallArray# cs)
 {-# INLINE sizeofChildren #-}
 
--- | Read a child without bounds checking. Unlifted elements need no
--- evaluation check after loading.
+-- | Unchecked read; unlifted elements need no evaluation check.
 indexChildren :: Children a -> Int -> Node a
 indexChildren (Children cs) (I# i) = case indexSmallArray# cs i of (# node #) -> node
 {-# INLINE indexChildren #-}
 
--- | Allocate an array filled with the supplied node.
 newChildren :: Int -> Node a -> ST s (MutableChildren s a)
 newChildren (I# n) node = ST $ \s -> case newSmallArray# n node s of
   (# s', m #) -> (# s', MutableChildren m #)
@@ -531,12 +496,21 @@ runChildren (ST build) =
     (# _, cs #) -> Children cs
 {-# INLINE runChildren #-}
 
+-- | @n >= 1@ children, @f i@ at index @i@.
+generateChildren :: Int -> (Int -> Node a) -> Children a
+generateChildren n f = runChildren $ do
+  m <- newChildren n (f 0)
+  let go !i
+        | i >= n = pure m
+        | otherwise = writeChildren m i (f i) >> go (i + 1)
+  go 1
+{-# INLINE generateChildren #-}
+
 ------------------------------------------------------------------------------
 -- Seeking
 
--- Non-inlined workers with unpacked result records let GHC return these
--- fields in registers. An unboxed tuple containing boxed Int or Metrics
--- values can instead allocate at every tree level.
+-- NOINLINE workers returning unpacked records keep results in registers; an
+-- unboxed tuple of boxed Int/Metrics would allocate at every level.
 
 -- | A child index and the total metrics of preceding children.
 data Seek = Seek {-# UNPACK #-} !Int {-# UNPACK #-} !Metrics
@@ -547,11 +521,9 @@ data Sought = Sought {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 -- | A child index, an offset within it, and the byte count before it.
 data SoughtBytes = SoughtBytes {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
--- | Find the first child whose cumulative count reaches @k@, or the last
--- child. Also return the metrics of preceding children.
---
--- Find the child before summing metrics to reduce register pressure.
--- Use the supplied total to sum whichever side is shorter.
+-- | The first child whose cumulative count reaches @k@ (or the last), and
+-- the metrics before it. Finds the index first (less register pressure),
+-- then sums the shorter side.
 seekChild :: Unit -> Int -> Metrics -> Children a -> Seek
 seekChild !u !k !total !cs = case seekUnit u k (count u total) cs of
   Sought i _
@@ -580,9 +552,7 @@ seekUnit !u !k !total !cs = case u of
           | otherwise = forwards (i + 1) (j - m)
           where
             m = sel (nodeMetrics (indexChildren cs i))
-        -- The same child, from the other end: the last one with less than k
-        -- in front of it, which is the total without the child and what is
-        -- after it.
+        -- Same child from the end: the last with fewer than k before it.
         backwards !i !after
           | i <= 0 = Sought 0 k
           | before < k = Sought i (k - before)
@@ -682,8 +652,12 @@ mkInner2 x y = inner (nodeHeight x + 1) (nodeMetrics x <> nodeMetrics y) $ runCh
 {-# SPECIALIZE mkInner2 :: Node () -> Node () -> Node () #-}
 
 replaceAt :: Children a -> Int -> Node a -> Children a
-replaceAt arr i x = runChildren $ do
-  m <- thawChildren arr 0 (sizeofChildren arr)
+replaceAt arr = replaceIn arr 0 (sizeofChildren arr)
+
+-- | Children @[off, off + cnt)@ with the @i@-th of them replaced.
+replaceIn :: Children a -> Int -> Int -> Int -> Node a -> Children a
+replaceIn arr off cnt i x = runChildren $ do
+  m <- thawChildren arr off cnt
   writeChildren m i x
   pure m
 
@@ -855,9 +829,8 @@ offsetInChunk !u !k !arr
   | k <= 0 = 0
   | otherwise = case u of
       Bytes -> roundDown arr k
-      Chars -> scanUnits False k arr 0 (sizeofByteArray arr)
-      Utf16 -> scanUnits True k arr 0 (sizeofByteArray arr)
       Lines -> scanLines k arr
+      _ -> scanUnits (u == Utf16) k arr 0 (sizeofByteArray arr)
 
 -- | @scanUnits wide k arr from to@ walks over code points from the boundary
 -- @from@ and stops in front of the first one that does not fit into @k@
@@ -1031,8 +1004,7 @@ swarScanLines !k !arr = goWord 0 0
 data ChunkLine = ChunkLine {-# UNPACK #-} !Int {-# UNPACK #-} !Int
   deriving (Eq, Show)
 
--- | Find a chunk's zero-based line start and terminator in one scan entry
--- point, avoiding separate foreign calls to 'scanLines' and 'findNewline'.
+-- | A chunk's line @k@ start and terminator in one foreign call.
 chunkLine :: Int -> ByteArray -> ChunkLine
 chunkLine !k !arr
   | sizeofByteArray arr >= simdMin = cLineSpan simdLevel k arr
@@ -1079,10 +1051,8 @@ swarKernels = Kernels "Haskell" swarMetrics swarNewlines swarFindNewline swarFin
 kernels :: [Kernels]
 kernels = swarKernels : map simdKernels [0 .. simdLevel]
 
--- | Minimum slice length for C scans, chosen to offset foreign-call overhead.
---
--- Dispatch directly to known functions. Selecting from a t'Kernels' record
--- can leave indirect calls with boxed arguments and results when not inlined.
+-- | Minimum slice length worth a foreign call. Scans dispatch on it to known
+-- functions: picking from a t'Kernels' record can box arguments.
 simdMin :: Int
 
 -- | The best level of SIMD support of the machine, as the C numbers them.
@@ -1178,7 +1148,7 @@ cLineSpan _ = swarLineSpan
 #endif
 
 ------------------------------------------------------------------------------
--- Leaves
+-- Leaves and bulk construction
 
 -- | Zero-copy view of a slice of a chunk.
 viewSlice :: ByteArray -> Int -> Int -> Text
@@ -1200,9 +1170,6 @@ mkLeaf arr = Leaf (sliceMetrics arr 0 (sizeofByteArray arr)) (measureChunk (chun
 mkLeafWith :: Measure a => Metrics -> ByteArray -> Node a
 mkLeafWith m arr = Leaf m (measureChunk (chunkText arr)) arr
 {-# INLINE mkLeafWith #-}
-
-concat2 :: ByteArray -> ByteArray -> ByteArray
-concat2 a b = concatSlices a 0 (sizeofByteArray a) b 0 (sizeofByteArray b)
 
 -- | A slice of one chunk followed by a slice of another.
 concatSlices :: ByteArray -> Int -> Int -> ByteArray -> Int -> Int -> ByteArray
@@ -1245,33 +1212,9 @@ splicedSlice !arr !i !j !src !soff !slen !from !to = runByteArray $ do
   piece (i + slen) (sizeofByteArray arr - (j - i) + slen) arr j
   pure out
 
--- | First @b@ bytes of a leaf.
-leafPrefix :: Measure a => Int -> Node a -> Node a
-leafPrefix b node = case node of
-  Leaf m _ arr
-    | b <= 0 -> emptyNode
-    | b >= sizeofByteArray arr -> node
-    | otherwise -> mkLeafWith (leafPrefixMetrics m arr b) (cloneByteArray arr 0 b)
-  Inner{} -> error "Data.Text.NanoRope: leafPrefix on an inner node"
-{-# INLINE leafPrefix #-}
-
--- | All but the first @b@ bytes of a leaf.
-leafSuffix :: Measure a => Int -> Node a -> Node a
-leafSuffix b node = case node of
-  Leaf m _ arr
-    | b <= 0 -> node
-    | b >= sizeofByteArray arr -> emptyNode
-    | otherwise ->
-        mkLeafWith (m `subMetrics` leafPrefixMetrics m arr b) (cloneByteArray arr b (sizeofByteArray arr - b))
-  Inner{} -> error "Data.Text.NanoRope: leafSuffix on an inner node"
-{-# INLINE leafSuffix #-}
-
--- | A tree over more than 'maxChunk' bytes, cut into evenly sized leaves.
--- Aiming a little below 'maxChunk' leaves room for moving every cut back to a
--- code point boundary.
---
--- Build top-down into each parent's child array, avoiding intermediate
--- lists of leaves and levels.
+-- | A tree over more than 'maxChunk' bytes in evenly sized leaves, built
+-- top-down into parent arrays (no intermediate lists). Leaves aim a little
+-- under 'maxChunk' so cuts can round down to code points.
 treeFromSlice :: Measure a => ByteArray -> Int -> Int -> Node a
 treeFromSlice !arr !off !len = node (levelSizes leaves) 0
   where
@@ -1287,21 +1230,12 @@ treeFromSlice !arr !off !len = node (levelSizes leaves) 0
     -- Strict in everything: a lazy index is a thunk for every node.
     node sizes !j = case sizes of
       parents : below@(children : _) ->
-        -- The children are spread evenly, so that no parent ends up below
-        -- 'minChildren'.
+        -- Spread children evenly so no parent falls below 'minChildren'.
         let !cq = children `quot` parents
             !cr = children `rem` parents
             !first = j * cq + min j cr
             !size = if j < cr then cq + 1 else cq
-         in mkInner $ runChildren $ do
-              -- At least one child, and the array starts out full of it.
-              m <- newChildren size (node below first)
-              let go !i
-                    | i >= size = pure m
-                    | otherwise = do
-                        writeChildren m i (node below (first + i))
-                        go (i + 1)
-              go 1
+         in mkInner (generateChildren size (\i -> node below (first + i)))
       [_] -> let !from = cut j in mkLeaf (cloneByteArray arr from (cut (j + 1) - from))
       [] -> emptyNode
 {-# INLINABLE treeFromSlice #-}
@@ -1330,11 +1264,8 @@ fromTextNode (TI.Text (A.ByteArray ba) off len)
 ------------------------------------------------------------------------------
 -- Concatenation
 
--- | Outcome of merging two trees: one or two nodes of the height of the
--- taller tree. Also the outcome of an edit within a leaf, which is 'None' if
--- the edit does not stay there.
---
--- An unboxed sum, so that handing a node up a level allocates nothing.
+-- | One or two nodes of the taller tree's height, or 'None' when an edit
+-- leaves its leaf. An unboxed sum: passing a node up allocates nothing.
 type Result a = (# (# #) | Node a | (# Node a, Node a #) #)
 
 pattern None :: Result a
@@ -1399,7 +1330,7 @@ merge l r = case compare (nodeHeight l) (nodeHeight r) of
 mergeEq :: Measure a => Node a -> Node a -> Result a
 mergeEq l@(Leaf ml al bl) r@(Leaf mr ar br)
   | sl >= minChunk && sr >= minChunk = Two l r
-  | total <= maxChunk = One (Leaf (ml <> mr) (al <> ar) (concat2 bl br))
+  | total <= maxChunk = One (Leaf (ml <> mr) (al <> ar) (concatSlices bl 0 sl br 0 sr))
   | half < sl =
       -- Even them out: the end of the left leaf goes to the right one.
       let cut = roundDownFrom bl half
@@ -1457,7 +1388,7 @@ fromChildren !h !m !cs
 {-# SPECIALIZE fromChildren :: Int -> Metrics -> Children () -> Result () #-}
 
 ------------------------------------------------------------------------------
--- Breaking
+-- Take, drop and split
 
 -- | Whether @k@ reaches the document end. In 'Lines', an offset equal to
 -- the newline count selects the final line start, which may precede the end.
@@ -1500,10 +1431,7 @@ joinLeft !h !cs !i !before !l
   | otherwise = case merge (indexChildren cs (i - 1)) l of
       One x
         | i == 1 -> x
-        | otherwise -> inner h m $ runChildren $ do
-            out <- thawChildren cs 0 i
-            writeChildren out (i - 1) x
-            pure out
+        | otherwise -> inner h m (replaceIn cs 0 i (i - 1) x)
       Two x y -> inner h m (snoc2 cs (i - 1) x y)
       None -> unreachable "joinLeft"
   where
@@ -1520,10 +1448,7 @@ joinRight !h !cs !i !after !r
   | otherwise = case merge r (indexChildren cs (i + 1)) of
       One x
         | rest == 1 -> x
-        | otherwise -> inner h m $ runChildren $ do
-            out <- thawChildren cs (i + 1) rest
-            writeChildren out 0 x
-            pure out
+        | otherwise -> inner h m (replaceIn cs (i + 1) rest 0 x)
       Two x y -> inner h m (cons2 x y cs (i + 2))
       None -> unreachable "joinRight"
   where
@@ -1534,7 +1459,12 @@ joinRight !h !cs !i !after !r
 
 takeNode :: Measure a => Unit -> Int -> Node a -> Node a
 takeNode u k node = case node of
-  Leaf m _ arr -> leafPrefix (leafOffset u k m arr) node
+  Leaf m _ arr
+    | b <= 0 -> emptyNode
+    | b >= sizeofByteArray arr -> node
+    | otherwise -> mkLeafWith (leafPrefixMetrics m arr b) (cloneByteArray arr 0 b)
+    where
+      b = leafOffset u k m arr
   Inner total h _ cs -> case seekChild u k total cs of
     Seek i before -> joinLeft h cs i before (takeNode u (k - count u before) (indexChildren cs i))
 {-# INLINABLE takeNode #-}
@@ -1542,7 +1472,13 @@ takeNode u k node = case node of
 
 dropNode :: Measure a => Unit -> Int -> Node a -> Node a
 dropNode u k node = case node of
-  Leaf m _ arr -> leafSuffix (leafOffset u k m arr) node
+  Leaf m _ arr
+    | b <= 0 -> node
+    | b >= size -> emptyNode
+    | otherwise -> mkLeafWith (m `subMetrics` leafPrefixMetrics m arr b) (cloneByteArray arr b (size - b))
+    where
+      size = sizeofByteArray arr
+      b = leafOffset u k m arr
   Inner total h _ cs -> case seekChild u k total cs of
     Seek i before ->
       let child = indexChildren cs i
@@ -1629,10 +1565,8 @@ sliceToText !i !j node
             child = indexChildren cs c
             j' = j - (i - i')
 
--- | Copy bytes @i .. j-1@ of a node to offset @d@ of a buffer.
---
--- Only boundary children need partial copies. Copy fully covered subtrees
--- with 'copyNode'.
+-- | Copy bytes @i .. j-1@ of a node to offset @d@ of a buffer. Only boundary
+-- children are clamped; covered ones go to 'copyNode'.
 copyRange :: MutableByteArray s -> Int -> Int -> Int -> Node a -> ST s ()
 copyRange !out !d !i !j node = case node of
   Leaf _ _ arr -> copyByteArray out d arr i (j - i)
@@ -1651,8 +1585,7 @@ copyRange !out !d !i !j node = case node of
             when (lo < hi) $ copyRange out (d + lo - i) (lo - start) (hi - start) child
         go (c + 1) end
 
--- | Copy a whole subtree to buffer offset @d@ and return the next offset.
--- Full-subtree copies need no seeking or bounds clamping.
+-- | Copy a whole subtree to offset @d@; return the next offset.
 copyNode :: MutableByteArray s -> Int -> Node a -> ST s Int
 copyNode !out !d node = case node of
   Leaf _ _ arr -> do
@@ -1666,26 +1599,21 @@ copyNode !out !d node = case node of
         | c >= n = pure d'
         | otherwise = copyNode out d' (indexChildren cs c) >>= go (c + 1)
 
--- | Locations of the start of line @l@ and of the end of its content, that
--- is before the terminating @\\n@ or @\\r\\n@, or at the end of the rope.
+-- | Two locations: a line start and the end of its content.
 data Span = Span {-# UNPACK #-} !Metrics {-# UNPACK #-} !Metrics
 
+-- | Start of line @l@ and end of its content (before @\\n@ or @\\r\\n@, or
+-- at the end of the rope).
 lineSpan :: Int -> Node a -> Span
-lineSpan !l root = Span start (lineEnd start (metricsAtNode Lines (max 0 l + 1) root) root)
+lineSpan !l root
+  | newlines next == newlines start = Span start next
+  | bytes lf > bytes start && indexByteNode (bytes lf - 1) root == 0x0D = Span start (lf `subMetrics` Metrics 1 1 1 0)
+  | otherwise = Span start lf
   where
     start = metricsAtNode Lines l root
-{-# NOINLINE lineSpan #-}
-
--- | End of the content of the line starting at @start@, given the start of
--- the next line.
-lineEnd :: Metrics -> Metrics -> Node a -> Metrics
-lineEnd start next root
-  | newlines next == newlines start = next
-  | bytes lf > bytes start && indexByteNode (bytes lf - 1) root == 0x0D = lf `subMetrics` Metrics 1 1 1 0
-  | otherwise = lf
-  where
+    next = metricsAtNode Lines (max 0 l + 1) root
     lf = next `subMetrics` Metrics 1 1 1 1
-{-# INLINE lineEnd #-}
+{-# NOINLINE lineSpan #-}
 
 -- | The end of the content of a line that starts at @from@ and is terminated
 -- by the line feed at @lf@ of the same chunk.
@@ -1746,11 +1674,6 @@ positionOfMetrics u m root =
   Position (newlines m) (count u m - count u (metricsAtNode Lines (newlines m) root))
 {-# INLINE positionOfMetrics #-}
 
-metricsAtPositionNode :: Unit -> Position -> Node a -> Metrics
-metricsAtPositionNode u pos root = case linePositionNode False u pos root of
-  Span _ at -> at
-{-# INLINE metricsAtPositionNode #-}
-
 -- | Locate a position, optionally computing its line start as well.
 -- When the line start is not requested, its field may repeat the position.
 linePositionNode :: Bool -> Unit -> Position -> Node a -> Span
@@ -1768,8 +1691,8 @@ linePositionNode !wanted !u (Position l0 c) root
             else
               let !to = contentEnd arr from lf
                   !b = column m arr from to
-                  -- Reuse the known newline count. Recover the line start
-                  -- by measuring only the column, rather than another prefix.
+                  -- Reuse the newline count; get the line start by
+                  -- measuring only the column.
                   !at = acc <> leafPrefixWithLines m arr b j
                in Span (if wanted then at `subMetrics` sliceOfLine m arr from b else at) at
       Inner total _ _ cs
@@ -1782,10 +1705,8 @@ linePositionNode !wanted !u (Position l0 c) root
       | c <= 0 = from
       | u == Lines || (u == Bytes || isAscii m) && c >= to - from = to
       | isAscii m = from + c
-      | otherwise = case u of
-          Bytes -> roundDownFrom arr (from + c)
-          Utf16 -> scanUnits True c arr from to
-          _ -> scanUnits False c arr from to
+      | u == Bytes = roundDownFrom arr (from + c)
+      | otherwise = scanUnits (u == Utf16) c arr from to
     -- The general case: a line across leaves, or no such line.
     general = case lineSpan l0 root of
       Span start end
@@ -1841,18 +1762,14 @@ metricsWhereNode p root
 {-# SPECIALIZE metricsWhereNode :: (Metrics -> () -> Bool) -> Node () -> Metrics #-}
 
 ------------------------------------------------------------------------------
--- Editing
+-- Editing the tree
 
--- | Replace @[k, k + d)@ with a byte-array slice in one descent, if the
--- range fits within one leaf. Copy the leaf and rebuild its path, splitting
--- an overflowing leaf into two. Return 'None' if the range spans leaves,
--- the leaf would shrink below @least@, or the result is too large to split.
---
--- Also return a conservative estimate of free space in the target leaf.
---
--- @least@ is 'minChunk', or zero for a root leaf. Using an integer rather
--- than a Boolean avoids constructor specialisation preceding measure
--- specialisation.
+-- | Replace @[k, k + d)@ with a slice of @src@ in one descent, copying the
+-- leaf and its path and splitting an overflowing leaf. 'None' if the range
+-- spans leaves, the leaf would drop below @least@ ('minChunk', 0 for a root
+-- leaf), or it is too big to split. Also returns a free-space estimate.
+-- @least@ is an Int, not a Bool, so constructor specialisation cannot run
+-- before measure specialisation.
 editNode :: Measure a => Int -> Unit -> Int -> Int -> ByteArray -> Int -> Int -> Node a -> (# Result a, Int# #)
 editNode !least u !k !d !src !soff !slen node = case node of
   Leaf m _ arr
@@ -1921,21 +1838,15 @@ edited u i j t root = case editRoot u i j t root of
 ------------------------------------------------------------------------------
 -- Typing
 
--- Buffered input must produce the same text as individual insertions.
--- For byte, code point, and UTF-16 offsets:
+-- Buffering is sound for Bytes, Chars and Utf16, even for clamped or rounded
+-- @i@ (not Lines: inserted text need not end at a line boundary):
 --
 -- > insert u (max 0 i + n) t2 (insert u i t1 r) == insert u i (t1 <> t2) r
 -- >   where n = count u (metrics (fromText t1))
 --
--- This also holds for clamped or rounded @i@: offsets beyond the end append,
--- and offsets inside a code point retain the same displacement after @t1@.
--- 'Lines' does not satisfy this rule, since inserted text need not end at
--- a line boundary.
---
--- A read after each keystroke applies the growing buffer to its base tree.
--- Limit buffering to the target leaf's estimated free space to avoid
--- repeatedly splitting it. The preceding insertion supplies that estimate;
--- an inaccurate estimate affects performance, not correctness.
+-- A run is capped by its leaf's free space (estimated by the previous
+-- insertion), so re-applying it after every keystroke does not keep splitting
+-- the leaf. A bad estimate costs speed, not correctness.
 
 -- | A rope with a run of keystrokes, of the given metrics, to be inserted at
 -- an offset.
@@ -2156,10 +2067,8 @@ hPutUtf8 h (Rope root) = do
     I# used <- pourNode h buf ptr 0 root
     flushBuffer h ptr used
 
--- | Copy a subtree into the output buffer, starting at @used@. Flush when
--- the next chunk would not fit, and return the number of bytes left buffered.
---
--- Kept at the top level so GHC can unbox the returned count.
+-- | Copy a subtree into the buffer from @used@, flushing when a chunk will
+-- not fit; return the bytes still buffered. Top level so the count unboxes.
 pourNode :: Handle -> MutableByteArray RealWorld -> Ptr Word8 -> Int -> Node a -> IO Int
 pourNode h !buf !ptr used@(I# used#) node = case node of
   Leaf _ _ arr
@@ -2176,30 +2085,23 @@ pourNode h !buf !ptr used@(I# used#) node = case node of
         | c >= n = pure used'
         | otherwise = pourNode h buf ptr used' (indexChildren cs c) >>= go (c + 1)
 
--- | Write the occupied part of the buffer.
---
--- Box the count only at the 'hPutBuf' call. Keeping that conversion here
--- avoids propagating boxed counts through 'pourNode'.
+-- | Write the used part of the buffer. Takes 'Int#' so the box needed by
+-- 'hPutBuf' does not spread into 'pourNode'.
 flushBuffer :: Handle -> Ptr Word8 -> Int# -> IO ()
 flushBuffer h ptr used# = when (used > 0) $ hPutBuf h ptr used
   where
     used = I# used#
 {-# NOINLINE flushBuffer #-}
 
--- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents.
---
--- Evaluates the tree, including pending input and annotations to weak head
--- normal form, before opening the file. An evaluation failure at this stage
--- leaves an existing file untouched. The write itself is not atomic.
+-- | Write UTF-8 to a file with 'hPutUtf8', replacing its contents. Forces
+-- the tree (pending input, annotations to WHNF) before opening the file, so
+-- a failure there leaves the file untouched. The write is not atomic.
 writeFileUtf8 :: FilePath -> Rope a -> IO ()
 writeFileUtf8 path rope@(Rope _) = withBinaryFile path WriteMode (`hPutUtf8` rope)
 
--- | /O(log n)/. Zero-copy view of the rest of the chunk containing the given
--- offset. Returns empty text when the clamped offset is at the end.
---
--- For a parser read callback, request a byte offset, consume the returned
--- text, then advance by its byte length. Offsets are clamped and rounded
--- as described at 'Unit'.
+-- | /O(log n)/. Zero-copy view of the rest of the chunk containing an
+-- offset (clamped and rounded as at 'Unit'); empty at the end. For a parser
+-- read callback, ask for a byte offset and advance by the result's length.
 chunkAt :: Unit -> Int -> Rope a -> Text
 chunkAt u k (Rope root)
   | b >= nodeBytes root = T.empty
@@ -2292,11 +2194,8 @@ slice u i j (Rope root)
 -- | The lowest node containing a range, with both offsets relative to it.
 data Sliced a = Sliced !(Node a) {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 
--- | Follow both ends of a range down as long as they lead into the same
--- child, for @0 <= i < j@ and @j@ not beyond the end.
---
--- Shared descent for 'slice' and 'sliceText'. Both endpoints remain relative
--- to the original text, so rounding is consistent across the two operations.
+-- | Descend while both ends of @[i, j)@ fall in one child, for @0 <= i < j@
+-- and @j@ not beyond the end. Shared by 'slice' and 'sliceText'.
 sliceDescend :: Unit -> Int -> Int -> Node a -> Sliced a
 sliceDescend !u !i !j node = case node of
   Leaf{} -> Sliced node i j
@@ -2312,16 +2211,15 @@ sliceDescend !u !i !j node = case node of
 -- and @j@ not beyond its end.
 sliceNode :: Measure a => Unit -> Int -> Int -> Node a -> Node a
 sliceNode u i j root = case sliceDescend u i j root of
-  Sliced node@(Leaf m _ arr) i' j' ->
-    let !bi = leafOffset u i' m arr
-        !bj = leafOffset u j' m arr
-     in if bi <= 0 && bj >= sizeofByteArray arr
-          then node
-          else
-            if bj <= bi
-              then emptyNode
-              else mkLeafWith (leafSliceMetrics m arr bi (bj - bi)) (cloneByteArray arr bi (bj - bi))
-  Sliced node i' j' -> dropRoot Bytes (byteOffsetAtNode u i' node) (takeRoot Bytes (byteOffsetAtNode u j' node) node)
+  Sliced node@(Leaf m _ arr) i' j'
+    | bi <= 0 && bj >= sizeofByteArray arr -> node
+    | bj <= bi -> emptyNode
+    | otherwise -> mkLeafWith (leafSliceMetrics m arr bi (bj - bi)) (cloneByteArray arr bi (bj - bi))
+    where
+      !bi = leafOffset u i' m arr
+      !bj = leafOffset u j' m arr
+  -- Cutting the tail does not move where @i'@ rounds to.
+  Sliced node i' j' -> dropRoot u i' (takeRoot u j' node)
 {-# INLINABLE sliceNode #-}
 {-# SPECIALIZE sliceNode :: Unit -> Int -> Int -> Node () -> Node () #-}
 
@@ -2347,18 +2245,12 @@ sliceTextNode u i j root = case sliceDescend u i j root of
 -- Editing
 
 -- | /O(log n + inserted bytes)/. Insert text at a clamped, code-point-aligned
--- offset. Empty input leaves the rope unchanged.
+-- offset; empty input is a no-op. Copies only the target chunk and its path.
 --
--- Small insertions copy the affected chunk and its path through the tree.
--- An overflowing chunk can split in two.
---
--- Consecutive insertions in the same unit ('Bytes', 'Chars', or 'Utf16')
--- can use a buffer of up to 'maxPending' bytes, limited by the target chunk's
--- free space. Updating that bounded buffer is /O(1)/ in document size.
--- A tree read, an edit elsewhere, or an insertion that exceeds the buffer's
--- capacity forces the pending insertion. 'length' and 'metrics' include
--- pending input without forcing it.
--- Evaluating a rope to weak head normal form may leave this insertion deferred.
+-- Consecutive insertions in the same unit ('Bytes', 'Chars' or 'Utf16') are
+-- buffered in /O(1)/, up to 'maxPending' bytes and the chunk's free space.
+-- A tree read, an edit elsewhere or a full buffer applies it; 'length' and
+-- 'metrics' do not, and WHNF may leave it pending.
 insert :: Measure a => Unit -> Int -> Text -> Rope a -> Rope a
 insert u i t r
   | T.null t = r
@@ -2369,9 +2261,7 @@ insert u i t r
 -- both offsets in the original rope. Does nothing when @j <= i@.
 -- Deleting a suffix of buffered 'Chars' input can take /O(1)/; see 'insert'.
 delete :: Measure a => Unit -> Int -> Int -> Rope a -> Rope a
-delete u i j r
-  | j <= i = r
-  | otherwise = deleteRange u i j r
+delete u i j = replace u i j T.empty
 {-# INLINABLE delete #-}
 
 -- | /O(log n + inserted bytes)/. Replace the half-open range @[i, j)@ with
@@ -2456,7 +2346,8 @@ splitAtPosition u pos r = splitAt Bytes (bytes (metricsAtPosition u pos r)) r
 -- | /O(log n)/. The location of a position in every unit, clamped like
 -- 'splitAtPosition'.
 metricsAtPosition :: Unit -> Position -> Rope a -> Metrics
-metricsAtPosition u pos (Rope root) = metricsAtPositionNode u pos root
+metricsAtPosition u pos (Rope root) = case linePositionNode False u pos root of
+  Span _ at -> at
 
 -- | /O(log n)/. Return prefix metrics for the line start and the position,
 -- sharing their lookup. Clamps coordinates as in 'metricsAtPosition'.
@@ -2498,7 +2389,7 @@ positionToOffset from to pos = count to . metricsAtPosition from pos
 {-# INLINE positionToOffset #-}
 
 ------------------------------------------------------------------------------
--- Custom measures
+-- Searching by measure
 
 -- | /O(log n)/ for constant-time measure combination and predicates.
 -- Split after the longest code-point-aligned prefix for which the predicate
@@ -2524,13 +2415,7 @@ remeasure (Rope root) = Rope (go root)
   where
     go :: Node a -> Node b
     go (Leaf m _ arr) = mkLeafWith m arr
-    go (Inner m h _ cs) = inner h m $ runChildren $ do
-      let n = sizeofChildren cs
-      out <- newChildren n (go (indexChildren cs 0))
-      let fill !i
-            | i >= n = pure out
-            | otherwise = writeChildren out i (go (indexChildren cs i)) >> fill (i + 1)
-      fill 1
+    go (Inner m h _ cs) = inner h m (generateChildren (sizeofChildren cs) (\i -> go (indexChildren cs i)))
 {-# INLINABLE remeasure #-}
 
 ------------------------------------------------------------------------------

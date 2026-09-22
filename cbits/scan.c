@@ -1,25 +1,15 @@
 /*
- * UTF-8 chunk scans with portable C, SSE2, and AVX2 implementations.
+ * UTF-8 chunk scans at three levels with identical results:
+ *   0  portable C (compilers may vectorise);
+ *   1  SSE2, 16 bytes at a time (every x86-64);
+ *   2  AVX2, 32 bytes at a time, if the CPU and OS support it.
+ * Callers pass a level <= nano_rope_simd_level(); Haskell caches it and tests
+ * compare all levels. Unit scans assume valid UTF-8; byte counts accept
+ * partial sequences. Called through unsafe FFI on unpinned arrays.
  *
- * Scans read bytes without allocating or modifying the input. Unit scans
- * assume valid UTF-8; byte-counting scans also accept partial sequences.
- * Data.Text.NanoRope.Internal passes unpinned array payloads through unsafe
- * foreign calls. The default build handles slices shorter than 32 bytes in
- * Haskell; the small-chunk test build also sends those slices here.
- *
- * Three levels, all computing exactly the same results:
- *
- *   0  portable C, which compilers are free to vectorise;
- *   1  SSE2, 16 bytes at a time (every x86-64 has it);
- *   2  AVX2, 32 bytes at a time, if the CPU and the OS support it.
- *
- * Each exported scan takes a level no higher than nano_rope_simd_level().
- * Haskell caches this choice; tests compare all supported levels.
- *
- * Short tails use an overlapping vector load with already-counted lanes
- * masked out. Loads stay within the supplied buffer bounds. Scans given a
- * whole-array bound may load bytes before the requested start, but exclude
- * them from the result.
+ * Tails use one overlapping vector load with already-counted lanes masked
+ * out. Loads stay in bounds; whole-array scans may read before the start but
+ * ignore those bytes.
  */
 
 #ifndef LEVEL
@@ -126,7 +116,7 @@ static inline uint32_t popcount_sse2(uint32_t m)
   return (((m + (m >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
 }
 
-/* Bits set, with the instruction, which every CPU with AVX2 has. */
+/* Hardware POPCNT: every AVX2 CPU has it. */
 #define AVX2 __attribute__((target("avx2,popcnt")))
 
 AVX2 static inline uint32_t popcount_avx2(uint32_t m)
