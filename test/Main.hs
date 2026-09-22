@@ -121,8 +121,7 @@ main =
           ]
       , testGroup
           ("chunk scans: " ++ L.intercalate ", " (map kernelsName kernels))
-          [ testProperty "metrics" prop_scanMetrics
-          , testProperty "line feeds" prop_scanNewlines
+          [ testProperty "metrics and line feeds" prop_scanMetrics
           , testProperty "the next line feed" prop_scanNext
           , testProperty "the previous line feed" prop_scanPrevious
           , testProperty "the k-th line" prop_scanLine
@@ -377,25 +376,22 @@ instance Arbitrary Op where
     Typed u i ss erased -> [Typed u i ss' erased | ss' <- shrink ss] ++ [Typed u i ss 0 | erased > 0]
     _ -> []
 
--- | Ranges are generated as a start and a length.
-range :: Unit -> Offset -> Offset -> Text -> (Int, Int)
-range u i (Offset len) t = (start, start + len * (Rope.count u (naiveMetrics t) + 5) `quot` 1000)
+-- | A range from a start and a length, with the code point counts it
+-- resolves to.
+range :: Unit -> Offset -> Offset -> Text -> ((Int, Int), (Int, Int))
+range u i (Offset len) t = ((a, b), charRange u a b t)
   where
-    start = resolve u i t
+    a = resolve u i t
+    b = a + len * (Rope.count u (naiveMetrics t) + 5) `quot` 1000
 
 apply :: Op -> (R, Text) -> (R, Text)
 apply op (r, t) = case op of
-  Insert u i (Snippet s) ->
-    let k = resolve u i t
-        n = charsAt u k t
-     in (Rope.insert u k s r, T.take n t <> s <> T.drop n t)
+  Insert u i s -> let (r', t', _) = keystroke u (r, t, resolve u i t) s in (r', t')
   Delete u i j ->
-    let (a, b) = range u i j t
-        (na, nb) = charRange u a b t
+    let ((a, b), (na, nb)) = range u i j t
      in (Rope.delete u a b r, T.take na t <> T.drop nb t)
   Replace u i j (Snippet s) ->
-    let (a, b) = range u i j t
-        (na, nb) = charRange u a b t
+    let ((a, b), (na, nb)) = range u i j t
      in (Rope.replace u a b s r, T.take na t <> s <> T.drop nb t)
   Append (Snippet s) -> (r <> Rope.fromText s, t <> s)
   Prepend (Snippet s) -> (Rope.fromText s <> r, s <> t)
@@ -406,8 +402,7 @@ apply op (r, t) = case op of
     let k = resolve u i t
      in (Rope.drop u k r, T.drop (charsAt u k t) t)
   Slice u i j ->
-    let (a, b) = range u i j t
-        (na, nb) = charRange u a b t
+    let ((a, b), (na, nb)) = range u i j t
      in (Rope.slice u a b r, T.take (nb - na) (T.drop na t))
   Rejoin u i ->
     let (a, b) = Rope.splitAt u (resolve u i t) r
@@ -576,8 +571,7 @@ prop_slice (Edited r t) u i j =
   counterexample (show (u, a, b)) $
     holds (Rope.slice u a b r) expected .&&. Rope.sliceText u a b r === expected
   where
-    (a, b) = range u i j t
-    (na, nb) = charRange u a b t
+    ((a, b), (na, nb)) = range u i j t
     expected = T.take (nb - na) (T.drop na t)
 
 prop_ops :: Doc -> [Op] -> Property
@@ -603,16 +597,15 @@ instance Arbitrary Burst where
 -- | Repeated typing and erasing at a cursor exercises chunk splits and merges.
 prop_typing :: Doc -> Offset -> Property
 prop_typing (Doc t0) start = forAll (resize 10 (listOf arbitrary)) $ \bursts ->
-  let cursor = max 0 (min (T.length t0) (resolve Chars start t0))
+  let cursor = charsAt Chars (resolve Chars start t0) t0
    in go (Rope.fromText t0, t0, cursor) bursts
   where
     go (r, t, _) [] = holds r t
     go st@(r, t, _) (b : bs) = holds r t .&&. counterexample (show b) (go (burst b st) bs)
 
-    burst (Typing s n) st = L.foldl' (\acc _ -> typeOne s acc) st [1 .. n]
+    burst (Typing s n) st = L.foldl' (\acc _ -> keystroke Chars acc (Snippet s)) st [1 .. n]
     burst (Erasing n) st = L.foldl' (\acc _ -> eraseOne acc) st [1 .. n]
 
-    typeOne s (r, t, c) = (Rope.insert Chars c s r, T.take c t <> s <> T.drop c t, c + T.length s)
     eraseOne st@(r, t, c)
       | c <= 0 = st
       | otherwise = (Rope.delete Chars (c - 1) c r, T.take (c - 1) t <> T.drop c t, c - 1)
@@ -655,7 +648,7 @@ prop_branching (Edited r0 t0) i s1 s2 s3 =
     , counterexample "the rope they came from" (holds r t)
     ]
   where
-    start = max 0 (min (T.length t0) (resolve Chars i t0))
+    start = charsAt Chars (resolve Chars i t0) t0
     (r, t, cursor) = L.foldl' (keystroke Chars) (r0, t0, start) [Snippet "ab", s1]
     (ra, ta, _) = keystroke Chars (r, t, cursor) s2
     (rb, tb, _) = keystroke Chars (r, t, cursor) s3
@@ -934,24 +927,26 @@ prop_big = forAll (genText (6000 * sizeFactor)) $ \t0 ->
 ------------------------------------------------------------------------------
 -- Chunk scans
 
--- | UTF-8 inputs for comparing every scan implementation with a model.
--- Long lines exercise searches beyond the first vector. Repeated pieces
--- exercise counter flushing at the 255-vector limit.
-newtype Scanned = Scanned Text
-  deriving (Show)
+-- | UTF-8 inputs, with their bytes, for comparing every scan implementation
+-- with a model. Long lines exercise searches beyond the first vector.
+-- Repeated pieces exercise counter flushing at the 255-vector limit.
+data Scanned = Scanned Text ByteArray
+
+instance Show Scanned where
+  show (Scanned t _) = show t
+
+scanned :: Text -> Scanned
+scanned t@(TI.Text (A.ByteArray ba) off len) = Scanned t (cloneByteArray (ByteArray ba) off len)
 
 instance Arbitrary Scanned where
   arbitrary =
-    Scanned
+    scanned
       <$> frequency
         [ (6, choose (0, 1100) >>= \n -> T.pack . concat <$> vectorOf n genPiece)
         , (3, choose (0, 1100) >>= \n -> T.pack . concat <$> vectorOf n (frequency [(1, pure "\n"), (60, filter (/= '\n') <$> genPiece)]))
         , (1, genPiece >>= \p -> choose (8000, 9000) >>= \n -> pure (T.pack (concat (replicate n p))))
         ]
-  shrink (Scanned t) = Scanned <$> shrinkText t
-
-bytesOfText :: Text -> ByteArray
-bytesOfText (TI.Text (A.ByteArray ba) off len) = cloneByteArray (ByteArray ba) off len
+  shrink (Scanned t _) = scanned <$> shrinkText t
 
 byteList :: ByteArray -> [Word8]
 byteList arr = [indexByteArray arr i | i <- [0 .. sizeofByteArray arr - 1]]
@@ -970,56 +965,44 @@ genSlice size = do
   len <- frequency [(1, pure (size - off)), (2, choose (0, min 40 (size - off))), (2, choose (0, size - off))]
   pure (off, len)
 
+-- | Metrics and the line feed count of a slice.
 prop_scanMetrics :: Scanned -> Property
-prop_scanMetrics (Scanned t) = forAll (genSlice (sizeofByteArray arr)) $ \(off, len) ->
+prop_scanMetrics (Scanned _ arr) = forAll (genSlice (sizeofByteArray arr)) $ \(off, len) ->
   let bs = L.take len (L.drop off (byteList arr))
       cs = len - L.length (filter isContByte bs)
-   in allKernels
-        (\k -> kernelMetrics k arr off len)
-        (Metrics len cs (cs + L.length (filter (>= 0xF0) bs)) (L.length (filter (== 0x0A) bs)))
-  where
-    arr = bytesOfText t
-
-prop_scanNewlines :: Scanned -> Property
-prop_scanNewlines (Scanned t) = forAll (genSlice (sizeofByteArray arr)) $ \(off, len) ->
-  allKernels (\k -> kernelNewlines k arr off len) (L.length (filter (== 0x0A) (L.take len (L.drop off (byteList arr)))))
-  where
-    arr = bytesOfText t
+      m = Metrics len cs (cs + L.length (filter (>= 0xF0) bs)) (L.length (filter (== 0x0A) bs))
+   in allKernels (\k -> (kernelMetrics k arr off len, kernelNewlines k arr off len)) (m, newlines m)
 
 -- | Offsets of the line feeds.
 lineFeeds :: ByteArray -> [Int]
 lineFeeds arr = [i | (i, b) <- zip [0 ..] (byteList arr), b == 0x0A]
 
 prop_scanNext :: Scanned -> Property
-prop_scanNext (Scanned t) = forAll (choose (0, size)) $ \from ->
+prop_scanNext (Scanned _ arr) = forAll (choose (0, size)) $ \from ->
   allKernels (\k -> kernelFindNewline k arr from) (fromMaybe size (L.find (>= from) (lineFeeds arr)))
   where
-    arr = bytesOfText t
     size = sizeofByteArray arr
 
 prop_scanPrevious :: Scanned -> Property
-prop_scanPrevious (Scanned t) = forAll (choose (0, sizeofByteArray arr)) $ \to ->
+prop_scanPrevious (Scanned _ arr) = forAll (choose (0, sizeofByteArray arr)) $ \to ->
   allKernels (\k -> kernelFindNewlineBack k arr to) (last (-1 : [i | i <- lineFeeds arr, i < to]))
-  where
-    arr = bytesOfText t
 
 -- | Check line-start and terminator offsets, including indices before
 -- the first line and beyond the last.
 prop_scanLine :: Scanned -> Property
-prop_scanLine (Scanned t) = forAll (choose (-1, L.length lfs + 2)) $ \n ->
+prop_scanLine (Scanned _ arr) = forAll (choose (-1, L.length lfs + 2)) $ \n ->
   let from
         | n <= 0 = 0
         | otherwise = case L.drop (n - 1) lfs of i : _ -> i + 1; [] -> size
    in allKernels (\k -> kernelLineSpan k n arr) (ChunkLine from (fromMaybe size (L.find (>= from) lfs)))
   where
-    arr = bytesOfText t
     size = sizeofByteArray arr
     lfs = lineFeeds arr
 
 -- | Compare unit scans with a decoded model of the longest prefix that fits
 -- in @k@ units. Both slice endpoints are code point boundaries.
 prop_scanUnits :: Scanned -> Bool -> Property
-prop_scanUnits (Scanned t) wide = forAll (genSlice (L.length bounds - 1)) $ \(i, n) ->
+prop_scanUnits (Scanned t arr) wide = forAll (genSlice (L.length bounds - 1)) $ \(i, n) ->
   let from = bounds !! i
       to = bounds !! (i + n)
       piece = T.unpack (takeWord8 (to - from) (dropWord8 from t))
@@ -1033,5 +1016,4 @@ prop_scanUnits (Scanned t) wide = forAll (genSlice (L.length bounds - 1)) $ \(i,
    in forAll (choose (-1, sum (map units piece) + 2)) $ \k ->
         allKernels (\kn -> kernelScanUnits kn wide k arr from to) (model k)
   where
-    arr = bytesOfText t
     bounds = scanl (+) 0 (map utf8Len (T.unpack t))
