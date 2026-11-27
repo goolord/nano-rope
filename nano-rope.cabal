@@ -5,27 +5,28 @@ synopsis:
     B-tree text rope with flat chunks, multi-unit indexing and custom measures
 
 description:
-    A persistent text rope for editors, language servers and parsers.
+    A persistent UTF-8 rope for editors, language servers, and parsers.
 
-    * UTF-8 chunks of at most 512 bytes keep local edits small, even in
-      documents with very long lines.
+    * Flat UTF-8 chunks (at most 512 bytes) keep edits local, even in files
+      with very long lines.
 
-    * A B-tree with up to 16 children per node shares unchanged text between
-      versions, making snapshots and undo inexpensive.
+    * A B-tree (up to 16 children per node) shares unchanged subtrees between
+      versions for cheap snapshots and undo.
 
-    * Consecutive insertions can use a bounded keystroke buffer to reduce
-      tree updates.
+    * Consecutive keystrokes and suffix backspaces at a cursor can stay in a
+      bounded buffer without rebuilding the tree on every key.
 
-    * Cached byte, code point, UTF-16 and newline counts support
-      logarithmic-time indexing and conversion between units.
+    * Cached byte, code point, UTF-16, and newline counts give @O(log n)@
+      indexing, line/column lookup, and unit conversion.
 
-    * Chunk scans use SSE2 or AVX2 on supported x86-64 systems, with portable
-      C elsewhere. Build with @-f -simd@ for Haskell-only scans.
+    * Chunk scans use SSE2 or AVX2 on x86-64 and portable C elsewhere; build
+      with @-f -simd@ for Haskell-only scans.
 
-    * Chunk views and buffered UTF-8 output avoid flattening the document.
+    * Zero-copy chunk views and buffered UTF-8 output avoid flattening the
+      document.
 
-    * Custom monoidal measures support application-specific summaries
-      and prefix searches.
+    * "Data.Text.NanoRope.Measured" caches custom monoidal measures alongside
+      the built-in counts for prefix searches.
 
 license:            MIT
 license-file:       LICENSE

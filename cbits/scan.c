@@ -43,8 +43,8 @@ typedef const uint8_t *bytes;
 
 /* ------------------------------------------------------------------------
  * Level 0: portable C, also used for inputs shorter than a vector.
- * Marked noinline so SSE2/AVX2 hot paths stay leaf functions without
- * spilling callee-saved registers for cold short-input fallbacks.
+ * Marked noinline so SSE2/AVX2 hot paths stay leaf functions and do not
+ * spill callee-saved registers.
  */
 
 NR_NOINLINE static HsWord64 metrics_c(bytes s, size_t n)
@@ -285,7 +285,7 @@ HsInt nano_rope_nth_newline(HsInt level, bytes s, HsInt n, HsInt k)
  * selects UTF-16 units rather than code points. */
 HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, HsInt wide)
 {
-  /* Handle empty prefixes before entering loops that require k >= 0. */
+  /* Handle empty prefixes so the scan loops can assume k > 0. */
   if (k <= 0)
     return from < to ? from : to;
   DISPATCH(level, scan_units, s, (size_t)from, (size_t)to, k, 0, (int)wide)
@@ -300,6 +300,7 @@ HsInt nano_rope_scan_units(HsInt level, bytes s, HsInt from, HsInt to, HsInt k, 
  *   ATTR      the attributes of a function of this level
  *   W         the bytes in a vector, V its type, MM(op) its intrinsics
  *   LOAD(p)   the vector at p, unaligned; ZERO, the one of zeros
+ *   VOR(a, b) bitwise OR of two vectors
  *   SUM(v)    the sum of the 64-bit lanes of a vector
  *
  * plus popcount_LEVEL, the matching population-count function.
@@ -402,13 +403,12 @@ ATTR NR_NOINLINE static HsWord64 FN(metrics)(bytes s, size_t n)
     return LO(metrics)(s, n);
   if (n > (size_t)FLUSH * W)
     return FN(metrics_full)(s, n);
-  const V nl = MM(set1_epi8)('\n');
   V an = ZERO, hi = ZERO;
   size_t i = 0;
   for (; n - i >= W; i += W) {
     V x = LOAD(s + i);
     hi = VOR(hi, x);
-    an = MM(sub_epi8)(an, MM(cmpeq_epi8)(x, nl));
+    an = MM(sub_epi8)(an, FN(is_newline)(x));
   }
   uint32_t non_ascii = FN(bits)(hi);
   HsInt nls = (HsInt)SUM(MM(sad_epu8)(an, ZERO));
@@ -416,7 +416,7 @@ ATTR NR_NOINLINE static HsWord64 FN(metrics)(bytes s, size_t n)
     V x = LOAD(s + n - W);
     int shift = W - (int)(n - i);
     non_ascii |= FN(bits)(x) >> shift;
-    nls += (HsInt)FN(popcount)(FN(bits)(MM(cmpeq_epi8)(x, nl)) >> shift);
+    nls += (HsInt)FN(popcount)(FN(bits)(FN(is_newline)(x)) >> shift);
   }
   return non_ascii ? FN(metrics_full)(s, n) : PACK(0, 0, nls);
 }

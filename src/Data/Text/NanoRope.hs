@@ -22,8 +22,9 @@
 -- columns. Only @\\n@ starts a new line.
 --
 -- Complexity bounds use /n/ for the document's byte length. They assume the
--- tree is evaluated: a read after buffered typing may first apply a pending
--- insertion. 'null', 'length', 'lineCount', and 'metrics' do not force it.
+-- tree is evaluated: a tree read after buffered typing may first apply a
+-- pending insertion. 'null', 'length', 'lineCount', 'metrics', and cursor-area
+-- lookups avoid forcing it.
 --
 -- = Example: a language server
 --
@@ -169,7 +170,7 @@ foldrChunks = M.foldrChunks
 
 -- | Strict left fold over non-empty chunks in document order. Walks the
 -- tree directly, sharing text buffers and avoiding an intermediate list.
--- Useful for consumers such as hashes and parsers.
+-- Handy for hashing or parsing without building a chunk list.
 foldlChunks' :: (b -> Text -> b) -> b -> Rope -> b
 foldlChunks' = M.foldlChunks'
 
@@ -251,16 +252,18 @@ sliceText = M.sliceText
 -- | /O(log n + inserted bytes)/. Insert text at a clamped, code-point-aligned
 -- offset; empty input is a no-op. Copies only the target chunk and its path.
 --
--- Consecutive insertions in the same unit ('Bytes', 'Chars' or 'Utf16') are
--- buffered in /O(1)/, up to 128 bytes and the chunk's free space. A tree
--- read, an edit elsewhere or a full buffer applies it; 'length' and 'metrics'
--- do not, and WHNF may leave it pending.
+-- Consecutive insertions at the end of a run ('Bytes', 'Chars', or 'Utf16')
+-- are buffered in /O(1)/, up to 128 bytes and the chunk's free space. An edit
+-- elsewhere, a full buffer, or a tree read outside the cursor applies it;
+-- 'length', 'metrics', and cursor-area lookups read through the buffer, and
+-- WHNF may leave it pending.
 insert :: Unit -> Int -> Text -> Rope -> Rope
 insert = M.insert
 
 -- | /O(log n)/. Remove the half-open range @[i, j)@, clamping and rounding
 -- both offsets in the original rope. Does nothing when @j <= i@.
--- Deleting a suffix of buffered 'Chars' input can take /O(1)/; see 'insert'.
+-- Deleting a suffix of buffered input ('Bytes', 'Chars', or 'Utf16') can take
+-- /O(1)/; see 'insert'.
 delete :: Unit -> Int -> Int -> Rope -> Rope
 delete = M.delete
 

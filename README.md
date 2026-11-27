@@ -4,8 +4,8 @@ A persistent UTF-8 rope for Haskell. Index and edit by bytes, Unicode code
 points, UTF-16 units, or lines in logarithmic time. Versions share unchanged
 text for undo and snapshots.
 
-Uses a B-tree of chunks up to 512 bytes, buffered consecutive insertions,
-zero-copy chunk reads, and optional custom monoidal summaries.
+Built as a B-tree of chunks up to 512 bytes, with a keystroke buffer,
+zero-copy chunk views, and optional custom measures.
 
 ## Quick start
 
@@ -63,7 +63,7 @@ their `bytes`, `chars`, or `utf16Units` fields to get columns.
 
 ## Custom measures
 
-`Data.Text.NanoRope.Measured` provides `Rope m` with cached monoidal summaries.
+`Data.Text.NanoRope.Measured` adds a cached monoidal `Measure` to every node.
 Implement `Measure.measureChunk`, then use `measure` to read the summary or
 `splitWhere` to search by it. Measures must obey:
 
@@ -72,9 +72,10 @@ measureChunk (a <> b) == measureChunk a <> measureChunk b
 measureChunk mempty   == mempty
 ```
 
-Search predicates must stay true once true for a growing prefix. Pairs and
-triples of measures are supported. `measured` / `unmeasured` in the plain
-module rebuild annotations while sharing text buffers.
+Search predicates must be monotone: once true for a prefix, they must stay true
+for any longer prefix. Pairs and triples of measures are supported. `measured`
+and `unmeasured` in the plain module rebuild annotations while sharing text
+buffers.
 
 ## Performance
 
@@ -87,19 +88,20 @@ For `n` document bytes and `k` inserted or returned bytes:
 | `insert`, `replace`, `getLine`, `sliceText` | `O(log n + k)` |
 | Construction, flattening, chunk traversal, UTF-8 output | `O(n)` |
 
-Bounds assume constant-time measure combination and search predicates, and
-linear-time chunk measurement. Consecutive insertions can use a bounded
-buffer; tree reads flush it, while `length` and `metrics` do not.
+These bounds assume `O(1)` `(<>)` and search predicates, and `O(chunk size)`
+`measureChunk`. Consecutive edits at a cursor use a bounded buffer; `length`,
+`metrics`, and cursor-area reads consult it directly, while other tree reads
+flush it.
 
-Scans use SSE2/AVX2 on supported x86-64 systems, portable C elsewhere, and
-Haskell for short scans. Build with `-f -simd` for Haskell-only scans.
+Scans use SSE2/AVX2 on x86-64, portable C elsewhere, and Haskell for short
+slices. Build with `-f -simd` for Haskell-only scans.
 
 ### Benchmarks
 
 GHC 9.14.1, about 4 MB / 100,000 lines of generated source. A fresh rope retains
-4.55 MB for 4.03 MB of text; after 10,000 random inserts, 4.60 MB. Retaining
-older versions uses additional memory. Construction and flattening usually
-copy the text.
+4.55 MB for 4.03 MB of text; after 10,000 random inserts, 4.60 MB. Keeping older
+versions retains only the chunks that differ. Construction and flattening copy
+the text unless it fits in one chunk.
 
 ![Timings, allocation, and live heap: nano-rope, text-rope, yi-rope, core-text](bench/results.svg)
 

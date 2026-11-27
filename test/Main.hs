@@ -656,42 +656,35 @@ prop_branching (Edited r0 t0) i s1 s2 s3 =
     rc = Rope.delete Chars (cursor - 1) cursor r
     tc = T.take (cursor - 1) t <> T.drop cursor t
 
--- | Reads and multi-unit erasures on a rope with pending buffered input must
--- agree with the model without forcing the deferred tree first.
+-- | Reads and erasures on a rope with pending input agree with the model.
 prop_typingReads :: Edited -> Unit -> Offset -> Property
 prop_typingReads (Edited r0 t0) u i =
   u /= Lines ==>
-    forAll (resize 6 (listOf1 (choose (1, 3) >>= genText))) $ \pieces ->
-      forAll (choose (0, 3)) $ \delUnits ->
-        forAll (arbitrary :: Gen Unit) $ \delUnit ->
-          forAll (arbitrary :: Gen Unit) $ \qUnit ->
-            let start = resolve u i t0
-                (r1, t1, cursor) = L.foldl' (keystroke u) (r0, t0, start) (Snippet "a" : map Snippet pieces)
-                (r, t) =
-                  if delUnits > 0 && delUnit /= Lines
-                    then
-                      let curInDel = Rope.count delUnit (naiveMetrics (T.take (charsAt u cursor t1) t1))
-                          (na, nb) = charRange delUnit (curInDel - delUnits) curInDel t1
-                       in (Rope.delete delUnit (curInDel - delUnits) curInDel r1, T.take na t1 <> T.drop nb t1)
-                    else (r1, t1)
-                table = lineTable t
-                nLines = L.length table
-             in forAll (genPosition t) $ \pos ->
-                  forAll (choose (-1, nLines + 1)) $ \l ->
-                    forAll (arbitrary :: Gen Offset) $ \off ->
-                      let k = resolve qUnit off t
-                          n = charsAtPosition qUnit pos t
-                          (lineM, atM) = Rope.metricsAtLineAndPosition qUnit pos r
-                       in conjoin
-                            [ counterexample "getLine" (Rope.getLine l r === (if l < 0 then "" else maybe "" snd (L.lookup l (zip [0 ..] table))))
-                            , counterexample "metricsAt" (Rope.metricsAt qUnit k r === naiveMetrics (T.take (charsAt qUnit k t) t))
-                            , counterexample "convert Bytes" (Rope.convert qUnit Bytes k r === bytes (naiveMetrics (T.take (charsAt qUnit k t) t)))
-                            , counterexample "metricsAtPosition" (Rope.metricsAtPosition qUnit pos r === naiveMetrics (T.take n t))
-                            , counterexample "metricsAtLineAndPosition line" (lineM === naiveMetrics (T.take (charsAt Lines (posLine pos) t) t))
-                            , counterexample "metricsAtLineAndPosition at" (atM === naiveMetrics (T.take n t))
-                            , counterexample "positionToOffset Bytes" (Rope.positionToOffset qUnit Bytes pos r === bytes (naiveMetrics (T.take n t)))
-                            , holds r t
-                            ]
+    forAll ((,,,) <$> resize 6 (listOf1 (choose (1, 3) >>= genText)) <*> choose (0, 3) <*> arbitrary <*> arbitrary) $
+      \(pieces, delUnits, delUnit, qUnit) ->
+        let start = resolve u i t0
+            (r1, t1, cursor) = L.foldl' (keystroke u) (r0, t0, start) (Snippet "a" : map Snippet pieces)
+            (r, t)
+              | delUnits > 0 && delUnit /= Lines =
+                  let curInDel = Rope.count delUnit (naiveMetrics (T.take (charsAt u cursor t1) t1))
+                      (na, nb) = charRange delUnit (curInDel - delUnits) curInDel t1
+                   in (Rope.delete delUnit (curInDel - delUnits) curInDel r1, T.take na t1 <> T.drop nb t1)
+              | otherwise = (r1, t1)
+            table = lineTable t
+         in forAll ((,,) <$> genPosition t <*> choose (-1, L.length table + 1) <*> arbitrary) $ \(pos, l, off) ->
+              let k = resolve qUnit off t
+                  n = charsAtPosition qUnit pos t
+                  (lineM, atM) = Rope.metricsAtLineAndPosition qUnit pos r
+               in conjoin
+                    [ counterexample "getLine" (Rope.getLine l r === (if l < 0 then "" else maybe "" snd (L.lookup l (zip [0 ..] table))))
+                    , counterexample "metricsAt" (Rope.metricsAt qUnit k r === naiveMetrics (T.take (charsAt qUnit k t) t))
+                    , counterexample "convert Bytes" (Rope.convert qUnit Bytes k r === bytes (naiveMetrics (T.take (charsAt qUnit k t) t)))
+                    , counterexample "metricsAtPosition" (Rope.metricsAtPosition qUnit pos r === naiveMetrics (T.take n t))
+                    , counterexample "metricsAtLineAndPosition line" (lineM === naiveMetrics (T.take (charsAt Lines (posLine pos) t) t))
+                    , counterexample "metricsAtLineAndPosition at" (atM === naiveMetrics (T.take n t))
+                    , counterexample "positionToOffset Bytes" (Rope.positionToOffset qUnit Bytes pos r === bytes (naiveMetrics (T.take n t)))
+                    , holds r t
+                    ]
 
 prop_metricsAt :: Edited -> Unit -> Offset -> Property
 prop_metricsAt (Edited r t) u i =

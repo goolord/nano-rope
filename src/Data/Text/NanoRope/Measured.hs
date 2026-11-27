@@ -17,9 +17,10 @@
 -- 'Chars' counts code points, not grapheme clusters or display columns.
 --
 -- Complexity bounds use /n/ for the document's byte length. They assume
--- constant-time measure combination, linear-time chunk measurement, and an
--- evaluated tree. Reads, including 'measure', may first apply buffered
--- input; 'null', 'length', 'lineCount', and 'metrics' do not force it.
+-- /O(1)/ measure combination, linear-time chunk measurement, and an evaluated
+-- tree. Reads that need the tree (including 'measure') may first apply
+-- buffered input; 'null', 'length', 'lineCount', 'metrics', and cursor-area
+-- lookups avoid forcing it.
 --
 -- = Example: counting tabs
 --
