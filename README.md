@@ -29,11 +29,11 @@ bytes, Unicode code points, UTF-16 code units, and lines.
 
 ### Measured in HLS (`rope-bench`)
 
-Measured directly inside HLS ([`lsp`](https://github.com/goolord/lsp/tree/nano-rope)
-and [`haskell-language-server`](https://github.com/goolord/haskell-language-server/tree/nano-rope)
-`nano-rope` branches vs `text-rope` 0.3, GHC 9.14.1, AVX2, identical checksums
-across all 60 checks): **6.04× faster (geomean)** across 48 workloads on 4
-Haskell modules (`Config.hs`, `Logic.hs`, `CodeAction.hs`, `Ppr.hs`).
+Measured directly inside `haskell-language-server`'s `rope-bench` (using the
+[`lsp` `nano-rope` branch](https://github.com/goolord/lsp/tree/nano-rope) vs
+`text-rope` 0.3, GHC 9.14.1, AVX2, identical checksums across all 60 checks):
+**6.04× faster (geomean)** across 48 workloads on 4 Haskell modules
+(`Config.hs`, `Logic.hs`, `CodeAction.hs`, `Ppr.hs`).
 
 Representative results on `Ppr.hs` (320 kB GHC module):
 
