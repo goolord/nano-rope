@@ -30,6 +30,12 @@
 
 typedef const uint8_t *bytes;
 
+#if defined(__GNUC__) || defined(__clang__)
+#define NR_NOINLINE __attribute__((noinline))
+#else
+#define NR_NOINLINE
+#endif
+
 /* Pack three counts into 21 bits each. Requires an input shorter than
  * 2^21 bytes; Haskell handles larger slices separately. */
 #define PACK(conts, fours, nls) \
@@ -37,9 +43,11 @@ typedef const uint8_t *bytes;
 
 /* ------------------------------------------------------------------------
  * Level 0: portable C, also used for inputs shorter than a vector.
+ * Marked noinline so SSE2/AVX2 hot paths stay leaf functions without
+ * spilling callee-saved registers for cold short-input fallbacks.
  */
 
-static HsWord64 metrics_c(bytes s, size_t n)
+NR_NOINLINE static HsWord64 metrics_c(bytes s, size_t n)
 {
   size_t conts = 0, fours = 0, nls = 0;
   for (size_t i = 0; i < n; i++) {
@@ -51,23 +59,15 @@ static HsWord64 metrics_c(bytes s, size_t n)
   return PACK(conts, fours, nls);
 }
 
-static HsInt newlines_c(bytes s, size_t n)
-{
-  size_t nls = 0;
-  for (size_t i = 0; i < n; i++)
-    nls += s[i] == '\n';
-  return (HsInt)nls;
-}
-
 /* The first '\n' at or after i, or n. */
-static HsInt find_newline_c(bytes s, size_t i, size_t n)
+NR_NOINLINE static HsInt find_newline_c(bytes s, size_t i, size_t n)
 {
   const uint8_t *p = i < n ? memchr(s + i, '\n', n - i) : NULL;
   return p ? (HsInt)(p - s) : (HsInt)n;
 }
 
 /* The last '\n' before i, or -1. */
-static HsInt find_newline_back_c(bytes s, size_t i)
+NR_NOINLINE static HsInt find_newline_back_c(bytes s, size_t i)
 {
   while (i > 0)
     if (s[--i] == '\n')
@@ -75,20 +75,26 @@ static HsInt find_newline_back_c(bytes s, size_t i)
   return -1;
 }
 
-/* Offset after the k-th '\n' at or after i (k >= 1), or n. */
-static HsInt nth_newline_c(bytes s, size_t i, size_t n, HsInt k)
+/* Offset after the k-th '\n' (0 for k <= 0) and the next '\n', packed. */
+NR_NOINLINE static HsWord64 line_span_c(bytes s, size_t n, HsInt k)
 {
-  for (; i < n; i++)
-    if (s[i] == '\n' && --k == 0)
-      return (HsInt)(i + 1);
-  return (HsInt)n;
+  size_t from = 0;
+  if (k > 0) {
+    for (; from < n; from++)
+      if (s[from] == '\n' && --k == 0) {
+        from++;
+        break;
+      }
+  }
+  HsInt lf = find_newline_c(s, from, n);
+  return (HsWord64)from | (HsWord64)lf << 32;
 }
 
 /* Return the offset of the first code point that would exceed k units, or `to`.
  * Start at i with u units already counted. Continuation bytes are skipped,
  * so scans may resume inside a sequence. `wide` selects UTF-16 units
  * rather than code points. */
-static HsInt scan_units_c(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
+NR_NOINLINE static HsInt scan_units_c(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
 {
   for (; i < to; i++) {
     uint8_t b = s[i];
@@ -153,6 +159,7 @@ static inline HsWord64 sum128(__m128i v)
 #define MM(op) _mm_##op
 #define LOAD(p) _mm_loadu_si128((const __m128i *)(p))
 #define ZERO _mm_setzero_si128()
+#define VOR(a, b) _mm_or_si128((a), (b))
 #define SUM(v) sum128(v)
 #include "scan.c"
 
@@ -170,6 +177,7 @@ AVX2 static inline HsWord64 sum256(__m256i v)
 #define MM(op) _mm256_##op
 #define LOAD(p) _mm256_loadu_si256((const __m256i *)(p))
 #define ZERO _mm256_setzero_si256()
+#define VOR(a, b) _mm256_or_si256((a), (b))
 #define SUM(v) sum256(v)
 #include "scan.c"
 
@@ -232,10 +240,18 @@ HsWord64 nano_rope_metrics(HsInt level, bytes s, HsInt off, HsInt len)
   DISPATCH(level, metrics, s + off, (size_t)len)
 }
 
-/* Number of '\n' in s[off .. off+len). */
+/* Number of '\n' in s[off .. off+len). Reuses metrics in <= 1 MiB blocks
+ * so the 21-bit packed newline field never overflows. */
 HsInt nano_rope_newlines(HsInt level, bytes s, HsInt off, HsInt len)
 {
-  DISPATCH(level, newlines, s + off, (size_t)len)
+  HsInt nls = 0;
+  while (len > 0) {
+    HsInt chunk = len > 0x100000 ? 0x100000 : len;
+    nls += (HsInt)(nano_rope_metrics(level, s, off, chunk) >> 42);
+    off += chunk;
+    len -= chunk;
+  }
+  return nls;
 }
 
 /* The first '\n' in s[from .. n), or n; from <= n. */
@@ -250,22 +266,18 @@ HsInt nano_rope_find_newline_back(HsInt level, bytes s, HsInt to)
   DISPATCH(level, find_newline_back, s, (size_t)to)
 }
 
-/* The offset just after the k-th '\n' in s[0 .. n) for k >= 1, or n. */
-HsInt nano_rope_nth_newline(HsInt level, bytes s, HsInt n, HsInt k)
-{
-  if (k <= 0)
-    return n;
-  DISPATCH(level, nth_newline, s, 0, (size_t)n, k)
-}
-
 /* Find a line start and its terminator in one foreign call. Pack the offset
  * after the k-th '\n' (zero for k <= 0) into the low 32 bits, and the next
  * '\n' offset into the high 32 bits. Missing endpoints use n. */
 HsWord64 nano_rope_line_span(HsInt level, bytes s, HsInt n, HsInt k)
 {
-  HsInt from = k <= 0 ? 0 : nano_rope_nth_newline(level, s, n, k);
-  HsInt lf = nano_rope_find_newline(level, s, from, n);
-  return (HsWord64)from | (HsWord64)lf << 32;
+  DISPATCH(level, line_span, s, (size_t)n, k)
+}
+
+/* The offset just after the k-th '\n' in s[0 .. n) for k >= 1, or n. */
+HsInt nano_rope_nth_newline(HsInt level, bytes s, HsInt n, HsInt k)
+{
+  return k <= 0 ? n : (HsInt)(uint32_t)nano_rope_line_span(level, s, n, k);
 }
 
 /* Return the end of the longest prefix of s[from .. to) fitting in k units.
@@ -325,13 +337,6 @@ ATTR static inline uint32_t FN(newline_mask)(bytes p)
   return FN(bits)(FN(is_newline)(LOAD(p)));
 }
 
-/* The counts of a metrics scan in the last t lanes of a vector. */
-ATTR static inline HsWord64 FN(pack_tail)(uint32_t conts, uint32_t fours, uint32_t nls, size_t t)
-{
-  int shift = W - (int)t;
-  return PACK(FN(popcount)(conts >> shift), FN(popcount)(fours >> shift), FN(popcount)(nls >> shift));
-}
-
 /* Count units in selected lanes using continuation and 4-byte leader masks. */
 ATTR static inline HsInt FN(units)(uint32_t lanes, uint32_t conts, uint32_t fours, int wide)
 {
@@ -357,10 +362,9 @@ ATTR static inline uint32_t FN(units_stop)(uint32_t lanes, uint32_t conts, uint3
   }
 }
 
-ATTR static HsWord64 FN(metrics)(bytes s, size_t n)
+/* Full metrics scan for non-ASCII or long (> FLUSH * W) inputs. */
+ATTR NR_NOINLINE static HsWord64 FN(metrics_full)(bytes s, size_t n)
 {
-  if (n < W)
-    return LO(metrics)(s, n);
   const V zero = ZERO;
   V sum = zero; /* packed as by PACK, in each 64-bit lane */
   size_t i = 0;
@@ -382,34 +386,42 @@ ATTR static HsWord64 FN(metrics)(bytes s, size_t n)
   HsWord64 packed = SUM(sum);
   if (i < n) {
     V x = LOAD(s + n - W);
-    packed += FN(pack_tail)(FN(bits)(FN(is_cont)(x)), FN(bits)(FN(is_four)(x)), FN(bits)(FN(is_newline)(x)), n - i);
+    int shift = W - (int)(n - i);
+    packed += PACK(FN(popcount)(FN(bits)(FN(is_cont)(x)) >> shift),
+                   FN(popcount)(FN(bits)(FN(is_four)(x)) >> shift),
+                   FN(popcount)(FN(bits)(FN(is_newline)(x)) >> shift));
   }
   return packed;
 }
 
-ATTR static HsInt FN(newlines)(bytes s, size_t n)
+/* ASCII-first metrics scan: stays within volatile vector registers on Windows
+ * x64 and falls back to metrics_full on non-ASCII or long inputs. */
+ATTR NR_NOINLINE static HsWord64 FN(metrics)(bytes s, size_t n)
 {
   if (n < W)
-    return LO(newlines)(s, n);
-  const V zero = ZERO;
-  V sn = zero;
+    return LO(metrics)(s, n);
+  if (n > (size_t)FLUSH * W)
+    return FN(metrics_full)(s, n);
+  const V nl = MM(set1_epi8)('\n');
+  V an = ZERO, hi = ZERO;
   size_t i = 0;
-  while (n - i >= W) {
-    size_t v = (n - i) / W;
-    if (v > FLUSH)
-      v = FLUSH;
-    V an = zero;
-    for (; v > 0; v--, i += W)
-      an = MM(sub_epi8)(an, FN(is_newline)(LOAD(s + i)));
-    sn = MM(add_epi64)(sn, MM(sad_epu8)(an, zero));
+  for (; n - i >= W; i += W) {
+    V x = LOAD(s + i);
+    hi = VOR(hi, x);
+    an = MM(sub_epi8)(an, MM(cmpeq_epi8)(x, nl));
   }
-  HsInt nls = (HsInt)SUM(sn);
-  if (i < n)
-    nls += FN(popcount)(FN(newline_mask)(s + n - W) >> (W - (n - i)));
-  return nls;
+  uint32_t non_ascii = FN(bits)(hi);
+  HsInt nls = (HsInt)SUM(MM(sad_epu8)(an, ZERO));
+  if (i < n) {
+    V x = LOAD(s + n - W);
+    int shift = W - (int)(n - i);
+    non_ascii |= FN(bits)(x) >> shift;
+    nls += (HsInt)FN(popcount)(FN(bits)(MM(cmpeq_epi8)(x, nl)) >> shift);
+  }
+  return non_ascii ? FN(metrics_full)(s, n) : PACK(0, 0, nls);
 }
 
-ATTR static HsInt FN(find_newline)(bytes s, size_t i, size_t n)
+ATTR NR_NOINLINE static HsInt FN(find_newline)(bytes s, size_t i, size_t n)
 {
   if (n < W)
     return LO(find_newline)(s, i, n);
@@ -426,7 +438,7 @@ ATTR static HsInt FN(find_newline)(bytes s, size_t i, size_t n)
   return (HsInt)n;
 }
 
-ATTR static HsInt FN(find_newline_back)(bytes s, size_t i)
+ATTR NR_NOINLINE static HsInt FN(find_newline_back)(bytes s, size_t i)
 {
   if (i < W)
     return LO(find_newline_back)(s, i);
@@ -443,32 +455,52 @@ ATTR static HsInt FN(find_newline_back)(bytes s, size_t i)
   return -1;
 }
 
-ATTR static HsInt FN(nth_newline)(bytes s, size_t i, size_t n, HsInt k)
+ATTR NR_NOINLINE static HsWord64 FN(line_span)(bytes s, size_t n, HsInt k)
 {
   if (n < W)
-    return LO(nth_newline)(s, i, n, k);
+    return LO(line_span)(s, n, k);
+  if (k <= 0)
+    return (HsWord64)FN(find_newline)(s, 0, n) << 32;
+  size_t i = 0;
   for (; n - i >= W; i += W) {
     uint32_t m = FN(newline_mask)(s + i);
     HsInt c = FN(popcount)(m);
-    if (c >= k)
-      return (HsInt)(i + nth_bit(m, k) + 1);
+    if (c >= k) {
+      uint32_t b = nth_bit(m, k);
+      size_t from = i + b + 1;
+      uint32_t rest = (m >> b) >> 1;
+      size_t lf = rest ? from + __builtin_ctz(rest) : (size_t)FN(find_newline)(s, i + W, n);
+      return (HsWord64)from | (HsWord64)lf << 32;
+    }
     k -= c;
   }
   if (i < n) {
     uint32_t m = FN(newline_mask)(s + n - W) >> (W - (n - i));
-    if (FN(popcount)(m) >= k)
-      return (HsInt)(i + nth_bit(m, k) + 1);
+    if (FN(popcount)(m) >= k) {
+      uint32_t b = nth_bit(m, k);
+      size_t from = i + b + 1;
+      uint32_t rest = (m >> b) >> 1;
+      size_t lf = rest ? from + __builtin_ctz(rest) : n;
+      return (HsWord64)from | (HsWord64)lf << 32;
+    }
   }
-  return (HsInt)n;
+  return (HsWord64)n | (HsWord64)n << 32;
 }
 
-ATTR static HsInt FN(scan_units)(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
+ATTR NR_NOINLINE static HsInt FN(scan_units)(bytes s, size_t i, size_t to, HsInt k, HsInt u, int wide)
 {
   if (to < W)
     return LO(scan_units)(s, i, to, k, u, wide);
   for (; to - i >= W; i += W) {
     V x = LOAD(s + i);
-    uint32_t conts = FN(bits)(FN(is_cont)(x)), fours = FN(bits)(FN(is_four)(x));
+    if (FN(bits)(x) == 0) {
+      if (u + W > k)
+        return (HsInt)(i + (size_t)(k - u));
+      u += W;
+      continue;
+    }
+    uint32_t conts = FN(bits)(FN(is_cont)(x));
+    uint32_t fours = wide ? FN(bits)(FN(is_four)(x)) : 0;
     HsInt c = FN(units)(ALL, conts, fours, wide);
     if (u + c > k)
       return (HsInt)(i + FN(units_stop)(ALL, conts, fours, k, u, wide));
@@ -476,8 +508,9 @@ ATTR static HsInt FN(scan_units)(bytes s, size_t i, size_t to, HsInt k, HsInt u,
   }
   if (i < to) {
     V x = LOAD(s + to - W);
-    uint32_t conts = FN(bits)(FN(is_cont)(x)), fours = FN(bits)(FN(is_four)(x));
     uint32_t lanes = ALL & ~((1u << (W - (to - i))) - 1);
+    uint32_t conts = FN(bits)(FN(is_cont)(x));
+    uint32_t fours = wide ? FN(bits)(FN(is_four)(x)) : 0;
     if (u + FN(units)(lanes, conts, fours, wide) > k)
       return (HsInt)(to - W + FN(units_stop)(lanes, conts, fours, k, u, wide));
   }
@@ -495,6 +528,7 @@ ATTR static HsInt FN(scan_units)(bytes s, size_t i, size_t to, HsInt k, HsInt u,
 #undef MM
 #undef LOAD
 #undef ZERO
+#undef VOR
 #undef SUM
 
 #endif /* LEVEL */
