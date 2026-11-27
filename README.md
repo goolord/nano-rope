@@ -18,9 +18,11 @@ bytes, Unicode code points, UTF-16 code units, and lines.
 - **Cursor typing buffer.** Consecutive edits at the cursor stay in a small
   bounded buffer; `length`, `metrics`, `getLine`, and cursor-area lookups read
   it directly without flushing the tree.
-- **Direct reads instead of split/concat.** `getLine`, `sliceText`, and
+- **Direct reads and sequential cursors.** `getLine`, `sliceText`, and
   `metricsAtLineAndPosition` read straight from the tree rather than splitting
-  and rebuilding subtrees on every completion, token, or line query.
+  and rebuilding subtrees. For sorted passes such as semantic tokenization,
+  `Cursor` caches the active leaf and line for `O(1)` amortized position, line,
+  and slice lookups.
 - **Compact edited heap.** Chunks stay bounded (≤512 bytes) and rebalance on
   edits, avoiding the fragment bloat `text-rope` accumulates during typing.
 - **Portable and TH-safe.** Runtime SSE2/AVX2 dispatch on x86-64 (portable C
@@ -42,7 +44,7 @@ Representative results on `Ppr.hs` (320 kB GHC module):
 | Typing, edits alone | 11.3 ms | 681 µs | **16.6×** | 17.5× less |
 | Typing, completion prefix | 15.2 ms | 1.84 ms | **8.3×** | 12.1× less |
 | Rename (200 edits) | 7.71 ms | 130 µs | **59×** | 2.2× less |
-| Semantic tokens (after typing) | 110 ms | 19.4 ms | **5.7×** | 10.9× less |
+| Semantic tokens (after typing) | 86.7 ms | 14.4 ms | **6.0×** | 10.4× less |
 | Position conversions (fresh) | 298 ms | 1.23 ms | **243×** | 36× less |
 | Position conversions (after typing) | 49.0 ms | 1.39 ms | **35×** | 185× less |
 | Reading lines (after typing) | 23.7 ms | 2.47 ms | **9.6×** | 22.6× less |
@@ -108,6 +110,10 @@ byteOff = bytes at                                 -- 13
   `toChunks`, and `toLazyText` share underlying buffers. `hPutUtf8` and
   `writeFileUtf8` stream raw UTF-8 bytes without handle encoding or newline
   translation.
+- **Read cursor:** `cursor` creates a read cursor over a fixed snapshot;
+  `cursorMetricsAtLineAndPosition`, `cursorMetricsAtPosition`, `cursorGetLine`,
+  and `cursorSliceText` walk sequential/nearby queries in `O(1)` amortized time
+  and fall back to `O(log n)` on distant jumps.
 - **Custom measures:** `Data.Text.NanoRope.Measured` caches any monoidal
   `Measure` per node (`measure`, monotone `splitWhere`, pairs/triples).
   `measured` and `unmeasured` convert while sharing chunk buffers.
