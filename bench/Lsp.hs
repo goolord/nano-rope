@@ -15,8 +15,9 @@
 --
 -- The generated document is mostly ASCII with occasional non-ASCII comments.
 --
--- Compare the combined 'Rope.metricsAtLineAndPosition' lookup with separate
--- line-start and position lookups, labelled "in two descents". When built with
+-- Sorted token and position passes use 'Rope.Cursor' (with stateless
+-- single-descent lookups labelled "stateless" and separate line-start /
+-- position lookups labelled "in two descents"). When built with
 -- @-f compare-text-rope@, each workload is also run on @text-rope@'s
 -- @Data.Text.Utf16.Rope.Mixed@ (the rope used by @lsp@ and HLS).
 module Lsp
@@ -280,6 +281,24 @@ semanticTokens :: Asking -> Rope -> [Token] -> Int
 semanticTokens asking rope = L.foldl' (\n t -> n + focusToken asking rope t) 0
 {-# INLINE semanticTokens #-}
 
+semanticTokensCursor :: Rope -> [Token] -> Int
+semanticTokensCursor rope = go 0 (Rope.cursor rope)
+  where
+    go !acc !_ [] = acc
+    go !acc !cur (Token l from to _ : rest) =
+      let !(line1, s1, cur1) = Rope.cursorMetricsAtLineAndPosition Chars (Position l from) cur
+       in if newlines line1 == l && chars s1 - chars line1 == from
+            then
+              let !(line2, s2, cur2) = Rope.cursorMetricsAtLineAndPosition Chars (Position l to) cur1
+               in if newlines line2 == l && chars s2 - chars line2 == to
+                    then
+                      let !ncs = utf16Units s1 - utf16Units line1
+                          !nce = utf16Units s2 - utf16Units line2
+                          !tok = Rope.cursorSliceText Bytes (bytes s1) (bytes s2) cur2
+                       in go (acc + ncs + nce + T.length tok) cur2 rest
+                    else go (acc - 1) cur2 rest
+            else go (acc - 1) cur1 rest
+
 convertPositions :: Asking -> Rope -> [Position] -> Int
 convertPositions asking rope = L.foldl' step 0
   where
@@ -287,6 +306,24 @@ convertPositions asking rope = L.foldl' step 0
       Just cp | Just (Position l c) <- convertPosition Chars Utf16 asking rope cp -> n + l + c
       _ -> n - 1
 {-# INLINE convertPositions #-}
+
+convertPositionCursor :: Unit -> Unit -> Rope -> Rope.Cursor -> Position -> (Maybe Position, Rope.Cursor)
+convertPositionCursor from to rope cur pos@(Position l c) =
+  let !(line, loc, cur') = Rope.cursorMetricsAtLineAndPosition from pos cur
+   in if newlines line == l && Rope.count from loc - Rope.count from line == c
+        then (Just (Position l (Rope.count to loc - Rope.count to line)), cur')
+        else (convertPosition from to TwoDescents rope pos, cur')
+{-# INLINE convertPositionCursor #-}
+
+convertPositionsCursor :: Rope -> [Position] -> Int
+convertPositionsCursor rope = go 0 (Rope.cursor rope)
+  where
+    go !acc !_ [] = acc
+    go !acc !cur (p : ps) = case convertPositionCursor Utf16 Chars rope cur p of
+      (Just cp, cur1) -> case convertPositionCursor Chars Utf16 rope cur1 cp of
+        (Just (Position l c), cur2) -> go (acc + l + c) cur2 ps
+        (Nothing, cur2) -> go (acc - 1) cur2 ps
+      (Nothing, cur1) -> go (acc - 1) cur1 ps
 
 readLines :: Rope -> [Position] -> Int
 readLines rope = L.foldl' step 0
@@ -491,7 +528,8 @@ lspBenchmarks e =
         []
 #endif
   , bgroup "semantic tokens" $
-      bench "nano-rope" (whnf (semanticTokens OneDescent (lspEdited e)) (lspTokens e))
+      bench "nano-rope" (whnf (semanticTokensCursor (lspEdited e)) (lspTokens e))
+        : bench "stateless" (whnf (semanticTokens OneDescent (lspEdited e)) (lspTokens e))
         :
 #ifdef COMPARE_TEXT_ROPE
         [bench "text-rope" (whnf (trSemanticTokens (lspEditedTR e)) (lspTokens e))]
@@ -499,7 +537,8 @@ lspBenchmarks e =
         []
 #endif
   , bgroup "position conversions" $
-      bench "nano-rope" (whnf (convertPositions OneDescent (lspEdited e)) (lspPositions e))
+      bench "nano-rope" (whnf (convertPositionsCursor (lspEdited e)) (lspPositions e))
+        : bench "stateless" (whnf (convertPositions OneDescent (lspEdited e)) (lspPositions e))
         :
 #ifdef COMPARE_TEXT_ROPE
         [bench "text-rope" (whnf (trConvertPositions (lspEditedTR e)) (lspPositions e))]

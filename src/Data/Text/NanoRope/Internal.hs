@@ -111,6 +111,14 @@ module Data.Text.NanoRope.Internal
   , offsetToPosition
   , positionToOffset
 
+    -- * Read cursor
+  , Cursor
+  , cursor
+  , cursorGetLine
+  , cursorMetricsAtPosition
+  , cursorMetricsAtLineAndPosition
+  , cursorSliceText
+
     -- * Custom measures
   , splitWhere
   , metricsWhere
@@ -2844,6 +2852,470 @@ offsetToPosition from to k (Rope root) = positionAtNode from to k root
 positionToOffset :: Unit -> Unit -> Position -> Rope a -> Int
 positionToOffset from to pos r = count to (metricsAtPosition from pos r)
 {-# INLINE positionToOffset #-}
+
+------------------------------------------------------------------------------
+-- Tree and API: read cursor
+
+-- | Zipper path from a leaf's parent up to the root.
+data CursorPath a
+  = CTop
+  | CStep {-# UNPACK #-} !(Children a) {-# UNPACK #-} !Int !(CursorPath a)
+
+-- | Active leaf position shared across all lines cached inside that leaf.
+data CursorLeaf a = CursorLeaf
+  { clRoot :: Node a
+  , clPath :: !(CursorPath a)
+  , clBefore :: {-# UNPACK #-} !Metrics
+  , clMetrics :: {-# UNPACK #-} !PackedMetrics
+  , clArr :: {-# UNPACK #-} !ByteArray
+  , clStartsLine :: !Bool
+  }
+
+-- | A read cursor over a fixed rope snapshot.
+--
+-- Sequential or nearby position, line, and byte-slice lookups reuse the active
+-- leaf and cached line in /O(1)/ amortized time instead of descending from the
+-- root on every query. Distant or backward jumps fall back to /O(log n)/ tree
+-- lookups.
+data Cursor a
+  = -- | Cached single-leaf line (valid iff @curLine >= 0@).
+    Cursor1
+      !(CursorLeaf a)
+      {-# UNPACK #-} !Int
+      -- ^ Cached line index, or @-1@ when uncached.
+      {-# UNPACK #-} !Word64
+      -- ^ Packed 16-bit offsets within @clArr@: @from | (end << 16) | (lf << 32)@.
+      {-# UNPACK #-} !Word64
+      -- ^ Packed 16-bit prefix counts at @from@ for non-ASCII leaves:
+      -- @fromChars | (fromUtf16 << 16)@. Unused when the leaf is ASCII.
+  | -- | Cached two-leaf line spanning @leaf0[from..end0)@ and @leaf1[0..end1)@.
+    Cursor2
+      !(CursorLeaf a)
+      !(CursorLeaf a)
+      {-# UNPACK #-} !Int
+      -- ^ Cached line index (@>= 0@).
+      {-# UNPACK #-} !Int
+      -- ^ Start byte in @leaf0@.
+      {-# UNPACK #-} !Int
+      -- ^ Content end byte in @leaf0@.
+      {-# UNPACK #-} !Int
+      -- ^ Content end byte in @leaf1@.
+      {-# UNPACK #-} !Metrics
+      -- ^ Global prefix metrics at @from@.
+      {-# UNPACK #-} !Metrics
+      -- ^ Metrics of @leaf0[from..end0)@.
+
+-- | Explicit unboxed return for 'cursorLinePosition' so GHC never boxes
+-- intermediate metrics or result records regardless of CPR arity limits.
+type CursorSpan# a = (# Int#, Int#, Int#, Int#, Int#, Int#, Int#, Int#, Cursor a #)
+
+cursorSpan# :: Metrics -> Metrics -> Cursor a -> CursorSpan# a
+cursorSpan# (Metrics (I# b1) (I# c1) (I# u1) (I# l1)) (Metrics (I# b2) (I# c2) (I# u2) (I# l2)) cur =
+  (# b1, c1, u1, l1, b2, c2, u2, l2, cur #)
+{-# INLINE cursorSpan# #-}
+
+packLineSpan :: Int -> Int -> Int -> Word64
+packLineSpan from end lf =
+  fromIntegral from
+    .|. (fromIntegral end `unsafeShiftL` 16)
+    .|. (fromIntegral lf `unsafeShiftL` 32)
+{-# INLINE packLineSpan #-}
+
+spanFrom, spanEnd, spanLf :: Word64 -> Int
+spanFrom w = fromIntegral (w .&. 0xFFFF)
+spanEnd w = fromIntegral ((w `unsafeShiftR` 16) .&. 0xFFFF)
+spanLf w = fromIntegral ((w `unsafeShiftR` 32) .&. 0xFFFF)
+{-# INLINE spanFrom #-}
+{-# INLINE spanEnd #-}
+{-# INLINE spanLf #-}
+
+packLinePrefix :: Int -> Int -> Word64
+packLinePrefix fc fu = fromIntegral fc .|. (fromIntegral fu `unsafeShiftL` 16)
+{-# INLINE packLinePrefix #-}
+
+cursorAtLeaf :: CursorLeaf a -> Cursor a
+cursorAtLeaf leaf = Cursor1 leaf (-1) 0 0
+{-# INLINE cursorAtLeaf #-}
+
+cursorActiveLeaf :: Cursor a -> CursorLeaf a
+cursorActiveLeaf (Cursor1 leaf _ _ _) = leaf
+cursorActiveLeaf (Cursor2 _ leaf1 _ _ _ _ _ _) = leaf1
+{-# INLINE cursorActiveLeaf #-}
+
+-- | Global prefix metrics at the start of the cached single-leaf line.
+lineStartMetrics :: CursorLeaf a -> Int -> Word64 -> Word64 -> Metrics
+lineStartMetrics leaf !l !lspan !lpref =
+  let !before = clBefore leaf
+      !pm = clMetrics leaf
+      !from = spanFrom lspan
+      !j = l - newlines before
+   in if packedBytes pm == packedChars pm
+        then before <> Metrics from from from j
+        else
+          let !fc = fromIntegral (lpref .&. 0xFFFF)
+              !fu = fromIntegral ((lpref `unsafeShiftR` 16) .&. 0xFFFF)
+           in before <> Metrics from fc fu j
+{-# INLINE lineStartMetrics #-}
+
+-- | Build a 'Cursor2' when line @l@ starts at @from@ in @leaf0@ (at local
+-- line @j0@) and terminates (or reaches EOF) inside @leaf0@'s right sibling.
+cacheTwoLeafLine :: Int -> Int -> Int -> CursorLeaf a -> Cursor a
+cacheTwoLeafLine !l !j0 !from leaf0 = case stepNextLeaf leaf0 of
+  Nothing -> cursorAtLeaf leaf0
+  Just leaf1 ->
+    let !pm1 = clMetrics leaf1
+        !arr1 = clArr leaf1
+        !size1 = packedBytes pm1
+        !lf1 = swarFindNewline arr1 0
+        !isLast1 = bytes (clBefore leaf1) + size1 == nodeBytes (clRoot leaf1)
+     in if lf1 < size1 || isLast1
+          then
+            let !pm0 = clMetrics leaf0
+                !arr0 = clArr leaf0
+                !size0 = packedBytes pm0
+                !leaf0M = unpackMetrics pm0
+                !end0 = if lf1 == 0 && lf1 < size1 then contentEnd arr0 from size0 else size0
+                !end1 = if lf1 < size1 then contentEnd arr1 0 lf1 else size1
+                !startM = clBefore leaf0 <> leafPrefixWithLines leaf0M arr0 from j0
+                !part0M = sliceOfLine leaf0M arr0 from end0
+             in Cursor2 leaf0 leaf1 l from end0 end1 startM part0M
+          else cursorAtLeaf leaf0
+{-# NOINLINE cacheTwoLeafLine #-}
+
+-- | Populate the cached line @l@ on @leaf@ when it fits in @leaf@ or across
+-- @leaf@ and its immediate right sibling.
+cursorCacheLine :: Int -> CursorLeaf a -> Cursor a
+cursorCacheLine !l leaf
+  | j < 0 || j > nLeaf = cursorAtLeaf leaf
+  | j == 0 && not (clStartsLine leaf) = cursorAtLeaf leaf
+  | otherwise = case chunkLineOf nLeaf j arr of
+      ChunkLine from lf
+        | lf < size || isLastLeaf ->
+            let !end = if lf < size then contentEnd arr from lf else size
+                !pref
+                  | packedBytes pm == packedChars pm = 0
+                  | otherwise =
+                      let !pmFrom = leafPrefixWithLines (unpackMetrics pm) arr from j
+                       in packLinePrefix (chars pmFrom) (utf16Units pmFrom)
+             in Cursor1 leaf l (packLineSpan from end lf) pref
+        | otherwise -> cacheTwoLeafLine l j from leaf
+  where
+    !before = clBefore leaf
+    !pm = clMetrics leaf
+    !arr = clArr leaf
+    !size = packedBytes pm
+    !nLeaf = packedLines pm
+    !j = l - newlines before
+    !isLastLeaf = bytes before + size == nodeBytes (clRoot leaf)
+{-# INLINE cursorCacheLine #-}
+
+-- | Move @leaf@ to the leaf immediately to its right, or 'Nothing' at the last leaf.
+stepNextLeaf :: CursorLeaf a -> Maybe (CursorLeaf a)
+stepNextLeaf leaf = goUp (clPath leaf)
+  where
+    !root = clRoot leaf
+    !pm = clMetrics leaf
+    !arr = clArr leaf
+    !size = packedBytes pm
+    !nextBefore = clBefore leaf <> unpackMetrics pm
+    !nextStarts = size > 0 && byteAt arr (size - 1) == 0x0A
+    goUp CTop = Nothing
+    goUp (CStep cs i up)
+      | i + 1 < sizeofChildren cs = Just (goDown (CStep cs (i + 1) up) (indexChildren cs (i + 1)))
+      | otherwise = goUp up
+    goDown path node = case node of
+      PackedLeaf npm _ narr -> CursorLeaf root path nextBefore npm narr nextStarts
+      Inner _ _ _ cs -> goDown (CStep cs 0 path) (indexChildren cs 0)
+
+-- | Descend from @root@ to the leaf holding line @l >= 0@, building a
+-- 'CursorPath' and caching line @l@ when it fits in one or two leaves.
+seekLeafFromRoot :: Int -> Node a -> Cursor a
+seekLeafFromRoot !l root = go CTop mempty l root
+  where
+    go path !before !j node = case node of
+      PackedLeaf pm _ arr ->
+        let !leaf0 = CursorLeaf root path before pm arr (bytes before == 0)
+            !size = packedBytes pm
+            !nLeaf = packedLines pm
+         in if j == nLeaf && size > 0 && byteAt arr (size - 1) == 0x0A
+              then case stepNextLeaf leaf0 of
+                Just leaf1 -> cursorCacheLine l leaf1
+                Nothing -> cursorCacheLine l leaf0
+              else cursorCacheLine l leaf0
+      Inner total h _ cs
+        | j <= 0 -> go (CStep cs 0 path) before 0 (indexChildren cs 0)
+        | otherwise -> case seekChild Lines h j total cs of
+            Seek i b -> go (CStep cs i path) (before <> b) (j - newlines b) (indexChildren cs i)
+{-# NOINLINE seekLeafFromRoot #-}
+
+-- | Step forward from cached line @prev@ to line @l@ within @leaf@ (or into
+-- its right sibling). Uses 'swarFindNewline' directly to avoid C FFI overhead
+-- on short lines.
+advanceLines :: Int -> CursorLeaf a -> Int -> Word64 -> Word64 -> Cursor a
+advanceLines !l leaf !prev0 !lspan0 !pref0 = go prev0 (spanFrom lspan0) (spanLf lspan0) pref0
+  where
+    !pm = clMetrics leaf
+    !arr = clArr leaf
+    !size = packedBytes pm
+    !ascii = packedBytes pm == packedChars pm
+    !leafM = unpackMetrics pm
+    !isLastLeaf = bytes (clBefore leaf) + size == nodeBytes (clRoot leaf)
+    go !curL !prevFrom !prevLf !pref
+      | prevLf >= size = cursorSeekLineSlow l leaf
+      | otherwise =
+          let !nextFrom = prevLf + 1
+              !pref'
+                | ascii = 0
+                | otherwise =
+                    let !seg = sliceOfLine leafM arr prevFrom prevLf
+                        !fc = fromIntegral (pref .&. 0xFFFF) + chars seg + 1
+                        !fu = fromIntegral ((pref `unsafeShiftR` 16) .&. 0xFFFF) + utf16Units seg + 1
+                     in packLinePrefix fc fu
+           in if nextFrom == size && not isLastLeaf
+                then case stepNextLeaf leaf of
+                  Just leaf1
+                    | curL + 1 == l -> cursorCacheLine l leaf1
+                    | otherwise -> cursorSeekLineSlow l leaf1
+                  Nothing -> cursorAtLeaf leaf
+                else
+                  let !nextLf = if nextFrom >= size then size else swarFindNewline arr nextFrom
+                   in if curL + 1 == l
+                        then
+                          if nextLf < size || isLastLeaf
+                            then
+                              let !end = if nextLf < size then contentEnd arr nextFrom nextLf else size
+                               in Cursor1 leaf l (packLineSpan nextFrom end nextLf) pref'
+                            else cacheTwoLeafLine l (l - newlines (clBefore leaf)) nextFrom leaf
+                        else go (curL + 1) nextFrom nextLf pref'
+{-# NOINLINE advanceLines #-}
+
+-- | Position a cursor on line @l@ starting from @leaf@: checks @leaf@, steps
+-- right up to two leaves, or falls back to a root descent.
+cursorSeekLineSlow :: Int -> CursorLeaf a -> Cursor a
+cursorSeekLineSlow !l leaf
+  | inCurrentLeaf = cacheOn leaf
+  | l > l0 + nLeaf = stepForward (2 :: Int) leaf
+  | otherwise = seekLeafFromRoot l (clRoot leaf)
+  where
+    !before = clBefore leaf
+    !pm = clMetrics leaf
+    !l0 = newlines before
+    !nLeaf = packedLines pm
+    !j = l - l0
+    !inCurrentLeaf = (j > 0 && j <= nLeaf) || (j == 0 && clStartsLine leaf)
+    cacheOn lf =
+      let !b = clBefore lf
+          !p = clMetrics lf
+          !a = clArr lf
+          !s = packedBytes p
+          !nl = packedLines p
+          !jl = l - newlines b
+          !lastL = bytes b + s == nodeBytes (clRoot lf)
+       in if jl == nl && s > 0 && byteAt a (s - 1) == 0x0A && not lastL
+            then case stepNextLeaf lf of
+              Just lf1 -> cursorCacheLine l lf1
+              Nothing -> cursorCacheLine l lf
+            else cursorCacheLine l lf
+    stepForward !tries lf
+      | tries <= 0 = seekLeafFromRoot l (clRoot lf)
+      | otherwise = case stepNextLeaf lf of
+          Nothing -> seekLeafFromRoot l (clRoot lf)
+          Just lf1 ->
+            let !b1 = clBefore lf1
+                !pm1 = clMetrics lf1
+                !l1 = newlines b1
+                !n1 = packedLines pm1
+                !j1 = l - l1
+             in if (j1 > 0 && j1 <= n1) || (j1 == 0 && clStartsLine lf1)
+                  then cacheOn lf1
+                  else
+                    if l > l1 + n1
+                      then stepForward (tries - 1) lf1
+                      else seekLeafFromRoot l (clRoot lf1)
+{-# NOINLINE cursorSeekLineSlow #-}
+
+-- | Position @cur@ on line @l@ (@0 <= l <= newlines root@).
+cursorSeekLine :: Int -> Cursor a -> Cursor a
+cursorSeekLine !l cur = case cur of
+  Cursor1 leaf prev lspan lpref
+    | l == prev -> cur
+    | prev >= 0 && l > prev && l <= newlines (clBefore leaf) + packedLines pm && spanLf lspan < packedBytes pm ->
+        advanceLines l leaf prev lspan lpref
+    | otherwise -> cursorSeekLineSlow l leaf
+    where
+      !pm = clMetrics leaf
+  Cursor2 leaf0 leaf1 prev _ _ _ _ _
+    | l == prev -> cur
+    | l > prev -> cursorSeekLineSlow l leaf1
+    | otherwise -> cursorSeekLineSlow l leaf0
+{-# INLINE cursorSeekLine #-}
+
+-- | Evaluate a position query on a cached single-leaf line.
+onCachedLine1 :: Unit -> Int -> Cursor a -> CursorLeaf a -> Int -> Word64 -> Word64 -> CursorSpan# a
+onCachedLine1 !u !c cur leaf !l !lspan !lpref =
+  let !pm = clMetrics leaf
+      !from = spanFrom lspan
+      !end = spanEnd lspan
+      !startM = lineStartMetrics leaf l lspan lpref
+   in if packedBytes pm == packedChars pm
+        then
+          let !d
+                | c <= 0 = 0
+                | u == Lines || c >= end - from = end - from
+                | otherwise = c
+              !atM = if d == 0 then startM else startM <> Metrics d d d 0
+           in cursorSpan# startM atM cur
+        else
+          let !leafM = unpackMetrics pm
+              !arr = clArr leaf
+              !b = columnOf u c leafM arr from end
+              !atM = if b <= from then startM else startM <> sliceOfLine leafM arr from b
+           in cursorSpan# startM atM cur
+{-# INLINE onCachedLine1 #-}
+
+-- | Evaluate a position query on a cached two-leaf line.
+onCachedLine2 :: Unit -> Int -> Cursor a -> CursorLeaf a -> CursorLeaf a -> Int -> Int -> Int -> Metrics -> Metrics -> CursorSpan# a
+onCachedLine2 !u !c cur leaf0 leaf1 !from !end0 !end1 !startM !part0M
+  | c <= 0 = cursorSpan# startM startM cur
+  | u == Lines =
+      let !part1M = sliceOfLine (unpackMetrics (clMetrics leaf1)) (clArr leaf1) 0 end1
+       in cursorSpan# startM (startM <> part0M <> part1M) cur
+  | c <= u0 =
+      let !leaf0M = unpackMetrics (clMetrics leaf0)
+          !arr0 = clArr leaf0
+          !b0 = columnOf u c leaf0M arr0 from end0
+          !atM = if b0 <= from then startM else startM <> sliceOfLine leaf0M arr0 from b0
+       in cursorSpan# startM atM cur
+  | end1 <= 0 = cursorSpan# startM (startM <> part0M) cur
+  | otherwise =
+      let !leaf1M = unpackMetrics (clMetrics leaf1)
+          !arr1 = clArr leaf1
+          !b1 = columnOf u (c - u0) leaf1M arr1 0 end1
+          !atM = clBefore leaf1 <> sliceOfLine leaf1M arr1 0 b1
+       in cursorSpan# startM atM cur
+  where
+    !u0 = count u part0M
+{-# INLINE onCachedLine2 #-}
+
+-- | Position lookup on a cursor, returning unboxed metrics and updated cursor.
+cursorLinePosition :: Unit -> Int -> Int -> Cursor a -> CursorSpan# a
+cursorLinePosition !u !l0 !c cur = case cur of
+  Cursor1 leaf prev lspan lpref
+    | l0 >= 0 && l0 == prev -> onCachedLine1 u c cur leaf prev lspan lpref
+    | otherwise -> miss (clRoot leaf)
+  Cursor2 leaf0 leaf1 prev from end0 end1 startM part0M
+    | l0 >= 0 && l0 == prev -> onCachedLine2 u c cur leaf0 leaf1 from end0 end1 startM part0M
+    | otherwise -> miss (clRoot leaf1)
+  where
+    miss root
+      | l > newlines (nodeMetrics root) = case linePositionGeneral u l0 c root of
+          Span s a -> cursorSpan# s a cur
+      | otherwise = case cursorSeekLine l cur of
+          cur'@(Cursor1 leaf prev lspan lpref)
+            | prev == l -> onCachedLine1 u c cur' leaf prev lspan lpref
+          cur'@(Cursor2 leaf0 leaf1 prev from end0 end1 startM part0M)
+            | prev == l -> onCachedLine2 u c cur' leaf0 leaf1 from end0 end1 startM part0M
+          cur' -> case linePositionGeneral u l0 c root of
+            Span s a -> cursorSpan# s a cur'
+      where
+        !l = max 0 l0
+{-# NOINLINE cursorLinePosition #-}
+
+-- | Unpacked result of 'cursorGetLine'' so GHC CPR-unboxes the 'Text' fields.
+data CursorText a = CursorText {-# UNPACK #-} !Text !(Cursor a)
+
+cursorGetLine' :: Int -> Cursor a -> CursorText a
+cursorGetLine' !l cur = case cur of
+  Cursor1 leaf prev lspan _
+    | l >= 0 && l == prev ->
+        let !from = spanFrom lspan
+         in CursorText (viewSlice (clArr leaf) from (spanEnd lspan - from)) cur
+    | otherwise -> miss (clRoot leaf)
+  Cursor2 leaf0 leaf1 prev from end0 end1 _ _
+    | l >= 0 && l == prev -> CursorText (line2Text leaf0 leaf1 from end0 end1) cur
+    | otherwise -> miss (clRoot leaf1)
+  where
+    line2Text leaf0 leaf1 from end0 end1
+      | end1 <= 0 = viewSlice (clArr leaf0) from (end0 - from)
+      | end0 <= from = viewSlice (clArr leaf1) 0 end1
+      | otherwise = chunkText (concatSlices (clArr leaf0) from (end0 - from) (clArr leaf1) 0 end1)
+    miss root
+      | l < 0 || l > newlines (nodeMetrics root) = CursorText T.empty cur
+      | otherwise = case cursorSeekLine l cur of
+          cur'@(Cursor1 leaf prev lspan _)
+            | prev == l ->
+                let !from = spanFrom lspan
+                 in CursorText (viewSlice (clArr leaf) from (spanEnd lspan - from)) cur'
+          cur'@(Cursor2 leaf0 leaf1 prev from end0 end1 _ _)
+            | prev == l -> CursorText (line2Text leaf0 leaf1 from end0 end1) cur'
+          cur' -> CursorText (lineText l root) cur'
+{-# NOINLINE cursorGetLine' #-}
+
+-- | /O(log n)/. Create a read cursor positioned at the start of the rope.
+-- Applies any pending typing buffer once.
+cursor :: Rope a -> Cursor a
+cursor (Rope root) = seekLeafFromRoot 0 root
+
+-- | Like 'getLine', advancing the cursor. /O(1)/ amortized when walking lines
+-- in order; /O(log n + length of the line)/ otherwise.
+cursorGetLine :: Int -> Cursor a -> (Text, Cursor a)
+cursorGetLine l cur = case cursorGetLine' l cur of
+  CursorText t cur' -> (t, cur')
+{-# INLINE cursorGetLine #-}
+
+-- | Like 'metricsAtPosition', advancing the cursor.
+cursorMetricsAtPosition :: Unit -> Position -> Cursor a -> (Metrics, Cursor a)
+cursorMetricsAtPosition u (Position l c) cur = case cursorLinePosition u l c cur of
+  (# _, _, _, _, b2, c2, u2, l2, cur' #) -> (Metrics (I# b2) (I# c2) (I# u2) (I# l2), cur')
+{-# INLINE cursorMetricsAtPosition #-}
+
+-- | Like 'metricsAtLineAndPosition', advancing the cursor. /O(1)/ for queries
+-- on the active line and /O(1)/ amortized for sorted positions across a document.
+cursorMetricsAtLineAndPosition :: Unit -> Position -> Cursor a -> (Metrics, Metrics, Cursor a)
+cursorMetricsAtLineAndPosition u (Position l c) cur = case cursorLinePosition u l c cur of
+  (# b1, c1, u1, l1, b2, c2, u2, l2, cur' #) ->
+    (Metrics (I# b1) (I# c1) (I# u1) (I# l1), Metrics (I# b2) (I# c2) (I# u2) (I# l2), cur')
+{-# INLINE cursorMetricsAtLineAndPosition #-}
+
+-- | Like 'sliceText', returning a zero-copy view in /O(1)/ when a 'Bytes'
+-- range lies inside the cursor's active leaf.
+cursorSliceText :: Unit -> Int -> Int -> Cursor a -> Text
+cursorSliceText Bytes !i !j cur
+  | j <= i || j <= 0 = T.empty
+  | otherwise = case cur of
+      Cursor1 leaf _ _ _ -> sliceOn leaf
+      Cursor2 leaf0 leaf1 _ _ _ _ _ _
+        | i' >= b1 && j <= b1 + packedBytes pm1 -> leafSlice leaf1 b1 pm1
+        | i' >= b0 && j <= b0 + packedBytes pm0 -> leafSlice leaf0 b0 pm0
+        | otherwise -> fallback (clRoot leaf1)
+        where
+          !b0 = bytes (clBefore leaf0)
+          !pm0 = clMetrics leaf0
+          !b1 = bytes (clBefore leaf1)
+          !pm1 = clMetrics leaf1
+  where
+    !i' = max 0 i
+    leafSlice lf lb pm =
+      let !arr = clArr lf
+          !bi = i' - lb
+          !bj = j - lb
+       in if packedBytes pm == packedChars pm
+            then viewSlice arr bi (bj - bi)
+            else
+              let !ri = roundDown arr bi
+                  !rj = roundDown arr bj
+               in viewSlice arr ri (rj - ri)
+    sliceOn lf
+      | i' >= lb && j <= lb + packedBytes pm = leafSlice lf lb pm
+      | otherwise = fallback (clRoot lf)
+      where
+        !lb = bytes (clBefore lf)
+        !pm = clMetrics lf
+    fallback root
+      | j >= nodeBytes root = sliceToText (byteOffsetAtNode Bytes i' root) (nodeBytes root) root
+      | otherwise = sliceTextBytes i' j root
+cursorSliceText u i j cur = sliceText u i j (Rope (clRoot (cursorActiveLeaf cur)))
+{-# INLINE cursorSliceText #-}
 
 ------------------------------------------------------------------------------
 -- API: searching by measure

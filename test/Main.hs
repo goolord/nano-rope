@@ -79,6 +79,12 @@ main =
           , testProperty "getLine" prop_getLine
           ]
       , testGroup
+          "cursor"
+          [ testProperty "sorted and random positions" prop_cursorPositions
+          , testProperty "sequential and random lines" prop_cursorLines
+          , testProperty "sliceText" prop_cursorSlice
+          ]
+      , testGroup
           "measures"
           [ testProperty "splitWhere by width" prop_splitWhereWidth
           , testProperty "splitWhere by line breaks" prop_splitWhereBreaks
@@ -749,6 +755,48 @@ prop_getLine (Edited r t) = forAll (choose (-1, L.length table + 1)) $ \l ->
   where
     table = lineTable t
 
+prop_cursorPositions :: Edited -> Property
+prop_cursorPositions (Edited r t) =
+  forAll (listOf ((,) <$> arbitrary <*> genPosition t)) $ \qs ->
+    let sorted = L.sortOn snd qs
+     in counterexample "sorted" (checkSeq sorted)
+          .&&. counterexample "random" (checkSeq qs)
+  where
+    checkSeq = snd . L.foldl' step (Rope.cursor r, property True)
+    step (cur, acc) (u, pos) =
+      let (l1, a1, cur1) = Rope.cursorMetricsAtLineAndPosition u pos cur
+          (a2, cur2) = Rope.cursorMetricsAtPosition u pos cur1
+          (el, ea) = Rope.metricsAtLineAndPosition u pos r
+          tok = Rope.cursorSliceText Bytes (bytes el) (bytes ea) cur2
+          etok = Rope.sliceText Bytes (bytes el) (bytes ea) r
+       in ( cur2
+          , acc
+              .&&. counterexample (show (u, pos)) ((l1, a1) === (el, ea))
+              .&&. counterexample (show (u, pos)) (a2 === ea)
+              .&&. counterexample ("slice " ++ show (u, pos)) (tok === etok)
+          )
+
+prop_cursorLines :: Edited -> Property
+prop_cursorLines (Edited r t) =
+  forAll (listOf (choose (-1, n + 1))) $ \randLines ->
+    counterexample "sequential" (checkSeq ([-1 .. n + 1] ++ [0 .. n]))
+      .&&. counterexample "random" (checkSeq randLines)
+  where
+    n = T.count "\n" t
+    checkSeq = snd . L.foldl' step (Rope.cursor r, property True)
+    step (cur, acc) l =
+      let (line, cur') = Rope.cursorGetLine l cur
+       in (cur', acc .&&. counterexample (show l) (line === Rope.getLine l r))
+
+prop_cursorSlice :: Edited -> Unit -> Offset -> Offset -> Property
+prop_cursorSlice (Edited r t) u i j =
+  forAll (genPosition t) $ \pos ->
+    let (_, cur) = Rope.cursorMetricsAtPosition Chars pos (Rope.cursor r)
+        a = resolve u i t
+        b = resolve u j t
+     in counterexample (show (pos, u, a, b)) $
+          Rope.cursorSliceText u a b cur === Rope.sliceText u a b r
+
 -- | The longest prefix (in characters) on which a predicate fails.
 longestPrefix :: (Text -> Bool) -> Text -> Int
 longestPrefix p t = L.length (takeWhile (not . p) (drop 1 (T.inits t)))
@@ -940,6 +988,9 @@ prop_plain (Edited r t) u i (Snippet s) =
     , Plain.toText (Plain.insert u k s plain) === Rope.toText (Rope.insert u k s r)
     , Plain.toText (fst (Plain.splitAt u k plain)) === Rope.toText (Rope.take u k r)
     , Plain.metricsWhere (\m -> Rope.count Chars m > k) plain === Rope.metricsAt Chars k r
+    , let (l, a, cur) = Plain.cursorMetricsAtLineAndPosition u (Position 0 k) (Plain.cursor plain)
+       in (l, a, fst (Plain.cursorGetLine 0 cur), Plain.cursorSliceText Bytes 0 (bytes a) cur)
+            === (fst (Rope.metricsAtLineAndPosition u (Position 0 k) r), snd (Rope.metricsAtLineAndPosition u (Position 0 k) r), Rope.getLine 0 r, Rope.sliceText Bytes 0 (bytes a) r)
     , holds (Plain.measured plain) t
     , Plain.fromText t === plain
     ]

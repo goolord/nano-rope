@@ -112,6 +112,14 @@ module Data.Text.NanoRope.Measured
   , offsetToPosition
   , positionToOffset
 
+    -- * Read cursor
+  , Cursor
+  , cursor
+  , cursorGetLine
+  , cursorMetricsAtPosition
+  , cursorMetricsAtLineAndPosition
+  , cursorSliceText
+
     -- * Searching by measure
   , splitWhere
   , metricsWhere

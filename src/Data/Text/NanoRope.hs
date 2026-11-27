@@ -103,6 +103,14 @@ module Data.Text.NanoRope
   , offsetToPosition
   , positionToOffset
 
+    -- * Read cursor
+  , Cursor
+  , cursor
+  , cursorGetLine
+  , cursorMetricsAtPosition
+  , cursorMetricsAtLineAndPosition
+  , cursorSliceText
+
     -- * Searching by metrics
   , splitWhere
   , metricsWhere
@@ -356,6 +364,42 @@ offsetToPosition = M.offsetToPosition
 -- 11
 positionToOffset :: Unit -> Unit -> Position -> Rope -> Int
 positionToOffset = M.positionToOffset
+
+-- | A read cursor over a fixed 'Rope' snapshot.
+--
+-- Sequential or nearby position, line, and byte-slice queries reuse the active
+-- leaf and cached line in /O(1)/ amortized time instead of descending from the
+-- root on every call. Distant or backward jumps fall back to /O(log n)/ tree
+-- lookups.
+type Cursor = M.Cursor ()
+
+-- | /O(log n)/. Create a read cursor positioned at the start of the rope.
+-- Applies any pending typing buffer once.
+cursor :: Rope -> Cursor
+cursor = M.cursor
+
+-- | Like 'getLine', advancing the cursor. /O(1)/ amortized when walking lines
+-- in order; /O(log n + length of the line)/ otherwise.
+cursorGetLine :: Int -> Cursor -> (Text, Cursor)
+cursorGetLine = M.cursorGetLine
+{-# INLINE cursorGetLine #-}
+
+-- | Like 'metricsAtPosition', advancing the cursor.
+cursorMetricsAtPosition :: Unit -> Position -> Cursor -> (Metrics, Cursor)
+cursorMetricsAtPosition = M.cursorMetricsAtPosition
+{-# INLINE cursorMetricsAtPosition #-}
+
+-- | Like 'metricsAtLineAndPosition', advancing the cursor. /O(1)/ for queries
+-- on the active line and /O(1)/ amortized for sorted positions across a document.
+cursorMetricsAtLineAndPosition :: Unit -> Position -> Cursor -> (Metrics, Metrics, Cursor)
+cursorMetricsAtLineAndPosition = M.cursorMetricsAtLineAndPosition
+{-# INLINE cursorMetricsAtLineAndPosition #-}
+
+-- | Like 'sliceText', returning a zero-copy view in /O(1)/ when a 'Bytes'
+-- range lies inside the cursor's active leaf.
+cursorSliceText :: Unit -> Int -> Int -> Cursor -> Text
+cursorSliceText = M.cursorSliceText
+{-# INLINE cursorSliceText #-}
 
 -- | /O(log n)/ for a constant-time predicate. Split after the longest
 -- code-point-aligned prefix for which the predicate is false. The predicate
