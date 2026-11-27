@@ -61,14 +61,20 @@ All.100k lines.10k getLine.yi-rope,122656250000,10607347468,227821079,15892,2202
 All.100k lines.10k edits at UTF-16 positions.nano-rope,5499267578,138444052,12931184,825602,220200960
 All.100k lines.10k edits at UTF-16 positions.text-rope,44238281250,2417748500,147793789,14954989,220200960
 All.100k lines.10k byte offsets to UTF-16 positions.nano-rope,1580810546,138444052,53,2,220200960
-"All.language server, 8k lines.typing, the edits alone",559997558,17305506,1341323,1658,220200960
-"All.language server, 8k lines.typing, completion prefix after each key",991821289,41926274,1647952,3686,220200960
-"All.language server, 8k lines.rename, 200 edits at once",149345397,7738344,568000,7,220200960
-"All.language server, 8k lines.semantic tokens",10559082031,713620130,1536933,43,220200960
-"All.language server, 8k lines.position conversions",2319335937,167705098,94,5,220200960
-"All.language server, 8k lines.reading lines",4711914062,444593202,9168752,230,220200960
-"All.language server, 8k lines.in two descents.typing, the edits alone",1306152343,55574150,1499052,3342,220200960
-"All.language server, 8k lines.in two descents.typing, completion prefix after each key",2029800415,145131510,1885018,2348,220200960
-"All.language server, 8k lines.in two descents.rename, 200 edits at once",178527832,15476690,568001,7,220200960
-"All.language server, 8k lines.in two descents.semantic tokens",13183593750,670820392,2300830,78,220200960
-"All.language server, 8k lines.in two descents.position conversions",3912353515,138444052,2958894,69,220200960
+"All.language server, 8k lines.typing, the edits alone.nano-rope",588989257,99192760,1341321,1641,48234496
+"All.language server, 8k lines.typing, the edits alone.text-rope",9924316406,768211634,34597989,60901,48234496
+"All.language server, 8k lines.typing, completion prefix after each key.nano-rope",1200866699,628293612,1648391,3678,48234496
+"All.language server, 8k lines.typing, completion prefix after each key.text-rope",14453125000,772142222,61599474,105121,49283072
+"All.language server, 8k lines.rename, 200 edits at once.nano-rope",144577026,31622128,567999,3,100663296
+"All.language server, 8k lines.rename, 200 edits at once.text-rope",9106445312,331479608,1311945,2145,100663296
+"All.language server, 8k lines.semantic tokens.nano-rope",9765625000,335410196,1536991,28,100663296
+"All.language server, 8k lines.semantic tokens.text-rope",99218750000,19279098592,613388796,69996,100663296
+"All.language server, 8k lines.position conversions.nano-rope",2273559570,110165652,28,1,100663296
+"All.language server, 8k lines.position conversions.text-rope",31982421875,2854480526,215766941,12995,100663296
+"All.language server, 8k lines.reading lines.nano-rope",4870605468,329514314,9168636,91,100663296
+"All.language server, 8k lines.reading lines.text-rope",34033203125,4819774648,220167441,14476,100663296
+"All.language server, 8k lines.in two descents.typing, the edits alone",1245117187,55574150,1499045,3321,100663296
+"All.language server, 8k lines.in two descents.typing, completion prefix after each key",1892089843,110165652,1885027,2259,100663296
+"All.language server, 8k lines.in two descents.rename, 200 edits at once",166511535,12003306,567999,2,100663296
+"All.language server, 8k lines.in two descents.semantic tokens",12597656250,662959216,2300507,31,100663296
+"All.language server, 8k lines.in two descents.position conversions",3845214843,83852548,2958878,27,100663296

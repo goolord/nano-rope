@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / GHC ${{ matrix.ghc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            ghc: "9.4.8"
+          - os: ubuntu-latest
+            ghc: "9.6.7"
+          - os: ubuntu-latest
+            ghc: "9.8.4"
+          - os: ubuntu-latest
+            ghc: "9.10.3"
+          - os: ubuntu-latest
+            ghc: "9.12.4"
+          - os: ubuntu-latest
+            ghc: "9.14.1"
+          - os: macos-14
+            ghc: "9.8.4"
+          - os: macos-14
+            ghc: "9.12.4"
+          - os: macos-14
+            ghc: "9.14.1"
+          - os: windows-latest
+            ghc: "9.6.7"
+          - os: windows-latest
+            ghc: "9.10.3"
+          - os: windows-latest
+            ghc: "9.12.4"
+          - os: windows-latest
+            ghc: "9.14.1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup-haskell
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: latest
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup-haskell.outputs.cabal-store }}
+            dist-newstyle
+            dist-nosimd
+          key: ${{ runner.os }}-ghc-${{ matrix.ghc }}-${{ hashFiles('nano-rope.cabal') }}
+          restore-keys: |
+            ${{ runner.os }}-ghc-${{ matrix.ghc }}-
+
+      - name: Update Cabal index
+        run: cabal update
+
+      - name: Test (default SIMD)
+        run: cabal test all --test-show-details=direct
+
+      - name: Test (Haskell-only, -f -simd)
+        run: cabal test all --builddir=dist-nosimd -f -simd --test-show-details=direct
+
+      - name: Build benchmark
+        run: cabal build nano-rope-bench
+
+      - name: Build Haddock
+        run: cabal haddock all
+
+      - name: Smoke test Template Haskell loading
+        shell: bash
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/Main.hs" <<'EOF'
+          {-# LANGUAGE OverloadedStrings, TemplateHaskell #-}
+          module Main where
+          import qualified Data.Text.NanoRope as R
+          import qualified Language.Haskell.TH as TH
+          spliced :: Int
+          spliced = $(let r = R.insert R.Utf16 2 "\128512\n" (mconcat (replicate 40 (R.fromText "abcdef\n"))) in TH.litE (TH.integerL (fromIntegral (R.length R.Bytes r))))
+          main :: IO ()
+          main = do
+            let r = R.insert R.Utf16 2 "\128512\n" (mconcat (replicate 40 (R.fromText "abcdef\n")))
+            if spliced == R.length R.Bytes r && R.getLine 1 r == "cdef"
+              then putStrLn ("TH smoke OK: " ++ show spliced)
+              else error ("TH smoke mismatch: " ++ show spliced)
+          EOF
+          cabal exec -- ghc -hide-all-packages -package base -package nano-rope -package template-haskell -outputdir "$tmp" -o "$tmp/smoke" "$tmp/Main.hs"
+          "$tmp/smoke"
+
+      - name: Package check and sdist
+        if: matrix.os == 'ubuntu-latest' && matrix.ghc == '9.14.1'
+        run: |
+          cabal check
+          cabal sdist

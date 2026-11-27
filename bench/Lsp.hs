@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Rope workloads modelled on @lsp@ and @haskell-language-server@.
@@ -15,8 +16,9 @@
 -- The generated document is mostly ASCII with occasional non-ASCII comments.
 --
 -- Compare the combined 'Rope.metricsAtLineAndPosition' lookup with separate
--- line-start and position lookups, labelled "in two descents". This measures
--- the effect of using the combined API as well as the underlying rope.
+-- line-start and position lookups, labelled "in two descents". When built with
+-- @-f compare-text-rope@, each workload is also run on @text-rope@'s
+-- @Data.Text.Utf16.Rope.Mixed@ (the rope used by @lsp@ and HLS).
 module Lsp
   ( LspEnv (..)
   , mkLspEnv
@@ -32,6 +34,12 @@ import Data.Text.NanoRope (Metrics (..), Position (..), Rope, Unit (..))
 import qualified Data.Text.NanoRope as Rope
 import Rand (rands)
 import Test.Tasty.Bench
+
+#ifdef COMPARE_TEXT_ROPE
+import qualified Data.Text.Rope as TR
+import qualified Data.Text.Utf16.Rope as TR16
+import qualified Data.Text.Utf16.Rope.Mixed as TRM
+#endif
 
 ------------------------------------------------------------------------------
 -- The document and the session
@@ -290,10 +298,127 @@ rename :: Asking -> Rope -> [Change] -> Int
 rename asking rope changes = T.length (Rope.toText (L.foldl' (applyChange asking) rope changes))
 {-# INLINE rename #-}
 
+#ifdef COMPARE_TEXT_ROPE
+------------------------------------------------------------------------------
+-- text-rope (Data.Text.Utf16.Rope.Mixed), matching lsp/VFS and HLS
+
+trApplyChange :: TRM.Rope -> Change -> TRM.Rope
+trApplyChange str (Change (Position sl sc) (Position fl fc) new) =
+  case TRM.utf16SplitAtPosition (TR16.Position (fromIntegral fl) (fromIntegral fc)) str of
+    Nothing -> str
+    Just (before, after) -> case TRM.utf16SplitAtPosition (TR16.Position (fromIntegral sl) (fromIntegral sc)) before of
+      Nothing -> str
+      Just (before', _) -> before' <> TRM.fromText new <> after
+
+trExtractLine :: TRM.Rope -> Word -> Maybe TRM.Rope
+trExtractLine rope l
+  | l <= TR16.posLine (TRM.utf16LengthAsPosition rope) =
+      let (_, suffix) = TRM.splitAtLine l rope
+          (prefix, _) = TRM.splitAtLine 1 suffix
+       in Just prefix
+  | otherwise = Nothing
+
+trCodePointToUtf16 :: TRM.Rope -> Position -> Maybe Position
+trCodePointToUtf16 rope (Position l c) = do
+  lineRope <- trExtractLine rope (fromIntegral l)
+  let cw = fromIntegral c
+  if cw <= TRM.charLength lineRope
+    then Just (Position l (fromIntegral (TRM.utf16Length (fst (TRM.charSplitAt cw lineRope)))))
+    else Nothing
+
+trUtf16ToCodePoint :: TRM.Rope -> Position -> Maybe Position
+trUtf16ToCodePoint rope (Position l c) = do
+  lineRope <- trExtractLine rope (fromIntegral l)
+  let cw = fromIntegral c
+  if cw <= TRM.utf16Length lineRope
+    then Position l . fromIntegral . TRM.charLength . fst <$> TRM.utf16SplitAt cw lineRope
+    else Nothing
+
+trRangeLines :: TRM.Rope -> Int -> Int -> Text
+trRangeLines rope lf lt =
+  let (_, s1) = TRM.splitAtLine (fromIntegral lf) rope
+      (s2, _) = TRM.splitAtLine (fromIntegral (lt - lf)) s1
+   in TRM.toText s2
+
+trTakeLineRange :: Int -> Int -> TRM.Rope -> [Text]
+trTakeLineRange from to rope
+  | to < from = []
+  | otherwise = TRM.lines (fst (TRM.splitAtLine (fromIntegral (to - from + 1)) (snd (TRM.splitAtLine (fromIntegral from) rope))))
+
+trCompletionPrefix :: TRM.Rope -> Position -> Int
+trCompletionPrefix rope (Position l c) = case trTakeLineRange l l rope of
+  curLine : _ -> T.length (T.takeWhileEnd (\x -> isAlphaNum x || x == '.' || x == '_' || x == '\'') (T.take c curLine))
+  [] -> 0
+
+trReplay :: (TRM.Rope -> Position -> Int) -> TRM.Rope -> [Step] -> Int
+trReplay observe = go 0
+  where
+    go !acc !rope [] = acc + fromIntegral (TRM.charLength rope)
+    go !acc !rope (Step c cursor : steps) =
+      let rope' = trApplyChange rope c
+       in go (acc + observe rope' cursor) rope' steps
+{-# INLINE trReplay #-}
+
+trObserveNothing :: TRM.Rope -> Position -> Int
+trObserveNothing rope _ = rope `seq` 1
+
+trSemanticTokens :: TRM.Rope -> [Token] -> Int
+trSemanticTokens rope0 = go 0 rope0 (TR.Position 0 0) 0
+  where
+    go !acc !_ !_ !_ [] = acc
+    go !acc !r !cur !col16 (Token l from to _ : rest) =
+      let startPos = TR.Position (fromIntegral l) (fromIntegral from)
+          endPos = TR.Position (fromIntegral l) (fromIntegral to)
+       in case (sub startPos cur, sub endPos startPos) of
+            (Just gapOff, Just tokOff) ->
+              let (gapRope, afterGap) = TRM.charSplitAtPosition gapOff r
+               in if TRM.charLengthAsPosition gapRope /= gapOff
+                    then go (acc - 1) r cur col16 rest
+                    else
+                      let (tokRope, remains) = TRM.charSplitAtPosition tokOff afterGap
+                       in if TRM.charLengthAsPosition tokRope /= tokOff
+                            then go (acc - 1) r cur col16 rest
+                            else
+                              let gapTxt = TRM.toText gapRope
+                                  tokTxt = TRM.toText tokRope
+                                  !ncs = newCol col16 gapTxt
+                                  !nce = newCol ncs tokTxt
+                               in go (acc + ncs + nce + T.length tokTxt) remains endPos nce rest
+            _ -> go (acc - 1) r cur col16 rest
+    sub (TR.Position l1 c1) (TR.Position l2 c2)
+      | l1 == l2 && c1 >= c2 = Just (TR.Position 0 (c1 - c2))
+      | l1 > l2 = Just (TR.Position (l1 - l2) c1)
+      | otherwise = Nothing
+    newCol !n txt = case T.breakOnEnd "\n" txt of
+      ("", nEnd) -> n + trUtf16Len nEnd
+      (_, nEnd) -> trUtf16Len nEnd
+    trUtf16Len = fromIntegral . TR16.length . TR16.fromText
+
+trConvertPositions :: TRM.Rope -> [Position] -> Int
+trConvertPositions rope = L.foldl' step 0
+  where
+    step n p = case trUtf16ToCodePoint rope p of
+      Just cp | Just (Position l c) <- trCodePointToUtf16 rope cp -> n + l + c
+      _ -> n - 1
+
+trReadLines :: TRM.Rope -> [Position] -> Int
+trReadLines rope = L.foldl' step 0
+  where
+    step n (Position l _) =
+      n + T.length (trRangeLines rope l (l + 3)) + sum (map T.length (trTakeLineRange l (l + 2) rope))
+
+trRename :: TRM.Rope -> [Change] -> Int
+trRename rope changes = T.length (TRM.toText (L.foldl' trApplyChange rope changes))
+#endif
+
 data LspEnv = LspEnv
   { lspOpened :: !Rope
   , lspEdited :: !Rope
   -- ^ Document after the generated typing session.
+#ifdef COMPARE_TEXT_ROPE
+  , lspOpenedTR :: !TRM.Rope
+  , lspEditedTR :: !TRM.Rope
+#endif
   , lspTyping :: ![Step]
   , lspRenaming :: ![Change]
   , lspTokens :: ![Token]
@@ -303,13 +428,25 @@ data LspEnv = LspEnv
   }
 
 instance NFData LspEnv where
-  rnf e = rnf (lspTyping e) `seq` rnf (lspRenaming e) `seq` rnf (lspTokens e) `seq` rnf (lspPositions e)
+  rnf e =
+    rnf (lspTyping e)
+      `seq` rnf (lspRenaming e)
+      `seq` rnf (lspTokens e)
+      `seq` rnf (lspPositions e)
+#ifdef COMPARE_TEXT_ROPE
+      `seq` rnf (lspOpenedTR e)
+      `seq` rnf (lspEditedTR e)
+#endif
 
 mkLspEnv :: Int -> LspEnv
 mkLspEnv nLines =
   LspEnv
     { lspOpened = opened
     , lspEdited = edited
+#ifdef COMPARE_TEXT_ROPE
+    , lspOpenedTR = openedTR
+    , lspEditedTR = L.foldl' (\r (Step c _) -> trApplyChange r c) openedTR steps
+#endif
     , lspTyping = steps
     , lspRenaming = renaming 200 text
     , lspTokens = toks
@@ -318,6 +455,9 @@ mkLspEnv nLines =
   where
     text = moduleText nLines
     opened = Rope.fromText text
+#ifdef COMPARE_TEXT_ROPE
+    openedTR = TRM.fromText text
+#endif
     (steps, edited) = typing 100 opened
     toks = tokens (Rope.toText edited)
     every n xs = case xs of
@@ -326,17 +466,59 @@ mkLspEnv nLines =
 
 lspBenchmarks :: LspEnv -> [Benchmark]
 lspBenchmarks e =
-  asked OneDescent
-    ++ [ bench "reading lines" $ whnf (readLines (lspEdited e)) (lspPositions e)
-       , bgroup "in two descents" (asked TwoDescents)
-       ]
-  where
-    -- Inlined, so that each workload is compiled for the one way of asking.
-    asked asking =
-      [ bench "typing, the edits alone" $ whnf (replay asking observeNothing (lspOpened e)) (lspTyping e)
-      , bench "typing, completion prefix after each key" $ whnf (replay asking (completionPrefix asking) (lspOpened e)) (lspTyping e)
-      , bench "rename, 200 edits at once" $ whnf (rename asking (lspOpened e)) (lspRenaming e)
-      , bench "semantic tokens" $ whnf (semanticTokens asking (lspEdited e)) (lspTokens e)
-      , bench "position conversions" $ whnf (convertPositions asking (lspEdited e)) (lspPositions e)
+  [ bgroup "typing, the edits alone" $
+      bench "nano-rope" (whnf (replay OneDescent observeNothing (lspOpened e)) (lspTyping e))
+        :
+#ifdef COMPARE_TEXT_ROPE
+        [bench "text-rope" (whnf (trReplay trObserveNothing (lspOpenedTR e)) (lspTyping e))]
+#else
+        []
+#endif
+  , bgroup "typing, completion prefix after each key" $
+      bench "nano-rope" (whnf (replay OneDescent (completionPrefix OneDescent) (lspOpened e)) (lspTyping e))
+        :
+#ifdef COMPARE_TEXT_ROPE
+        [bench "text-rope" (whnf (trReplay trCompletionPrefix (lspOpenedTR e)) (lspTyping e))]
+#else
+        []
+#endif
+  , bgroup "rename, 200 edits at once" $
+      bench "nano-rope" (whnf (rename OneDescent (lspOpened e)) (lspRenaming e))
+        :
+#ifdef COMPARE_TEXT_ROPE
+        [bench "text-rope" (whnf (trRename (lspOpenedTR e)) (lspRenaming e))]
+#else
+        []
+#endif
+  , bgroup "semantic tokens" $
+      bench "nano-rope" (whnf (semanticTokens OneDescent (lspEdited e)) (lspTokens e))
+        :
+#ifdef COMPARE_TEXT_ROPE
+        [bench "text-rope" (whnf (trSemanticTokens (lspEditedTR e)) (lspTokens e))]
+#else
+        []
+#endif
+  , bgroup "position conversions" $
+      bench "nano-rope" (whnf (convertPositions OneDescent (lspEdited e)) (lspPositions e))
+        :
+#ifdef COMPARE_TEXT_ROPE
+        [bench "text-rope" (whnf (trConvertPositions (lspEditedTR e)) (lspPositions e))]
+#else
+        []
+#endif
+  , bgroup "reading lines" $
+      bench "nano-rope" (whnf (readLines (lspEdited e)) (lspPositions e))
+        :
+#ifdef COMPARE_TEXT_ROPE
+        [bench "text-rope" (whnf (trReadLines (lspEditedTR e)) (lspPositions e))]
+#else
+        []
+#endif
+  , bgroup "in two descents"
+      [ bench "typing, the edits alone" $ whnf (replay TwoDescents observeNothing (lspOpened e)) (lspTyping e)
+      , bench "typing, completion prefix after each key" $ whnf (replay TwoDescents (completionPrefix TwoDescents) (lspOpened e)) (lspTyping e)
+      , bench "rename, 200 edits at once" $ whnf (rename TwoDescents (lspOpened e)) (lspRenaming e)
+      , bench "semantic tokens" $ whnf (semanticTokens TwoDescents (lspEdited e)) (lspTokens e)
+      , bench "position conversions" $ whnf (convertPositions TwoDescents (lspEdited e)) (lspPositions e)
       ]
-    {-# INLINE asked #-}
+  ]

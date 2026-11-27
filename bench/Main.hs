@@ -387,8 +387,8 @@ main = do
           Left ExitSuccess -> pure ()
           Left failure -> throwIO failure
           Right () -> pure ()
-      -- The comparison chart excludes nano-rope-only language-server runs.
-      -- Their results remain in the CSV.
+      -- Include 100k-line and head-to-head language-server runs in the chart;
+      -- nano-rope-only two-descent runs remain in the CSV.
       samples <- filter ((`elem` libraryNames) . sampleLibrary) . readSamples <$> withFile csv ReadMode hGetContents'
       let bytes = lengthWord8 (sourceText documentLines)
           ran = map sampleLibrary samples ++ map footprintLibrary fps
@@ -460,6 +460,15 @@ chartRows =
       [ inBoth "Random splits" "10k random splits"
       , inBoth "getLine" "10k getLine"
       , Row "Byte offsets to UTF-16 positions" [("", "10k byte offsets to UTF-16 positions")]
+      ]
+  , Group
+      "Language server (8k lines)"
+      [ Row "Typing, edits alone" [("", "typing, the edits alone")]
+      , Row "Typing, completion prefix" [("", "typing, completion prefix after each key")]
+      , Row "Rename (200 edits)" [("", "rename, 200 edits at once")]
+      , Row "Semantic tokens" [("", "semantic tokens")]
+      , Row "Position conversions" [("", "position conversions")]
+      , Row "Reading lines" [("", "reading lines")]
       ]
   ]
   where
