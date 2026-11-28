@@ -286,7 +286,7 @@ timeRow c times bytes (Row label runs) =
       runFrame y k label state (length runs > 1) tip $
         dots cy [(i, logX times (timeX0, timeX1) (sampleSeconds s)) | (i, s) <- got]
           ++ [mark' "m o" i (timeX1 - 1) cy | (i, l) <- present c, (w, l) `elem` chartSkipped c, i `notElem` map fst got]
-          ++ factor cy "faster" "slower" [(sampleSeconds s, others) | (0, s) <- got]
+          ++ factor cy (Just showSeconds) "faster" "slower" [(sampleSeconds s, others) | (0, s) <- got]
           ++ dots cy [(i, logX bytes (allocX0, allocX1) a) | (i, s) <- got, Just a <- [sampleAllocated s], a > 0]
       where
         cy = y + runH / 2
@@ -375,7 +375,7 @@ memoryPanel c
     drawRun y k st =
       runFrame y k "Live heap" st (length states > 1) tip $
         dots cy [(i, x b) | (i, b) <- got]
-          ++ factor cy "smaller" "larger" [(b, [o | (i, o) <- got, i /= 0]) | (0, b) <- got]
+          ++ factor cy (Just showBytes) "smaller" "larger" [(b, [o | (i, o) <- got, i /= 0]) | (0, b) <- got]
       where
         cy = y + runH / 2
         cells = [(i, l, find (\f -> footprintState f == st && footprintLibrary f == l) fps) | (i, l) <- present c]
@@ -425,13 +425,16 @@ mark' cls0 i x y = case i `mod` 4 of
     polygon ps = tag "polygon" [cls, ("points", unwords [num px ++ "," ++ num py | (px, py) <- ps])] []
 
 -- | Ratio to the lowest comparison value, with differences below 5%
--- labelled as approximately equal.
-factor :: Double -> String -> String -> [(Double, [Double])] -> [String]
-factor cy better worse cmp = case cmp of
+-- labelled as approximately equal. Large slowdowns (>= 10×) are shown as
+-- absolute differences when a formatter is provided.
+factor :: Double -> Maybe (Double -> String) -> String -> String -> [(Double, [Double])] -> [String]
+factor cy delta better worse cmp = case cmp of
   [(mine, others@(_ : _))] ->
-    let f = minimum others / mine
+    let best = minimum others
+        f = best / mine
         (cls, n, s)
           | f >= 1.05 = ("q", times f, better)
+          | f <= 0.1, Just fmt <- delta = ("q w", fmt (mine - best), worse)
           | f <= 1 / 1.05 = ("q w", times (1 / f), worse)
           | otherwise = ("q w", "1.0×", "on par")
      in [ text factorX (cy + 5) [("class", cls), ("text-anchor", "end")] n
